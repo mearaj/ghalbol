@@ -53,10 +53,27 @@ if [[ ! -d "$OPUS_SRC" ]]; then
   if [[ ! -f "$TARBALL" ]]; then
     echo "==> Downloading Opus $OPUS_VERSION"
     URL="https://github.com/xiph/opus/releases/download/v$OPUS_VERSION/opus-$OPUS_VERSION.tar.gz"
+    # CI has seen curl exit 92 (HTTP/2 framing). Prefer HTTP/1.1 + retries.
+    download_ok=0
     if command -v curl >/dev/null 2>&1; then
-      curl -fL "$URL" -o "$TARBALL"
-    else
-      wget -O "$TARBALL" "$URL"
+      for attempt in 1 2 3 4 5; do
+        if curl -fL --http1.1 --retry 3 --retry-delay 2 --retry-all-errors \
+          "$URL" -o "$TARBALL"; then
+          download_ok=1
+          break
+        fi
+        echo "WARN: Opus download attempt $attempt failed; retrying…" >&2
+        rm -f "$TARBALL"
+        sleep "$attempt"
+      done
+    elif command -v wget >/dev/null 2>&1; then
+      if wget -O "$TARBALL" "$URL"; then
+        download_ok=1
+      fi
+    fi
+    if [[ "$download_ok" -ne 1 ]]; then
+      echo "ERROR: failed to download Opus from $URL" >&2
+      exit 1
     fi
   fi
   echo "==> Extracting Opus $OPUS_VERSION"

@@ -72,17 +72,25 @@ if [[ ! -f "$OPUS_LIB/libopus.a" ]]; then
   ANDROID_NDK_HOME="$NDK_DIR" PACK_ANDROID_ARM64_ONLY=1 "$ROOT/scripts/build_android_opus.sh"
 fi
 
-# Do NOT source android-ndk-env.sh here — it points CC_* at Studio's NDK and
+# Do NOT source android-ndk-env.sh here — it points CC_* / AR_* at Studio's NDK and
 # fights cargo-makepad's ANDROID_NDK_ROOT / clang (breaks aws-lc-sys cmake).
 unset ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_TOOLCHAIN_BIN ANDROID_NDK_HOST_TAG || true
 unset CC_aarch64_linux_android CXX_aarch64_linux_android \
   CC_armv7_linux_androideabi CXX_armv7_linux_androideabi \
   CC_i686_linux_android CXX_i686_linux_android \
   CC_x86_64_linux_android CXX_x86_64_linux_android \
+  AR_aarch64_linux_android AR_armv7_linux_androideabi \
+  AR_i686_linux_android AR_x86_64_linux_android \
+  RANLIB_aarch64_linux_android RANLIB_armv7_linux_androideabi \
+  RANLIB_i686_linux_android RANLIB_x86_64_linux_android \
   CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER \
   CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER \
   CARGO_TARGET_I686_LINUX_ANDROID_LINKER \
-  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER || true
+  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER \
+  CARGO_TARGET_AARCH64_LINUX_ANDROID_AR \
+  CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_AR \
+  CARGO_TARGET_I686_LINUX_ANDROID_AR \
+  CARGO_TARGET_X86_64_LINUX_ANDROID_AR || true
 
 # Point audiopus_sys at the prebuilt static Opus (host-arch .so would fail link).
 export LIBOPUS_LIB_DIR="$OPUS_LIB"

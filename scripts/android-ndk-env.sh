@@ -183,6 +183,28 @@ export CXX_i686_linux_android="${BIN}/i686-linux-android${API}-clang++"
 export CC_x86_64_linux_android="${BIN}/x86_64-linux-android${API}-clang"
 export CXX_x86_64_linux_android="${BIN}/x86_64-linux-android${API}-clang++"
 
+# NDK r23+ dropped target-prefixed `*-ar` / `*-ranlib`. cc-rs still searches for
+# `aarch64-linux-android-ar` unless AR_<triple> is set — CI fails without this.
+AR_BIN="${BIN}/llvm-ar"
+RANLIB_BIN="${BIN}/llvm-ranlib"
+if [[ ! -x "$AR_BIN" ]]; then
+  _ghalbol_log "android-ndk-env: missing ${AR_BIN}"
+  _ghalbol_fail_help
+  return 1 2>/dev/null || exit 1
+fi
+export AR_aarch64_linux_android="$AR_BIN"
+export AR_armv7_linux_androideabi="$AR_BIN"
+export AR_i686_linux_android="$AR_BIN"
+export AR_x86_64_linux_android="$AR_BIN"
+export RANLIB_aarch64_linux_android="$RANLIB_BIN"
+export RANLIB_armv7_linux_androideabi="$RANLIB_BIN"
+export RANLIB_i686_linux_android="$RANLIB_BIN"
+export RANLIB_x86_64_linux_android="$RANLIB_BIN"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$AR_BIN"
+export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_AR="$AR_BIN"
+export CARGO_TARGET_I686_LINUX_ANDROID_AR="$AR_BIN"
+export CARGO_TARGET_X86_64_LINUX_ANDROID_AR="$AR_BIN"
+
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${CC_aarch64_linux_android}"
 export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="${CC_armv7_linux_androideabi}"
 export CARGO_TARGET_I686_LINUX_ANDROID_LINKER="${CC_i686_linux_android}"
