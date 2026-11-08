@@ -22,6 +22,10 @@ use crate::p2p::native_log;
 static LAST_BRIDGE_PENDING_POLL_MS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 const BRIDGE_PENDING_POLL_MS: i64 = 3_000;
+static LAST_COORD_DIAL_SWEEP_MS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+/// Storm throttle for coord public-TCP sweep (urgent/priority still win inside the pass).
+const COORD_DIAL_SWEEP_MS: i64 = 5_000;
 /// After a failed accept, wait before retrying the same bridge_id (avoids log storms).
 const BRIDGE_ACCEPT_RETRY_MS: i64 = 30_000;
 static BRIDGE_ACCEPT_BACKOFF: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
@@ -259,6 +263,7 @@ pub fn mark_peer_disconnected(
     session.set_peer_connected(peer, false);
     session.set_stream_ready(peer, false);
     session.clear_transport_kem_for_peer(peer);
+    crate::coord_runtime::note_peer_disconnect_urgent(peer);
     let _ = events_tx.send(GossipChatEvent::PeerDisconnected(peer.clone()));
 }
 
@@ -278,6 +283,21 @@ fn run_connect_upkeep(
         }
     }
     crate::coord_runtime::coord_register_tick(&[]);
+
+    // TRANSPORT.md scale invariant: urgent → priority → capped background public-TCP dials.
+    let sweep_now = chrono_now_ms();
+    let last_sweep = LAST_COORD_DIAL_SWEEP_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if crate::coord_runtime::coord_is_configured()
+        && sweep_now.saturating_sub(last_sweep) >= COORD_DIAL_SWEEP_MS
+    {
+        LAST_COORD_DIAL_SWEEP_MS.store(sweep_now, std::sync::atomic::Ordering::Relaxed);
+        spawn_scheduled_coord_dials(
+            Arc::clone(&registry),
+            Arc::clone(&session),
+            identity.clone(),
+            events_tx.clone(),
+        );
+    }
 
     let now = chrono_now_ms();
     let last = LAST_BRIDGE_PENDING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed);
@@ -354,6 +374,73 @@ fn run_connect_upkeep(
                     if g.len() > 64 {
                         g.retain(|_, until| *until > now_ms);
                     }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_scheduled_coord_dials(
+    registry: Arc<PeerSessionRegistry>,
+    session: Arc<SessionState>,
+    identity: crate::DecryptedIdentity,
+    events_tx: std::sync::mpsc::Sender<GossipChatEvent>,
+) {
+    let mut priority = session.peers_with_pending_outbox();
+    if let Some(fg) = session.foreground_peer() {
+        if !priority.iter().any(|p| p == &fg) {
+            priority.push(fg);
+        }
+    }
+    let mut all = session.list_dm_peer_wires();
+    if let Some(ns) = session.app_namespace.as_deref() {
+        if let Ok(contacts) = crate::contacts_v1::list_contacts(ns) {
+            for c in contacts {
+                if c.has_public_key() && !all.iter().any(|p| p.eq_ignore_ascii_case(&c.public_key_hex))
+                {
+                    all.push(c.public_key_hex);
+                }
+            }
+        }
+    }
+    let connected: Vec<String> = all
+        .iter()
+        .filter(|p| super::peer_session::writer_open_for_peer(&registry.writers, p))
+        .cloned()
+        .collect();
+    let targets =
+        crate::coord_runtime::peers_for_lookup_tick(&[], &priority, &all, &connected);
+    if targets.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for pk in targets {
+            if super::peer_session::writer_open_for_peer(&registry.writers, &pk) {
+                continue;
+            }
+            let addrs =
+                match crate::coord_runtime::lookup_dial_addrs_for_public_key_async(&pk).await {
+                    Ok(a) if !a.is_empty() => a,
+                    Ok(_) => continue,
+                    Err(_) => continue,
+                };
+            for addr in addrs.into_iter().take(2) {
+                if super::peer_session::writer_open_for_peer(&registry.writers, &pk) {
+                    break;
+                }
+                let reg = Arc::clone(&registry);
+                let sess = Arc::clone(&session);
+                let id = identity.clone();
+                let ev = events_tx.clone();
+                let peer = pk.clone();
+                tokio::spawn(dial_peer_tcp(
+                    reg, sess, id, ev, peer, addr.host, addr.port,
+                ));
+                for _ in 0..15 {
+                    if super::peer_session::writer_open_for_peer(&registry.writers, &pk) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }

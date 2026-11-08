@@ -46,7 +46,7 @@ Examples aligned with **Tier 3** (paid backup relay):
 | | Communication identity | Payment identity |
 |--|------------------------|------------------|
 | **Purpose** | Who you are on the network | How you pay for optional services |
-| **Based on** | secp256k1 messaging keypair | External wallet / payment rail |
+| **Based on** | Device identity keypair (any supported algorithm) | External wallet / payment rail |
 | **Used for** | Signatures, invites, sync, registration | Invoices, entitlement, subscription |
 
 **Payment wallets are not messaging identities.** This keeps privacy boundaries clear and avoids coupling key rotation to wallet addresses.

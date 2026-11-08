@@ -13,6 +13,15 @@ pub struct ActiveCallSnapshot {
     pub video_active: bool,
     pub camera_on: bool,
     pub remote_video_on: bool,
+    /// Wall-clock ms when this call first became active (voice or video).
+    pub started_at_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn slot() -> &'static Mutex<Option<ActiveCallSnapshot>> {
@@ -41,10 +50,14 @@ pub fn on_voice_start(call_id: &str, peer_public_key_hex: &str) {
         video_active: false,
         camera_on: false,
         remote_video_on: false,
+        started_at_ms: now_ms(),
     });
     snap.call_id = call_id.to_string();
     snap.peer_public_key_hex = peer_public_key_hex.to_string();
     snap.voice_active = true;
+    if snap.started_at_ms <= 0 {
+        snap.started_at_ms = now_ms();
+    }
     *g = Some(snap);
 }
 
@@ -75,11 +88,15 @@ pub fn on_video_start(call_id: &str, peer_public_key_hex: &str, camera_enabled: 
         video_active: false,
         camera_on: false,
         remote_video_on: false,
+        started_at_ms: now_ms(),
     });
     snap.call_id = call_id.to_string();
     snap.peer_public_key_hex = peer_public_key_hex.to_string();
     snap.video_active = true;
     snap.camera_on = camera_enabled;
+    if snap.started_at_ms <= 0 {
+        snap.started_at_ms = now_ms();
+    }
     *g = Some(snap);
 }
 

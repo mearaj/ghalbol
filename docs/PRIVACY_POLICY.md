@@ -37,7 +37,7 @@ Ghal Bol provides **encrypted 1:1 text chat**, **delivery/read receipts**, and *
 
 The app keeps data **locally** under your control, including:
 
-- **Cryptographic identity** — a secp256k1 key pair. The private key is stored in an encrypted **keystore** (`keystore_v1.json`, protected with your **app password** using Argon2id and ChaCha20-Poly1305).
+- **Cryptographic identity** — a local key pair (`secp256k1`, `ed25519`, or `ecdsa-p256`). The private key is stored in an encrypted **keystore** (`keystore_v1.json`, protected with your **app password** using Argon2id and ChaCha20-Poly1305).
 - **Contacts** — names, public keys, chat previews, unread counts, and trust/block flags (`contacts_v1.json`).
 - **Chat transcripts** — message text, timestamps, and delivery state on **your device only** (`chat_transcript_v1.json`).
 - **Preferences** — including the coordination server URL you use.
@@ -107,7 +107,7 @@ Invites (e.g. `https://ghalbol.com/connect/<public_key_hex>` or `ghalbol://conne
 
 ## Android background processing
 
-On Android, networking runs in the app process (there is no separate background service). Incoming calls, new messages and a locked keystore post notifications. A new-message notification shows the contact's name and only "New message", "Voice message" or "File" — never the message text. After a reboot, open the app once so it can connect again.
+On Android, networking runs in the app process (there is no separate background service). Incoming calls, new messages and a locked keystore post notifications. A new-message notification shows the contact's name and only "New message", "Voice message" or "File" — never the message text. After a reboot, open the app once so it can connect again. The app sets `android:allowBackup="false"` so the OS does not include the encrypted keystore or chat stores in automatic cloud / adb backups.
 
 ---
 

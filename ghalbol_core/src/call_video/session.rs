@@ -12,7 +12,7 @@
 //! same loop runs on desktop (nokhwa), Android (Camera2), and headless tests.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -39,6 +39,8 @@ pub struct VideoControls {
     pub force_keyframe: Arc<AtomicBool>,
     /// Set by the RX jitter when a peer keyframe is needed; drained to send `key_request`.
     pub outbound_key_request: Arc<AtomicBool>,
+    /// Negotiated encode max edge from peer `video_on` caps (0 = use local default).
+    pub remote_max_edge: Arc<AtomicU32>,
     /// Source frames encoded+sent.
     pub frames_sent: Arc<AtomicU64>,
     /// Frames decoded+rendered.
@@ -55,6 +57,12 @@ impl VideoControls {
     }
     pub fn set_camera_off(&self, off: bool) {
         self.camera_off.store(off, Ordering::Relaxed);
+    }
+    pub fn set_remote_max_edge(&self, max_edge: u32) {
+        self.remote_max_edge.store(max_edge, Ordering::Relaxed);
+    }
+    pub fn remote_max_edge(&self) -> u32 {
+        self.remote_max_edge.load(Ordering::Relaxed)
     }
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -96,6 +104,7 @@ pub async fn run_video_session(
         if controls.stop.load(Ordering::Relaxed) {
             break;
         }
+        adaptive.set_peer_max_edge(controls.remote_max_edge());
         tokio::select! {
             // Camera → encode/seal → transport (each frame may be several chunks).
             cap = video.capture_rx.recv() => {
@@ -105,6 +114,9 @@ pub async fn run_video_session(
                             continue;
                         }
                         crate::call_video::publish_local_preview(&call_id, frame.clone());
+                        if !adaptive.should_encode_frame() {
+                            continue;
+                        }
                         let encode_frame = adaptive.frame_for_encode(&frame);
                         if controls.frames_sent.load(Ordering::Relaxed) == 0 {
                             crate::p2p::native_log::info(

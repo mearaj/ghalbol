@@ -118,9 +118,23 @@ fn play_stop() -> &'static AtomicBool {
     &STOP
 }
 
-fn playing_path() -> &'static Mutex<Option<String>> {
-    static PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    PATH.get_or_init(|| Mutex::new(None))
+struct PlayingSlot {
+    path: String,
+    started: Instant,
+    duration_ms: u32,
+}
+
+fn playing_slot() -> &'static Mutex<Option<PlayingSlot>> {
+    static SLOT: OnceLock<Mutex<Option<PlayingSlot>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Active voice-note playback: `(path, elapsed_ms, duration_ms)`.
+pub fn voice_play_progress() -> Option<(String, u32, u32)> {
+    let slot = playing_slot().lock().ok()?;
+    let p = slot.as_ref()?;
+    let elapsed = p.started.elapsed().as_millis() as u32;
+    Some((p.path.clone(), elapsed.min(p.duration_ms), p.duration_ms))
 }
 
 pub fn play_opus_file(path: &str) -> Result<bool, String> {
@@ -128,18 +142,26 @@ pub fn play_opus_file(path: &str) -> Result<bool, String> {
     if path.is_empty() {
         return Err("missing voice note".into());
     }
-    if let Ok(mut current) = playing_path().lock() {
-        if current.as_deref() == Some(path.as_str()) {
+    if let Ok(mut current) = playing_slot().lock() {
+        if current.as_ref().is_some_and(|s| s.path == path) {
             play_stop().store(true, Ordering::Relaxed);
             *current = None;
             return Ok(false);
         }
-        *current = Some(path.clone());
     }
     play_stop().store(false, Ordering::Relaxed);
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let pcm = decode_opus_blob_to_pcm(&bytes)?;
     let samples = pcm.len();
+    let duration_ms = voice_msg_v1::duration_ms_from_pcm_len(samples).max(1);
+    if let Ok(mut current) = playing_slot().lock() {
+        *current = Some(PlayingSlot {
+            path: path.clone(),
+            started: Instant::now(),
+            duration_ms,
+        });
+    }
+    let path_for_clear = path.clone();
     thread::spawn(move || {
         if let Ok(stream) = start_output(pcm) {
             let _ = stream.play();
@@ -152,8 +174,8 @@ pub fn play_opus_file(path: &str) -> Result<bool, String> {
             }
             drop(stream);
         }
-        if let Ok(mut current) = playing_path().lock() {
-            if current.as_deref() == Some(path.as_str()) {
+        if let Ok(mut current) = playing_slot().lock() {
+            if current.as_ref().is_some_and(|s| s.path == path_for_clear) {
                 *current = None;
             }
         }

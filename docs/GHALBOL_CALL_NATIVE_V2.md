@@ -154,7 +154,7 @@ The Makepad call screen calls `ghalbol_core::host`. Media stays in Rust.
 | `start_voice_call` / `start_video_call` / `accept_incoming_call` | Open the call. |
 | `set_mic_muted` / `set_speaker` | Mute and speaker. |
 | `end_call` | Hang up and stop media. |
-| `call_banner` / `call_picture_pngs` | Status line and video pictures. |
+| `call_banner` / `call_picture_rgbas` | Status line and video pictures. |
 | `poll_event` | UI refresh. An `incoming_call_wake` event brings the call screen forward after a notification tap. |
 
 ---

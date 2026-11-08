@@ -39,11 +39,11 @@ Inner JSON:
 
 ## Sync policy
 
-1. User sets status → save prefs → enqueue sealed status DM (`MsgKind::AvailabilityStatus`) to each registered DM peer over **native-connect**, **and** upload a short-TTL availability control envelope on the **delivery mailbox** for each secp256k1 contact.
+1. User sets status → save prefs → enqueue sealed status DM (`MsgKind::AvailabilityStatus`) to each registered DM peer over **native-connect**, **and** upload a short-TTL availability control envelope on the **delivery mailbox** for each contact with a public key (all identity algorithms).
 2. When a peer session becomes ready → send current local status once on native-connect (so late contacts learn it).
 3. Empty status clears the peer’s stored field when received.
 
-Mailbox availability uses the same offline seal as text (`kind: availability_status` inner JSON). Non-secp contacts only receive status over native-connect until multi-algo mailbox seal ships.
+Mailbox availability uses the same multi-algo offline seal as text (`kind: availability_status` inner JSON; seal prefixes `0x10`/`0x11`/`0x12`).
 
 ## Anti-patterns
 

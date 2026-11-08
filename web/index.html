@@ -132,9 +132,142 @@
     function privacy() {
       return `
         <h1>Privacy policy</h1>
-        <p>Ghal Bol does not ask for a phone number or email. Chat and call content is end-to-end encrypted between the two devices. The coordination server stores a public key and reachable endpoints so peers can connect. It does not store transcripts. The delivery mailbox stores ciphertext until the recipient acknowledges it, then deletes the payload.</p>
-        <p>The app password and private key stay on the device. You can export an encrypted backup or delete the identity. There are no advertising or analytics SDKs in the app.</p>
-        <p>Full text: the repository file <code>docs/PRIVACY_POLICY.md</code>. This page is the public URL for that policy.</p>
+<p><strong>Last updated:</strong> October 2026</p>
+<p><strong>App:</strong> Ghal Bol (<code>com.ghalbol</code>)</p>
+<p><strong>Publisher:</strong> Ghal Bol / <a href="https://ghalbol.com">ghalbol.com</a></p>
+<p>This Privacy Policy explains how the Ghal Bol mobile and desktop applications (“the app”) and the optional <strong>coordination</strong> and <strong>delivery</strong> services we operate handle information. Ghal Bol keeps <strong>chat history on devices</strong>; the delivery server holds temporary E2E ciphertext only until delivery is acknowledged. <strong>Calls</strong> are designed to travel peer-to-peer (or through an opaque coord bridge) and are not stored as call content on our servers.</p>
+<p>---</p>
+<h2>Summary</h2>
+<table>
+<tr><th>Topic</th><th>What we do</th></tr>
+<tr><td>Account</td><td><strong>No</strong> phone number, email, or cloud account required</td></tr>
+<tr><td>Messages</td><td>End-to-end encrypted on your device; the delivery server holds only <strong>ciphertext it cannot read</strong>, until the recipient acknowledges it</td></tr>
+<tr><td>Identity</td><td><strong>Local</strong> cryptographic key on your device; public key used for invites and discovery</td></tr>
+<tr><td>Coordination server</td><td>Stores <strong>only</strong> presence and connection endpoints (see below)</td></tr>
+<tr><td>Ads / analytics</td><td><strong>No</strong> advertising SDKs; <strong>no</strong> third-party analytics in the core app</td></tr>
+<tr><td>Sale of data</td><td><strong>We do not sell</strong> your personal information</td></tr>
+</table>
+<p>---</p>
+<h2>Who this applies to</h2>
+<p>This policy applies to anyone who installs or uses Ghal Bol and, where relevant, to data processed by the <strong>default production coordination server</strong> at <code>https://coord.ghalbol.com</code>. Advanced users may point the app at a <strong>different coordination server</strong> (including one they run themselves); that operator’s practices would then apply to coordination data sent to that server.</p>
+<p>---</p>
+<h2>What Ghal Bol is (and is not)</h2>
+<p>Ghal Bol provides <strong>encrypted 1:1 text chat</strong>, <strong>delivery/read receipts</strong>, and <strong>voice/video calls</strong> between people who connect via <strong>QR code or invite link</strong>. It is <strong>not</strong> a traditional cloud messenger: there is <strong>no central chat archive</strong> operated by us. When the recipient is offline, a message waits on the delivery server as end-to-end encrypted ciphertext and is removed once the recipient&#x27;s device acknowledges it (or when it expires). Each device keeps its own chat history.</p>
+<p>---</p>
+<h2>Information stored on your device</h2>
+<p>The app keeps data <strong>locally</strong> under your control, including:</p>
+<ul>
+<li><strong>Cryptographic identity</strong> — a local key pair (<code>secp256k1</code>, <code>ed25519</code>, or <code>ecdsa-p256</code>). The private key is stored in an encrypted <strong>keystore</strong> (<code>keystore_v1.json</code>, protected with your <strong>app password</strong> using Argon2id and ChaCha20-Poly1305).</li>
+<li><strong>Contacts</strong> — names, public keys, chat previews, unread counts, and trust/block flags (<code>contacts_v1.json</code>).</li>
+<li><strong>Chat transcripts</strong> — message text, timestamps, and delivery state on <strong>your device only</strong> (<code>chat_transcript_v1.json</code>).</li>
+<li><strong>Preferences</strong> — including the coordination server URL you use.</li>
+<li><strong>In-app diagnostic log</strong> (optional, for troubleshooting) — kept in app memory and exportable <strong>only if you choose</strong> to share it (e.g. via the system share sheet).</li>
+</ul>
+<p>Your <strong>app password</strong> is used to unlock the keystore on the device. It is <strong>not</strong> transmitted to Ghal Bol servers.</p>
+<p>You may <strong>export</strong> an encrypted keystore backup or (after re-entering your password) view/copy your private key. You may <strong>delete</strong> the local identity from the app or remove all app data by <strong>uninstalling</strong>.</p>
+<p>---</p>
+<h2>How chat and calls move</h2>
+<p>When you send a <strong>chat message</strong>:</p>
+<p>1. Your device encrypts the payload with keys derived from your identity and the recipient’s.</p>
+<p>2. Opaque ciphertext is uploaded to the <strong>Ghal Bol delivery server</strong> (temporary mailbox). The server cannot decrypt it.</p>
+<p>3. The recipient downloads, decrypts locally, and sends delivery/read signals through the same mailbox path.</p>
+<p>When you place a <strong>voice or video call</strong>:</p>
+<p>1. Signaling and media use <strong>native connect</strong> (direct on LAN when possible, otherwise the coord byte bridge).</p>
+<p>2. Media remains end-to-end encrypted on device. Coordination does not decrypt call content.</p>
+<p><strong>Delivery and read receipts</strong> for chat are decided by the <strong>recipient’s device</strong> and returned through the delivery path; the sender’s app updates ticks only when those signals arrive.</p>
+<p><strong>LAN discovery:</strong> On local networks, the app may use <strong>mDNS</strong> so <strong>calls</strong> can find configured contacts without the coordination server.</p>
+<p><strong>NAT traversal (calls):</strong> If a direct connection is not possible, the app may use the <strong>coord byte bridge</strong> on <strong>Ghal Bol coordination servers</strong> (for example <code>coord.ghalbol.com</code>). Traffic remains encrypted at the transport/protocol layers. Chat text uses the <strong>delivery mailbox</strong>, not the bridge.</p>
+<p>---</p>
+<h2>Coordination server (presence only)</h2>
+<p>To help peers find each other on the internet, the app registers with a <strong>coordination server</strong> (default: <code>https://coord.ghalbol.com</code>). This service is <strong>Tier 1 discovery only</strong> — it does <strong>not</strong> store chats or call content.</p>
+<p>When your app is online and registered, the server may store:</p>
+<table>
+<tr><th>Data</th><th>Purpose</th></tr>
+<tr><td><strong>Public key</strong> (66-character hex identity)</td><td>Identify your peer for lookup</td></tr>
+<tr><td><strong>Reachable endpoints</strong> (e.g. IP addresses, ports, native endpoints, transport capabilities)</td><td>Allow other peers to dial you</td></tr>
+<tr><td><strong>Optional IPv4 / IPv6 hints</strong></td><td>Assist connection setup</td></tr>
+<tr><td><strong>Last heartbeat timestamp</strong></td><td>Know whether you are currently reachable</td></tr>
+</table>
+<p>Registration uses a <strong>challenge–response</strong>: you sign a server nonce with your private key so only the holder of that identity can register endpoints for that public key.</p>
+<p><strong>Retention:</strong> Presence records are <strong>ephemeral</strong>. Entries expire after heartbeats stop (short TTL; stale peers are purged). There is <strong>no</strong> message archive on the server.</p>
+<p><strong>HTTPS:</strong> Production coordination uses TLS. The app may be configured to use other URLs (including local development servers).</p>
+<p>---</p>
+<h2>Voice and video calls</h2>
+<p>Calls use <strong>native encrypted media</strong> over native connect (<code>/ghalbol/call/1.0.0</code> for voice, <code>/ghalbol/call-video/1.0.0</code> for video). <strong>Call signaling</strong> (invite, accept, hangup, video on/off) is exchanged over the <strong>native connect</strong> path, not through the delivery mailbox. <strong>Chat text</strong> uses the delivery server.</p>
+<p>Media is intended to flow <strong>peer-to-peer</strong> (direct LAN, or through the coord byte bridge when NAT requires it). We do not operate a media server that decrypts call content.</p>
+<p>---</p>
+<h2>Invite links and QR codes</h2>
+<p>Invites (e.g. <code>https://ghalbol.com/connect/&lt;public_key_hex&gt;</code> or <code>ghalbol://connect/...</code>) contain your <strong>public key</strong> and optional display alias. They do <strong>not</strong> embed your private key. Anyone you share an invite with can add you as a contact and attempt to connect while you are online.</p>
+<p>---</p>
+<h2>Android background processing</h2>
+<p>On Android, networking runs in the app process (there is no separate background service). Incoming calls, new messages and a locked keystore post notifications. A new-message notification shows the contact&#x27;s name and only &quot;New message&quot;, &quot;Voice message&quot; or &quot;File&quot; — never the message text. After a reboot, open the app once so it can connect again. The app sets <code>android:allowBackup=&quot;false&quot;</code> so the OS does not include the encrypted keystore or chat stores in automatic cloud / adb backups.</p>
+<p>---</p>
+<h2>Permissions</h2>
+<p>The app requests OS permissions only for features you use:</p>
+<table>
+<tr><th>Permission</th><th>Why</th></tr>
+<tr><td><strong>Internet / network state</strong></td><td>P2P connections and coordination lookups</td></tr>
+<tr><td><strong>Wi‑Fi multicast</strong> (Android)</td><td>Local (LAN) peer discovery via mDNS</td></tr>
+<tr><td><strong>Camera</strong></td><td>Scan invitation QR codes; video calls</td></tr>
+<tr><td><strong>Microphone</strong></td><td>Voice and video calls; voice messages</td></tr>
+<tr><td><strong>Notifications</strong> (Android)</td><td>Incoming calls, new messages, unlock reminder</td></tr>
+</table>
+<p>You can deny permissions; related features may not work (e.g. no QR scan without camera). Files you send, back up or import are chosen in the system file picker, which needs no storage permission.</p>
+<p>---</p>
+<h2>Third-party services</h2>
+<table>
+<tr><th>Service</th><th>Role</th><th>Data involved</th></tr>
+<tr><td><strong>Ghal Bol coordination server</strong></td><td>Presence, endpoint lookup, WAN call byte bridge</td><td>Public key, endpoints, heartbeats; opaque bridged call bytes (not decrypted)</td></tr>
+<tr><td><strong>Ghal Bol delivery server</strong></td><td>Temporary text mailbox</td><td>Opaque E2E ciphertext until delivery ack; metadata for acks/TTL</td></tr>
+<tr><td><strong>On-device camera / QR decode</strong></td><td>Decode invitation QR</td><td>Processing is <strong>on-device</strong></td></tr>
+</table>
+<p>We do <strong>not</strong> integrate advertising networks or third-party analytics SDKs in the core application code paths described in our open-source tree.</p>
+<p><strong>Google Play:</strong> Distribution through Google Play is subject to <a href="https://policies.google.com/">Google’s policies</a> in addition to this document.</p>
+<p>---</p>
+<h2>What we do not do</h2>
+<ul>
+<li>We do <strong>not</strong> require a phone number, email address, or social login.</li>
+<li>We do <strong>not</strong> store your chat transcripts or call recordings on Ghal Bol coordination servers.</li>
+<li>We do <strong>not</strong> sell your personal information.</li>
+<li>We do <strong>not</strong> use your messages to train machine-learning models.</li>
+</ul>
+<p>---</p>
+<h2>Children</h2>
+<p>Ghal Bol is <strong>not directed at children under 13</strong>. We do not knowingly collect personal information from children. If you believe a child has provided information through the app, contact us and we will take appropriate steps.</p>
+<p>---</p>
+<h2>Security</h2>
+<p>We use industry-standard cryptography for identity and message sealing on the wire. No system is perfectly secure; you are responsible for your <strong>app password</strong>, <strong>device security</strong>, and <strong>who you share invites or key backups with</strong>. Importing a private key from another system (e.g. a cryptocurrency wallet) is discouraged because it can put unrelated funds at risk.</p>
+<p>---</p>
+<h2>Your choices</h2>
+<ul>
+<li><strong>Use or change coordination server</strong> in app/environment configuration.</li>
+<li><strong>Export or delete</strong> local identity and data as described above.</li>
+<li><strong>Block contacts</strong> locally (<code>is_blocked</code>); this affects your device’s behavior, not a global account system.</li>
+<li><strong>Uninstall</strong> the app to remove local data from your device (coordination presence will expire on its own).</li>
+</ul>
+<p>Because there is no central chat account, <strong>“delete my messages from the cloud”</strong> does not apply — we do not host them. Peers may retain their own copy of conversations on their devices.</p>
+<p>---</p>
+<h2>International users</h2>
+<p>If you use Ghal Bol from outside the country where our coordination infrastructure is hosted, your <strong>public key and network endpoints</strong> will be processed where that server runs (and on peers’ devices worldwide). P2P traffic routes according to the internet path between devices.</p>
+<p>---</p>
+<h2>Changes to this policy</h2>
+<p>We may update this Privacy Policy from time to time. The <strong>“Last updated”</strong> date at the top will change when we do. Continued use of the app after an update means you accept the revised policy. Material changes may also be noted in release notes or on <a href="https://ghalbol.com">ghalbol.com</a>.</p>
+<p>---</p>
+<h2>Contact</h2>
+<p>Questions or privacy requests:</p>
+<ul>
+<li><strong>Email:</strong> privacy@ghalbol.com</li>
+<li><strong>Website:</strong> https://ghalbol.com</li>
+</ul>
+<p>Replace the email above with your live support address if it differs on the website.</p>
+<p>---</p>
+<h2>Play Store / repository hosting</h2>
+<p>For <strong>Google Play Console</strong>, provide a <strong>public HTTPS URL</strong> to this document, for example:</p>
+<ul>
+<li><code>https://github.com/&lt;your-org&gt;/&lt;your-repo&gt;/blob/main/docs/PRIVACY_POLICY.md</code> (GitHub renders markdown), or</li>
+<li><code>https://ghalbol.com/privacy</code> if you mirror this file on your website.</li>
+</ul>
+<p>Keep the URL stable across releases.</p>
         <a class="btn secondary" href="/">Back to home</a>
       `;
     }

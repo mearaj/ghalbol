@@ -16,7 +16,7 @@ Connectivity: [TRANSPORT.md](TRANSPORT.md) § **Connectivity lifecycle**, § **N
 | [GHALBOL_DELIVERY.md](GHALBOL_DELIVERY.md) | Text mailbox design (`ghalbol_delivery`) |
 | [GHALBOL_DELIVERY_WIRE_V1.md](GHALBOL_DELIVERY_WIRE_V1.md) | Delivery HTTP/WebSocket wire |
 | [COORDINATION_SERVER.md](COORDINATION_SERVER.md) | Run/test `ghalbol_coord`, local/prod, troubleshooting |
-| [IDENTITY.md](IDENTITY.md) | Local identity (secp256k1 today) |
+| [IDENTITY.md](IDENTITY.md) | Local identity (`secp256k1`, `ed25519`, `ecdsa-p256`) |
 | [MULTI_ALGO.md](MULTI_ALGO.md) | Multi-algorithm identity wire |
 | [GHALBOL_VOICE_V1.md](GHALBOL_VOICE_V1.md) | Call signaling (`ghalbol_call_v1`) |
 | [GHALBOL_CALL_NATIVE_V2.md](GHALBOL_CALL_NATIVE_V2.md) | Native voice engine (shipping) |

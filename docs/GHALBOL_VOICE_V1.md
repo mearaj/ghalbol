@@ -27,7 +27,7 @@ Read [DESIGN.md](DESIGN.md) and [AGENTS.md](../AGENTS.md): **Rust owns signaling
 | `accept` | Callee accepts; may echo engine tags. |
 | `reject` | Decline. |
 | `hangup` | End call. |
-| `video_on` | Start native video substream + camera; payload may negotiate `{w,h,fps,codec}` caps. |
+| `video_on` | Start native video substream + camera; payload negotiates `{w,h,fps,codec}` caps (peer takes the min edge; shipping codec `h264`). |
 | `video_off` | Stop camera + tear down video substream; voice continues. |
 | `key_request` | RX → TX: force an immediate video keyframe (after loss / late join). |
 
@@ -52,7 +52,7 @@ All envelopes use `ghalbol.share = ghalbol_call_v1`, `ref_id` = `call_id`, encry
 
 - **Outbound:** `host::start_voice_call` / `host::start_video_call` → `p2p_call_signal` in-process.
 - **Inbound:** poll `kind: call_signal`. The app shows `host::call_banner` and the call pictures.
-- **Media:** `host::accept_incoming_call`, `host::set_mic_muted`, `host::end_call`, `host::call_picture_pngs`.
+- **Media:** `host::accept_incoming_call`, `host::set_mic_muted`, `host::end_call`, `host::call_picture_rgbas`.
 - The UI does not build call signals itself.
 
 ---
@@ -104,4 +104,4 @@ Rust: `ghalbol_core/src/call_media_key.rs`, `call_media/crypto.rs`. The app call
 
 - Group calls
 - Server-side SFU
-- Call history in transcript (optional later)
+- ~~Call history in transcript~~ — **done** (local `call_event` lines via `call_history.rs`)

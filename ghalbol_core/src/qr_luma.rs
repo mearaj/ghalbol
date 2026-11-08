@@ -31,3 +31,29 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Result<String, String> {
 pub fn is_ghalbol_invite(text: &str) -> bool {
     crate::connect_invite_v1::parse_connect_invite_uri(text.trim()).is_ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connect_invite_v1::{
+        build_connect_invite_wire_map, connect_invite_app_uri_from_wire_map,
+    };
+    use crate::keystore_v1::create_keystore_v1;
+
+    #[test]
+    fn invite_detector_accepts_app_uri() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let wire = build_connect_invite_wire_map("ghalbol-chat", &id.public_key_hex(), None).unwrap();
+        let uri = connect_invite_app_uri_from_wire_map(&wire).unwrap();
+        assert!(is_ghalbol_invite(&uri));
+        assert!(is_ghalbol_invite(&format!("  {uri}  ")));
+    }
+
+    #[test]
+    fn invite_detector_rejects_noise() {
+        assert!(!is_ghalbol_invite("https://example.com"));
+        assert!(!is_ghalbol_invite("ghalbol://connect/"));
+        assert!(!is_ghalbol_invite("not a qr"));
+        assert!(!is_ghalbol_invite(""));
+    }
+}

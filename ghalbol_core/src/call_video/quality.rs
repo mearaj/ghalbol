@@ -5,33 +5,36 @@
 use super::{RawVideoFrame, i420_downscale_max_edge};
 
 /// Target camera capture (even dimensions). HW/backends may deliver closest size (desktop nokhwa).
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"))]
 pub const CAP_WIDTH: u32 = 640;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"))]
 pub const CAP_HEIGHT: u32 = 480;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tier {
     pub max_edge: u32,
     pub bitrate_bps: u32,
+    pub fps: u32,
 }
 
 const TIERS: [Tier; 4] = [
     Tier {
         max_edge: 640,
         bitrate_bps: 2_000_000,
+        fps: 30,
     },
     Tier {
         max_edge: 560,
         bitrate_bps: 1_500_000,
+        fps: 24,
     },
     Tier {
         max_edge: 480,
         bitrate_bps: 1_000_000,
+        fps: 20,
     },
     Tier {
         max_edge: 360,
         bitrate_bps: 500_000,
+        fps: 12,
     },
 ];
 
@@ -42,6 +45,10 @@ pub struct AdaptiveQuality {
     congested_ticks: u8,
     clear_ticks: u8,
     last_logged_tier: usize,
+    /// Peer-advertised cap from `video_on` (0 = uncapped beyond local tiers).
+    peer_max_edge: u32,
+    /// Capture frames seen since last encode (for fps ladder skip).
+    frames_seen: u32,
 }
 
 impl AdaptiveQuality {
@@ -51,11 +58,35 @@ impl AdaptiveQuality {
             congested_ticks: 0,
             clear_ticks: 0,
             last_logged_tier: 0,
+            peer_max_edge: 0,
+            frames_seen: 0,
         }
     }
 
+    /// Returns true when this capture frame should be encoded at the current fps tier.
+    /// Assumes capture ≈ 30 fps; skips so effective encode rate ≈ `tier.fps`.
+    pub fn should_encode_frame(&mut self) -> bool {
+        self.frames_seen = self.frames_seen.wrapping_add(1);
+        let fps = self.tier().fps.max(1);
+        // Keep every Nth frame: 30/fps rounded.
+        let keep_every = (30u32 / fps).max(1);
+        self.frames_seen % keep_every == 0
+    }
+
+    pub fn set_peer_max_edge(&mut self, max_edge: u32) {
+        self.peer_max_edge = max_edge;
+    }
+
     pub fn tier(&self) -> Tier {
-        TIERS[self.tier_idx]
+        let mut t = TIERS[self.tier_idx];
+        if self.peer_max_edge > 0 && t.max_edge > self.peer_max_edge {
+            t.max_edge = self.peer_max_edge;
+            // Keep bitrate proportional to the clamped edge vs the top tier.
+            let scale = (self.peer_max_edge as u64 * t.bitrate_bps as u64)
+                / u64::from(TIERS[0].max_edge).max(1);
+            t.bitrate_bps = (scale as u32).max(250_000).min(t.bitrate_bps);
+        }
+        t
     }
 
     /// Prepare a frame for the encoder at the current tier.
@@ -131,5 +162,13 @@ mod tests {
             let _ = q.tick();
         }
         assert_eq!(q.tier().max_edge, 560);
+    }
+
+    #[test]
+    fn peer_cap_clamps_tier_edge() {
+        let mut q = AdaptiveQuality::new();
+        q.set_peer_max_edge(360);
+        assert_eq!(q.tier().max_edge, 360);
+        assert!(q.tier().bitrate_bps <= TIERS[0].bitrate_bps);
     }
 }

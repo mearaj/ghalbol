@@ -100,7 +100,7 @@ Stored and transmitted as opaque JSON; server **must not** decrypt.
 
 **Inner plaintext** (before seal): `{"text":"…"}` — same semantic as DM v1 text body.
 
-**Cipher (v1 shipping):** `OFFLINE_CIPHER_SECP256K1_V1` from [`offline_seal_v1.rs`](../ghalbol_core/src/offline_seal_v1.rs) for secp256k1 recipients. Non-secp256k1: error until extended per [`MULTI_ALGO.md`](MULTI_ALGO.md).
+**Cipher (v1 shipping):** [`offline_seal_v1.rs`](../ghalbol_core/src/offline_seal_v1.rs) — `0x10` secp256k1 ECDH, `0x11` ed25519 (X25519 after birational map), `0x12` ecdsa-p256 ECDH. See [`MULTI_ALGO.md`](MULTI_ALGO.md).
 
 **Outer signature** covers canonical JSON of `{ message_id, sender_wire, recipient_wire, created_at_ms, ciphertext_hex }` (sorted keys, no whitespace).
 

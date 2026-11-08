@@ -39,6 +39,16 @@ Play App Signing: use the **app signing key** fingerprint from Play Console → 
 
 Dev installs (`com.ghalbol.debug`) need **their own** `assetlinks` entry with the debug keystore fingerprint, or test `ghalbol://connect/…` links (custom scheme, no `assetlinks`). Release sideloads and Play use `com.ghalbol`.
 
+Print a fingerprint (and a debug package JSON stub):
+
+```bash
+./scripts/print_android_assetlinks_sha.sh
+# or release/upload keystore:
+./scripts/print_android_assetlinks_sha.sh /path/to.jks upload
+```
+
+Paste the SHA into `web/.well-known/assetlinks.json` as a second target for `com.ghalbol.debug` when testing App Links on sideload builds.
+
 ## 3. Verify on device
 
 ```bash

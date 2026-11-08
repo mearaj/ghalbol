@@ -92,7 +92,7 @@ One store, `chat_transcript_v1.json`, for LAN and WAN. Load a thread by peer id 
 
 ## Calls
 
-`host::start_voice_call`, `host::start_video_call`, `host::accept_incoming_call`, `host::set_mic_muted`, `host::end_call`. While video is connected, `host::call_picture_pngs` is the local and remote picture. Ending a call stops media. Log out stops the node, which ends an active call.
+`host::start_voice_call`, `host::start_video_call`, `host::accept_incoming_call`, `host::set_mic_muted`, `host::end_call`. While video is connected, `host::call_picture_rgbas` is the local and remote picture. Ending a call stops media. Log out stops the node, which ends an active call.
 
 ## Notifications
 
@@ -100,7 +100,7 @@ New inbound text, voice notes and files post a notification when they bump unrea
 
 ## Invites
 
-Format 2 carries `public_key_hex` only. Encode and decode live in `connect_invite_v1.rs`. The desktop app registers `ghalbol://`. A link passed on the command line is joined after unlock.
+Invite wire **v3** carries `identity_wire` plus optional `global_alias` (v2 `public_key_hex` still parses). Encode and decode live in `connect_invite_v1.rs`. The desktop app registers `ghalbol://`. A link passed on the command line is joined after unlock.
 
 ## Persistence
 

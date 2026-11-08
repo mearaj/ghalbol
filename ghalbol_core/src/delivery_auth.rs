@@ -99,3 +99,61 @@ pub fn verify_delivery_signature(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::IdentityAlgorithm;
+    use crate::keystore_v1::{create_keystore_v1, create_keystore_v1_with_algorithm};
+
+    #[test]
+    fn session_challenge_is_stable_and_case_folds_wire() {
+        let nonce = [7u8; 32];
+        let a = session_challenge_bytes(&nonce, "ABCD");
+        let b = session_challenge_bytes(&nonce, "abcd");
+        assert_eq!(a, b);
+        let s = String::from_utf8(a).unwrap();
+        assert!(s.starts_with("ghalbol:delivery:session:v1\n"));
+        assert!(s.contains(&hex::encode(nonce)));
+        assert!(s.ends_with("\nabcd"));
+    }
+
+    #[test]
+    fn upload_and_extend_challenges_include_fields() {
+        let nonce = [1u8; 32];
+        let up = String::from_utf8(upload_challenge_bytes(&nonce, " mid ", "EEFF")).unwrap();
+        assert!(up.contains("ghalbol:delivery:upload:v1\n"));
+        assert!(up.contains("\nmid\n"));
+        assert!(up.ends_with("\neeff"));
+        let ex = String::from_utf8(extend_challenge_bytes(&nonce, " mid ")).unwrap();
+        assert!(ex.contains("ghalbol:delivery:extend:v1\n"));
+        assert!(ex.ends_with("\nmid"));
+    }
+
+    #[test]
+    fn secp256k1_sign_verify_roundtrip() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let msg = session_challenge_bytes(&[9u8; 32], &id.identity_wire());
+        let sig = sign_delivery_challenge(&id, &msg).unwrap();
+        verify_delivery_signature(&id.identity_wire(), &msg, &sig).unwrap();
+    }
+
+    #[test]
+    fn ed25519_and_p256_sign_verify_roundtrip() {
+        for algo in [IdentityAlgorithm::Ed25519, IdentityAlgorithm::EcdsaP256] {
+            let (_ks, id) = create_keystore_v1_with_algorithm("pw", algo, None).unwrap();
+            let msg = upload_challenge_bytes(&[3u8; 32], "m1", &id.identity_wire());
+            let sig = sign_delivery_challenge(&id, &msg).unwrap();
+            verify_delivery_signature(&id.identity_wire(), &msg, &sig).unwrap();
+        }
+    }
+
+    #[test]
+    fn verify_rejects_tampered_message() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let msg = extend_challenge_bytes(&[2u8; 32], "ok");
+        let sig = sign_delivery_challenge(&id, &msg).unwrap();
+        let bad = extend_challenge_bytes(&[2u8; 32], "nope");
+        assert!(verify_delivery_signature(&id.identity_wire(), &bad, &sig).is_err());
+    }
+}

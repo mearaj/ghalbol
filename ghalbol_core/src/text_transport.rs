@@ -24,3 +24,18 @@ pub fn lan_fast_path_enabled() -> bool {
 pub fn lan_p2p_ack_mirror_enabled(recipient_wire: &str) -> bool {
     lan_fast_path_enabled() && crate::p2p::contact_has_lan_p2p_text_path(recipient_wire)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_fast_path_is_on() {
+        assert!(lan_fast_path_enabled());
+    }
+
+    #[test]
+    fn wan_alias_matches_delivery_primary() {
+        assert_eq!(wan_text_via_delivery_server(), delivery_primary_text());
+    }
+}

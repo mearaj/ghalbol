@@ -1038,7 +1038,7 @@ pub fn delivery_send_attachment(
     })
 }
 
-/// Broadcast availability over the mailbox (short TTL). Skips non-secp peers.
+/// Broadcast availability over the mailbox (short TTL) to every contact with a key.
 /// Call alongside native-connect status sync so text-only peers still see it.
 pub fn delivery_broadcast_availability(status: &str, updated_at_ms: i64) -> usize {
     let Some(url) = delivery_url() else {
@@ -1057,11 +1057,6 @@ pub fn delivery_broadcast_availability(status: &str, updated_at_ms: i64) -> usiz
             continue;
         }
         let peer = c.public_key_hex.clone();
-        if let Ok(id) = crate::identity::Identity::parse(&peer) {
-            if id.algorithm != crate::identity::IdentityAlgorithm::Secp256k1 {
-                continue;
-            }
-        }
         let message_id = format!(
             "avail-{}-{}",
             updated_at_ms,

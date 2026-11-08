@@ -62,19 +62,37 @@ pub fn store_for_teardown() -> Result<Vec<(String, String)>, ()> {
         .collect())
 }
 
+/// One ring dropped by [expire_stale_ringing] (peer wire, call id, was inbound).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredRing {
+    pub peer_public_key_hex: String,
+    pub call_id: String,
+    pub incoming: bool,
+}
+
 /// Drop [CallPhase::IncomingRinging] / [CallPhase::OutgoingRinging] older than [MAX_LIVE_CALL_INVITE_AGE_MS].
-pub fn expire_stale_ringing(now_ms: i64) -> bool {
+/// Returns each expired ring so callers can record missed / cancelled history.
+pub fn expire_stale_ringing(now_ms: i64) -> Vec<ExpiredRing> {
     let Ok(mut g) = store().lock() else {
-        return false;
+        return Vec::new();
     };
-    let before = g.len();
-    g.retain(|_, c| {
-        !matches!(
+    let mut expired = Vec::new();
+    g.retain(|pk, c| {
+        let ringing = matches!(
             c.phase,
             CallPhase::IncomingRinging | CallPhase::OutgoingRinging
-        ) || now_ms.saturating_sub(c.phase_at_ms) <= MAX_LIVE_CALL_INVITE_AGE_MS
+        );
+        if !ringing || now_ms.saturating_sub(c.phase_at_ms) <= MAX_LIVE_CALL_INVITE_AGE_MS {
+            return true;
+        }
+        expired.push(ExpiredRing {
+            peer_public_key_hex: pk.clone(),
+            call_id: c.call_id.clone(),
+            incoming: c.phase == CallPhase::IncomingRinging,
+        });
+        false
     });
-    g.len() != before
+    expired
 }
 
 pub fn clear_peer(peer_pk_hex: &str) {
@@ -94,8 +112,8 @@ pub fn peer_call_phase(peer_pk_hex: &str) -> CallPhase {
 }
 
 /// First inbound ring waiting for the user (for UI restore when the app was killed).
+/// Callers that care about TTL must run [expire_stale_ringing] first so history can be recorded.
 pub fn first_incoming_ringing() -> Option<(String, String)> {
-    expire_stale_ringing(now_ms());
     let Ok(g) = store().lock() else {
         return None;
     };
@@ -109,7 +127,6 @@ pub fn first_incoming_ringing() -> Option<(String, String)> {
 
 /// First outbound ring (caller waiting for peer accept) — never show Accept here.
 pub fn first_outgoing_ringing() -> Option<(String, String)> {
-    expire_stale_ringing(now_ms());
     let Ok(g) = store().lock() else {
         return None;
     };
@@ -123,7 +140,6 @@ pub fn first_outgoing_ringing() -> Option<(String, String)> {
 
 /// Age of the current inbound ring, for UI stale checks.
 pub fn incoming_ring_age_ms(now_ms: i64) -> Option<i64> {
-    expire_stale_ringing(now_ms);
     let Ok(g) = store().lock() else {
         return None;
     };
@@ -409,9 +425,10 @@ mod tests {
         let t0 = now_ms();
         apply_inbound(PK, "call-stale", CallSigKind::Invite).unwrap();
         assert_eq!(phase_for_peer(PK), CallPhase::IncomingRinging);
-        assert!(expire_stale_ringing(
-            t0 + MAX_LIVE_CALL_INVITE_AGE_MS + 1_000
-        ));
+        let expired = expire_stale_ringing(t0 + MAX_LIVE_CALL_INVITE_AGE_MS + 1_000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].call_id, "call-stale");
+        assert!(expired[0].incoming);
         assert_eq!(phase_for_peer(PK), CallPhase::Idle);
         assert!(first_incoming_ringing().is_none());
     }

@@ -1,13 +1,11 @@
-//! Call video pictures for the UI: the latest local and remote frames as small PNGs.
+//! Call video pictures for the UI: the latest local and remote frames as RGBA tiles.
 //! Desktop and Android share this; capture and decode live in `call_video`.
 
 use std::sync::Mutex;
 
 struct Pictures {
     local_gen: u64,
-    local_png: Option<Vec<u8>>,
     remote_gen: u64,
-    remote_png: Option<Vec<u8>>,
 }
 
 fn pictures() -> &'static Mutex<Pictures> {
@@ -15,15 +13,15 @@ fn pictures() -> &'static Mutex<Pictures> {
     P.get_or_init(|| {
         Mutex::new(Pictures {
             local_gen: 0,
-            local_png: None,
             remote_gen: 0,
-            remote_png: None,
         })
     })
 }
 
-/// Latest local and remote call pictures as PNG, or empty when that side has no new frame.
-pub fn call_picture_pngs(call_id: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+/// Latest local / remote frames as RGBA (downscaled), or empty when that side has no new frame.
+pub fn call_picture_rgbas(
+    call_id: &str,
+) -> (Option<(u32, u32, Vec<u8>)>, Option<(u32, u32, Vec<u8>)>) {
     let mut slot = match pictures().lock() {
         Ok(g) => g,
         Err(_) => return (None, None),
@@ -34,23 +32,17 @@ pub fn call_picture_pngs(call_id: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         crate::call_video::latest_local_preview(call_id, slot.local_gen)
     {
         slot.local_gen = frame_gen;
-        slot.local_png = rgba_to_png(
-            &crate::call_video::i420_to_rgba(&frame),
-            frame.width,
-            frame.height,
-        );
-        local_out = slot.local_png.clone();
+        let rgba = crate::call_video::i420_to_rgba(&frame);
+        let (rgba, w, h) = downscale(&rgba, frame.width, frame.height, 320);
+        local_out = Some((w, h, rgba));
     }
     if let Some((frame, frame_gen)) =
         crate::call_video::latest_decoded_frame(call_id, slot.remote_gen)
     {
         slot.remote_gen = frame_gen;
-        slot.remote_png = rgba_to_png(
-            &crate::call_video::i420_to_rgba(&frame),
-            frame.width,
-            frame.height,
-        );
-        remote_out = slot.remote_png.clone();
+        let rgba = crate::call_video::i420_to_rgba(&frame);
+        let (rgba, w, h) = downscale(&rgba, frame.width, frame.height, 640);
+        remote_out = Some((w, h, rgba));
     }
     (local_out, remote_out)
 }
@@ -59,26 +51,9 @@ pub fn clear_call_pictures() {
     if let Ok(mut slot) = pictures().lock() {
         *slot = Pictures {
             local_gen: 0,
-            local_png: None,
             remote_gen: 0,
-            remote_png: None,
         };
     }
-}
-
-fn rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    let (rgba, width, height) = downscale(rgba, width, height, 320);
-    if width == 0 || height == 0 || rgba.len() < (width as usize) * (height as usize) * 4 {
-        return None;
-    }
-    let mut out = Vec::new();
-    let mut encoder = png::Encoder::new(&mut out, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().ok()?;
-    writer.write_image_data(&rgba).ok()?;
-    drop(writer);
-    Some(out)
 }
 
 fn downscale(src: &[u8], width: u32, height: u32, max_w: u32) -> (Vec<u8>, u32, u32) {

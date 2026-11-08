@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::delivery_auth::{sign_delivery_challenge, verify_delivery_signature};
 use crate::identity::Identity;
 use crate::keystore_v1::DecryptedIdentity;
-use crate::offline_seal_v1::seal_to_secp256k1_public;
+use crate::offline_seal_v1::{open_sealed_for_identity, seal_to_identity_public};
 use crate::public_key_util::normalize_contact_identity_wire;
 
 pub const DELIVERY_MSG_SHARE: &str = "ghalbol_delivery_msg_v1";
@@ -38,11 +38,12 @@ pub fn build_text_envelope(
     let sender_wire = ident.identity_wire();
     let recipient_norm = normalize_contact_identity_wire(recipient_wire)?;
     let recipient_id = Identity::parse(&recipient_norm)?;
-    if recipient_id.algorithm != crate::identity::IdentityAlgorithm::Secp256k1 {
-        return Err("delivery cipher: secp256k1 recipients only in v1".to_string());
-    }
     let inner = json!({ "text": text }).to_string();
-    let sealed = seal_to_secp256k1_public(&recipient_id.public_key, inner.as_bytes())?;
+    let sealed = seal_to_identity_public(
+        recipient_id.algorithm,
+        &recipient_id.public_key,
+        inner.as_bytes(),
+    )?;
     let ciphertext_hex = hex::encode(&sealed);
     let sign_bytes = envelope_sign_bytes(
         message_id,
@@ -75,12 +76,13 @@ pub fn build_voice_envelope(
     let sender_wire = ident.identity_wire();
     let recipient_norm = normalize_contact_identity_wire(recipient_wire)?;
     let recipient_id = Identity::parse(&recipient_norm)?;
-    if recipient_id.algorithm != crate::identity::IdentityAlgorithm::Secp256k1 {
-        return Err("delivery cipher: secp256k1 recipients only in v1".to_string());
-    }
     let inner = crate::voice_msg_v1::build_voice_inner(duration_ms, opus_blob)?;
     let inner_bytes = inner.to_json_bytes()?;
-    let sealed = seal_to_secp256k1_public(&recipient_id.public_key, &inner_bytes)?;
+    let sealed = seal_to_identity_public(
+        recipient_id.algorithm,
+        &recipient_id.public_key,
+        &inner_bytes,
+    )?;
     let ciphertext_hex = hex::encode(&sealed);
     let sign_bytes = envelope_sign_bytes(
         message_id,
@@ -112,11 +114,12 @@ pub fn build_attachment_envelope(
     let sender_wire = ident.identity_wire();
     let recipient_norm = normalize_contact_identity_wire(recipient_wire)?;
     let recipient_id = Identity::parse(&recipient_norm)?;
-    if recipient_id.algorithm != crate::identity::IdentityAlgorithm::Secp256k1 {
-        return Err("delivery cipher: secp256k1 recipients only in v1".to_string());
-    }
     let inner_bytes = inner.to_json_bytes()?;
-    let sealed = seal_to_secp256k1_public(&recipient_id.public_key, &inner_bytes)?;
+    let sealed = seal_to_identity_public(
+        recipient_id.algorithm,
+        &recipient_id.public_key,
+        &inner_bytes,
+    )?;
     let ciphertext_hex = hex::encode(&sealed);
     let sign_bytes = envelope_sign_bytes(
         message_id,
@@ -150,16 +153,17 @@ pub fn build_availability_envelope(
     let sender_wire = ident.identity_wire();
     let recipient_norm = normalize_contact_identity_wire(recipient_wire)?;
     let recipient_id = Identity::parse(&recipient_norm)?;
-    if recipient_id.algorithm != crate::identity::IdentityAlgorithm::Secp256k1 {
-        return Err("delivery cipher: secp256k1 recipients only in v1".to_string());
-    }
     let inner = json!({
         "kind": "availability_status",
         "status": status,
         "updated_at_ms": updated_at_ms,
     })
     .to_string();
-    let sealed = seal_to_secp256k1_public(&recipient_id.public_key, inner.as_bytes())?;
+    let sealed = seal_to_identity_public(
+        recipient_id.algorithm,
+        &recipient_id.public_key,
+        inner.as_bytes(),
+    )?;
     let ciphertext_hex = hex::encode(&sealed);
     let sign_bytes = envelope_sign_bytes(
         message_id,
@@ -201,8 +205,7 @@ pub fn open_text_from_envelope(
         .and_then(|v| v.as_str())
         .ok_or("missing ciphertext_hex")?;
     let sealed = hex::decode(ciphertext_hex.trim()).map_err(|e| format!("ciphertext hex: {e}"))?;
-    let sk = ident.try_secp256k1_secret()?;
-    let plain = crate::offline_seal_v1::open_sealed_secp256k1(sk, &sealed)?;
+    let plain = open_sealed_for_identity(ident, &sealed)?;
     let inner: Value = serde_json::from_slice(&plain).map_err(|e| format!("inner json: {e}"))?;
     let text = inner
         .get("text")
@@ -336,8 +339,7 @@ fn open_plain_from_envelope(
         .and_then(|v| v.as_str())
         .ok_or("missing ciphertext_hex")?;
     let sealed = hex::decode(ciphertext_hex.trim()).map_err(|e| format!("ciphertext hex: {e}"))?;
-    let sk = ident.try_secp256k1_secret()?;
-    let plain = crate::offline_seal_v1::open_sealed_secp256k1(sk, &sealed)?;
+    let plain = open_sealed_for_identity(ident, &sealed)?;
     Ok((message_id, sender_wire, plain))
 }
 
@@ -422,5 +424,58 @@ mod tests {
             }
             other => panic!("expected AvailabilityStatus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_ed25519_mailbox_text() {
+        let (_ks_a, a) = crate::create_keystore_v1_with_algorithm(
+            "pw",
+            crate::IdentityAlgorithm::Ed25519,
+            None,
+        )
+        .unwrap();
+        let (_ks_b, b) = crate::create_keystore_v1_with_algorithm(
+            "pw2",
+            crate::IdentityAlgorithm::Ed25519,
+            None,
+        )
+        .unwrap();
+        let env = build_text_envelope(&a, "msg-ed", &b.identity_wire(), "ed hello", 1_000).unwrap();
+        let (_id, _from, text) = open_text_from_envelope(&b, &env).unwrap();
+        assert_eq!(text, "ed hello");
+    }
+
+    #[test]
+    fn roundtrip_ecdsa_p256_mailbox_text() {
+        let (_ks_a, a) = crate::create_keystore_v1_with_algorithm(
+            "pw",
+            crate::IdentityAlgorithm::EcdsaP256,
+            None,
+        )
+        .unwrap();
+        let (_ks_b, b) = crate::create_keystore_v1_with_algorithm(
+            "pw2",
+            crate::IdentityAlgorithm::EcdsaP256,
+            None,
+        )
+        .unwrap();
+        let env =
+            build_text_envelope(&a, "msg-p256", &b.identity_wire(), "p256 hello", 1_000).unwrap();
+        let (_id, _from, text) = open_text_from_envelope(&b, &env).unwrap();
+        assert_eq!(text, "p256 hello");
+    }
+
+    #[test]
+    fn cross_algo_secp_sender_to_ed_recipient() {
+        let (_ks_a, a) = crate::create_keystore_v1("pw", None).unwrap();
+        let (_ks_b, b) = crate::create_keystore_v1_with_algorithm(
+            "pw2",
+            crate::IdentityAlgorithm::Ed25519,
+            None,
+        )
+        .unwrap();
+        let env = build_text_envelope(&a, "msg-x", &b.identity_wire(), "cross", 1_000).unwrap();
+        let (_id, _from, text) = open_text_from_envelope(&b, &env).unwrap();
+        assert_eq!(text, "cross");
     }
 }

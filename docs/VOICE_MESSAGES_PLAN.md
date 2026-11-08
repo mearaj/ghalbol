@@ -27,7 +27,7 @@ WhatsApp-style **voice notes** in 1:1 chat:
 |------|--------|
 | **Same rail as text** | One sealed envelope on the **delivery mailbox** (`delivery_msg_v1`, `delivery_send_voice_dm`); recipient acks drive ticks; transcript patch on poll. The native-connect `/ghalbol/msg/1.0.0` frame below is only the LAN mirror / no-delivery-URL path. |
 | **Full payload in one send** | Entire encoded audio inside the sealed inner JSON — no chunking, no sender-served download link (v1). |
-| **Same E2E as text** | Inner JSON → `seal_to_secp256k1_public` → `ciphertext_hex` → signed envelope. **Not** call media keys. |
+| **Same E2E as text** | Inner JSON → `seal_to_identity_public` → `ciphertext_hex` → signed envelope. **Not** call media keys. |
 | **Rust owns behaviour** | Record policy, Opus encode/decode, send/retry, decrypt, transcript. Makepad calls `ghalbol_core::host`. |
 | **Truthful ticks** | Makepad never promotes delivery/read; native transcript + poll only ([DESIGN.md](DESIGN.md)). |
 
@@ -80,7 +80,7 @@ Product path: a `delivery_msg_v1` envelope, same shell as text ([GHALBOL_DELIVER
 **Delivery mailbox (product path, `delivery_msg_v1.rs`):**
 
 1. `serde_json` inner bytes  
-2. Seal to the recipient identity with `offline_seal_v1::seal_to_secp256k1_public` (ephemeral ECDH + AES-256-GCM). **v1 supports secp256k1 recipients only** — see [MULTI_ALGO.md](MULTI_ALGO.md) § Implementation status.  
+2. Seal to the recipient identity with `offline_seal_v1::seal_to_identity_public` (ephemeral ECDH + AES-256-GCM; secp256k1 / ed25519 / ecdsa-p256) — see [MULTI_ALGO.md](MULTI_ALGO.md) § Implementation status.  
 3. Hex-encode → `ciphertext_hex`  
 4. Sign the envelope with the sender device key  
 
@@ -138,7 +138,7 @@ Hub preview: e.g. `"Voice message"` or `"🎤 0:45"` via `contacts_v1` preview h
 - **Toggle** mic in composer → start/stop record via `host::voice_note_toggle` (shipping v1; hold-to-record remains optional later).
 - **Timer** visible; hard stop at **2:00**.
 - Outbound bubble: duration + sending spinner → ticks when native says so.
-- Inbound bubble: play/pause; optional simple progress bar.
+- Inbound bubble: play/pause; simple progress (`elapsed / duration` via `host::voice_play_progress`).
 - **Read receipts:** same as text — room open + read gate; no special “played to end” requirement in v1 (optional v2).
 
 ---

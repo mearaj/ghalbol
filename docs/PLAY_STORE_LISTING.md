@@ -49,10 +49,11 @@ Expect **Everyone** or **Teen** depending on questionnaire answers. No user-gene
 |----------|--------|
 | Collects data? | Yes — limited technical data |
 | Personal info | Public key / device endpoints sent to coordination server for presence |
-| Messages | Not collected by developer servers; P2P between users |
+| Messages | Not collected as plaintext; text/voice notes/files are end-to-end sealed and stored only as opaque ciphertext on the delivery mailbox until the recipient acknowledges them |
 | Encrypted in transit | Yes (peer encryption + HTTPS to coord) |
 | Users can request deletion | Coord presence expires automatically; local data deleted on uninstall |
-| Data shared with third parties | No sale; optional Google Play ML Kit for scanner |
+| Data shared with third parties | No sale; QR scanning is on-device (no ML Kit / Play Services scanner dependency) |
+| Device or other IDs / backups | No Android Auto Backup of app data (`allowBackup=false`); identity lives only in app-private storage until the user exports a keystore backup |
 
 Link privacy policy URL: `https://ghalbol.com/privacy` (publish [PRIVACY_POLICY.md](PRIVACY_POLICY.md) there first).
 
@@ -61,16 +62,16 @@ Link privacy policy URL: `https://ghalbol.com/privacy` (publish [PRIVACY_POLICY.
 - Website: `https://ghalbol.com`
 - Email: support@ghalbol.com (use your real support address)
 
-## Release notes (v1.0.1 build 8)
+## Release notes (v1.1.0 build 10)
 
-- Native encrypted voice and video calls over direct P2P
+- Native encrypted voice and video calls (OpenH264 on desktop and Android)
+- Multi-algorithm identity (secp256k1, ed25519, ecdsa-p256)
 - Improved LAN and WAN connectivity, Wi‑Fi handover, and coord bridge stability
-- Delivery and read receipt fixes; hub unread sync on room leave
-- Foreground service declarations for camera and microphone (Play Store explainers in `videos/`)
-- Network status helper; assorted P2P and call UI fixes
+- Delivery / read receipts; call history lines; RGBA call tiles
+- No Android Auto Backup of keystore/chat (`allowBackup=false`)
 
-Previous: v1.0.0 — initial release (P2P encrypted chat, QR invites, coordination at coord.ghalbol.com).
+Previous: v1.0.1 — native calls and connectivity fixes. v1.0.0 — initial release (P2P encrypted chat, QR invites, coordination at coord.ghalbol.com).
 
 ## Android process
 
-Native connect runs in the app process. The manifest does not declare a foreground service. Microphone and camera are used while a call is on screen. An incoming call posts a notification. After a reboot, open the app once.
+Native connect runs in the app process. The manifest does not declare a foreground service for networking. Microphone and camera are used while a call is on screen. An incoming call posts a notification. After a reboot, open the app once.

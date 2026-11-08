@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -160,14 +161,31 @@ pub(crate) async fn dial_peer_tcp(
         return;
     }
     native_log::info("connect", format!("dial {peer_wire} at {host}:{port}"));
-    let stream = match TcpStream::connect((host.as_str(), port)).await {
-        Ok(s) => s,
-        Err(e) => {
+    let stream = match tokio::time::timeout(
+        Duration::from_secs(4),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             registry.end_dial(&peer_wire);
             native_log::warn("connect", format!("dial failed {peer_wire}: {e}"));
             let _ = events_tx.send(GossipChatEvent::DialFailed {
                 peer: Some(peer_wire),
                 error: e.to_string(),
+            });
+            return;
+        }
+        Err(_) => {
+            registry.end_dial(&peer_wire);
+            native_log::warn(
+                "connect",
+                format!("dial timed out {peer_wire} at {host}:{port}"),
+            );
+            let _ = events_tx.send(GossipChatEvent::DialFailed {
+                peer: Some(peer_wire),
+                error: "dial timed out".to_string(),
             });
             return;
         }

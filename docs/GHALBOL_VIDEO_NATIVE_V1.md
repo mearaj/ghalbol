@@ -19,7 +19,7 @@ transport as native voice.
 
 | Principle | Consequence for video |
 |-----------|-----------------------|
-| **Rust owns media** (golden rule #1) | Capture, encode, seal, transport, jitter, and decode happen in Rust. Makepad shows the call screen, camera permission, and the local and remote pictures from `host::call_picture_pngs`. |
+| **Rust owns media** (golden rule #1) | Capture, encode, seal, transport, jitter, and decode happen in Rust. Makepad shows the call screen, camera permission, and the local and remote pictures from `host::call_picture_rgbas`. |
 | **Reuse the link** | Video frames ride the **same native connection** as chat + voice (a media substream), so we inherit NAT traversal, coord bridge for WAN, Noise, discovery, urgent-reconnect, keepalive, and LAN-shift work in native connect. |
 | **One E2E story** (golden rule #7) | Video frames are sealed with the transport media key (`derive_call_media_keys_from_transport`). Per-frame AES-GCM; key never on the wire. |
 | **No new servers** | Direct when possible; coord bridge only as WAN fallback — same as voice. |
@@ -40,7 +40,7 @@ transport as native voice.
 | **Session lifecycle** | `call_media/session.rs`, `MediaControls`, `OutboundCmd::CallMedia*` | **Extend** `MediaControls` with camera on/off + a `VideoCodec` path; add `OutboundCmd::CallVideoStart/Stop/SetCameraEnabled`. |
 | **Codec** | `call_media/codec.rs` `AudioCodec` (Opus) | **New `VideoCodec` trait** + encoder/decoder (see § Codec). |
 | **Jitter / sync** | `call_media/jitter.rs` (20 ms audio frames) | **New frame-aware video jitter** (keyframe/delta aware) + A/V sync using `MediaFrame.ts` (already reserved, `mod.rs`). |
-| **Capture / render** | `nokhwa` on desktop | Camera frames stay in Rust. The call screen shows PNG pictures from `host::call_picture_pngs`. |
+| **Capture / render** | `nokhwa` on desktop; Camera2 on Android | Camera frames stay in Rust. The call screen shows RGBA tiles from `host::call_picture_rgbas`. |
 | **Controls** | `host::start_video_call`, `host::end_call` | The UI does not pass pixel buffers. |
 | **Call UI** | `call_view` in `ghalbol_app` | Local preview and remote picture. |
 
@@ -51,7 +51,7 @@ transport as native voice.
 ```text
 ┌───────────────────────── ghalbol_app (Makepad) ─────────────────────────┐
 │ Call UI, camera-permission prompt, local PiP + remote video surface      │
-│ local and remote pictures from host::call_picture_pngs                     │
+│ local and remote pictures from host::call_picture_rgbas                    │
 │ Calls ghalbol_core::host ; refreshes from poll                             │
 └───────────────────────────────┬─────────────────────────────────────────┘
                                  │ ghalbol_core::host
@@ -204,8 +204,8 @@ Reuse `call_sig_v1.rs` / `call_state.rs`. Native video signaling:
 | Kind | Native v1 meaning |
 |------|-------------------|
 | `invite` / `accept` | Carry inner JSON `voice_engine`/`video_engine` capability tags (alongside `media`). Both sides supporting `video_engine: native_v1` ⇒ native video is available in-call. |
-| `video_on` | Start the native video substream + camera; payload negotiates `{w,h,fps,codec}` caps (min of both sides). |
-| `video_off` | Stop camera + tear down the video substream; voice continues. |
+| `video_on` | Start the native video substream + camera; payload negotiates `{w,h,fps,codec}` caps (peer takes the min edge; shipping codec `h264`). |
+| `video_off` | Stop camera; tear down the video substream when the local camera is already off (receive-only), otherwise keep decode while voice continues. |
 | `key_request` (**new**) | RX → TX: force an immediate keyframe (after loss / late join). |
 
 `call_state.rs` tracks `video_enabled` per call and which **video engine** is active.
@@ -216,7 +216,7 @@ parse remote → decide `_willUseNativeVideo`).
 
 ## Call screen
 
-`host::start_video_call` starts the camera and the video substream. `host::call_picture_pngs` returns a local or remote PNG when that picture's generation changes. `host::end_call` stops both video and voice. The call banner is the truthful status line.
+`host::start_video_call` starts the camera and the video substream. `host::call_picture_rgbas` returns a local or remote RGBA tile when that picture's generation changes. `host::end_call` stops both video and voice. The call banner is the truthful status line.
 
 ---
 
@@ -250,7 +250,7 @@ tests.
 |-------|-------|---------------|
 | **V0** | `VideoCodec` trait + `NullVideoCodec` + packetizer/reassembler + video jitter (keyframe-aware) + `MediaCrypto` video key — **engine core, no camera/transport**, unit-tested like the voice P0 | Round-trip + reorder/loss/keyframe-recovery unit tests pass (mirrors `call_media` tests) |
 | **V1** | `/ghalbol/call-video/1.0.0` substream in `connect/` + SW codec (H.264) + **desktop** camera (`nokhwa`) + render texture; CLI/test harness | Two Linux desktops hold a clear 2-way video call over a real native connect link; measured rtt/fps/bitrate; audio stays native voice |
-| **V2** | Wire into Makepad via **`host::start_video_call`** / `host::call_picture_pngs`; congestion + `key_request` | Linux↔Linux native video |
+| **V2** | Wire into Makepad via **`host::start_video_call`** / `host::call_picture_rgbas`; congestion + `key_request` | Linux↔Linux native video |
 | **V3** | **Android** Camera2 + `MediaCodec` HW encode/decode + SurfaceTexture render; switch-camera; route toggles | Android↔Android and Android↔Linux video solid on Wi-Fi + cellular within battery/thermal budget |
 | **V4** | **iOS** AVFoundation + VideoToolbox | iOS interop |
 | **V5** | Option B (QUIC datagrams) for video if substream HOL hurts on lossy cellular | Lower jitter / faster recovery on lossy links |
@@ -281,9 +281,9 @@ tests.
 | Phase | State |
 |-------|-------|
 | **V0 engine core** | **Done.** `ghalbol_core/src/call_video/` — `RawVideoFrame`/`EncodedVideoFrame`, `VideoEncoder`/`VideoDecoder` traits + `NullVideoCodec`, frame **fragmentation/reassembly** (`packet.rs`, `Reassembler`), **keyframe-aware jitter** (`jitter.rs`, `VideoJitter` — waits for a keyframe, jumps to the next keyframe on a gap, raises a throttled `key_request` call signal), and per-chunk **AES-256-GCM seal** reusing `call_media::MediaCrypto` with a distinct video key. `VideoEngine` drives `on_capture → wires`, `on_wire → reassemble+jitter`, `on_render → decoded frame`. Wired into shipping `/ghalbol/call-video` via `start_call_video_for_peer`; inbound `key_request` forces a local IDR. |
-| **V1 codec** | **Done (desktop).** `call_video/codec_h264.rs` — `H264Encoder`/`H264Decoder` over **OpenH264** (`openh264` 0.9, bundled source built via `cc`; realtime config: 2 Mbps / 30 fps, accurate keyframe flag via Annex-B NAL scan). I420 in/out. `VideoEngine::new_h264()`. **4 tests** incl. a **full two-engine pipeline** (encode → fragment → seal → wire → reassemble → keyframe-aware jitter → decode). Desktop-gated; Android codec (`MediaCodec` / cross-built openh264) lands in its phase so the Android build stays untouched now. |
-| **V1 transport + capture/render** | **Done (Linux desktop + Android).** `/ghalbol/call-video/1.0.0` substream and `host::start_video_call`. **Desktop:** `nokhwa` camera → I420. **Android:** NDK Camera2 in this process → I420. The call screen loads PNG pictures from `host::call_picture_pngs` when the frame generation changes. If the camera cannot be opened, the video call reports that capture is unavailable. |
-| **V2 Android HW codec** | **Optional next.** `MediaCodec` H.264 encode/decode behind the same trait for lower CPU/battery (OpenH264 SW already ships). |
+| **V1 codec** | **Done (desktop + Android SW).** `call_video/codec_h264.rs` — `H264Encoder`/`H264Decoder` over **OpenH264** (`openh264` 0.9, bundled source built via `cc`; realtime config: 2 Mbps / 30 fps, accurate keyframe flag via Annex-B NAL scan). I420 in/out. `VideoEngine::new_h264()`. Pipeline tests cover encode → fragment → seal → wire → reassemble → keyframe-aware jitter → decode. |
+| **V1 transport + capture/render** | **Done (Linux desktop + Android).** `/ghalbol/call-video/1.0.0` substream and `host::start_video_call`. **Desktop:** `nokhwa` camera → I420. **Android:** NDK Camera2 in this process → I420. Invite/accept advertise `video_engine: native_v1`; local camera start emits `video_on` with `{w,h,fps,codec}` caps; stop/camera-off emit `video_off`. Inbound `CallStreamHeader` / `video_on` opens a receive-side session (`camera_enabled: false`). Adaptive quality ladder steps resolution **and fps** (30→24→20→12) from wire-queue pressure + peer caps. The call screen paints live RGBA textures via `host::call_picture_rgbas`. Camera on/off is `host::set_call_camera_enabled`. If the camera cannot be opened, the video call reports that capture is unavailable. |
+| **V2 Android HW codec** | **Optional next.** `MediaCodec` H.264 encode/decode behind the same trait for lower CPU/battery (OpenH264 SW already ships on Android). |
 | **V2 Linux wiring** | **Done.** Native video when both peers advertise `native_v1` (Linux↔Linux, Linux↔Android, Android↔Android). |
 | **V3 Android / V4 iOS / V5 datagrams** | Not started. |
 
@@ -291,8 +291,8 @@ tests.
 
 | Rule | Detail |
 |------|--------|
-| **Pictures** | In-memory frames. `host::call_picture_pngs` returns a PNG only when that track's generation changes. |
-| **End** | `host::end_call` stops video and voice and sends hangup. Quit and shutdown call it too. |
+| **Pictures** | In-memory frames. `host::call_picture_rgbas` returns RGBA only when that track's generation changes (Makepad live textures). |
+| **End** | `host::end_call` stops video and voice; Decline on an incoming ring sends `reject`, otherwise `hangup`. Quit and shutdown call it too. |
 
 **Current shipping reality:** native **voice** (`native_v2`) + **native video** (`native_v1`) when both peers negotiate the tags. Voice detail: [GHALBOL_CALL_NATIVE_V2.md](GHALBOL_CALL_NATIVE_V2.md).
 

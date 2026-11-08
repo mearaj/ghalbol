@@ -30,7 +30,7 @@ Ghal Bol separates **chat protocol** from **transport**:
 
 ### Scale invariant (non-negotiable)
 
-A user may have **thousands of contacts**, most **stale** (offline, never registered, or coord lookup `404`). **Stale peers must not block a reachable peer.** Coord lookup passes split **urgent** (recent disconnect), **priority** (outbox or foreground chat), and **background** (LRU-capped sweep). Urgent and priority are **uncapped** and run first.
+A user may have **thousands of contacts**, most **stale** (offline, never registered, or coord lookup `404`). **Stale peers must not block a reachable peer.** Coord lookup passes split **urgent** (recent disconnect), **priority** (outbox or foreground chat), and **background** (LRU-capped sweep, `LOOKUP_BACKGROUND_CAP` = 4 per tick). Urgent and priority are **uncapped** and run first (`coord_runtime/lookup_schedule.rs` + connect upkeep public-TCP dial).
 
 ### Instant-connect acceptance criteria (testable)
 
@@ -99,7 +99,7 @@ Per contact (connect worker ~1s upkeep + events):
 | Principle | Implementation |
 |-----------|----------------|
 | Symmetric | Inbound accept and outbound dial share the same Noise+mux handler |
-| Parallel inputs | mDNS events + coord endpoints (public TCP dial when used) + bridge pending poll |
+| Parallel inputs | mDNS events + coord endpoints (**public TCP dial before bridge** on call invite/accept) + bridge pending poll |
 | One session per peer | `PeerSessionRegistry` — new dial skipped when writer open |
 
 ---

@@ -588,6 +588,17 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
         CallSigKind::VideoOn => {
             platform_incoming_call_dismiss();
             crate::p2p::call_active::set_remote_video_on(&parsed.call_id, true);
+            // Receive-side session so inbound mux frames have a wire_in channel.
+            let _ = start_call_video_for_peer(
+                Arc::clone(&ctx.session),
+                ctx.writers.clone(),
+                parsed.call_id.clone(),
+                parsed.sender_public_key_hex.clone(),
+                false,
+                ctx.events_tx.clone(),
+            )
+            .await;
+            apply_remote_video_caps(ctx.session.as_ref(), &parsed.call_id, &parsed.payload);
             emit_call_media(
                 &ctx.events_tx,
                 &parsed.call_id,
@@ -599,6 +610,12 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
         CallSigKind::VideoOff => {
             platform_incoming_call_dismiss();
             crate::p2p::call_active::set_remote_video_on(&parsed.call_id, false);
+            // Doc: video_off tears down the video substream when we are not sending.
+            // Keep the session if our camera is still on (receive path still useful).
+            if ctx.session.call_video_camera_is_off(&parsed.call_id) {
+                ctx.session.call_video_stop(&parsed.call_id);
+                crate::p2p::call_active::on_video_stop(&parsed.call_id);
+            }
             emit_call_media(
                 &ctx.events_tx,
                 &parsed.call_id,
@@ -615,7 +632,13 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
             platform_incoming_call_dismiss();
             drop_pending_call_invite(&parsed.call_id);
             let cid = parsed.call_id.clone();
+            let history_reason = if parsed.kind == CallSigKind::Reject {
+                "remote_reject"
+            } else {
+                "remote_hangup"
+            };
             if crate::p2p::call_active::snapshot().is_some_and(|s| s.call_id == cid) {
+                crate::call_history::record_from_active(history_reason);
                 ctx.session.call_media_stop(&cid);
                 ctx.session.call_video_stop(&cid);
                 crate::p2p::call_active::clear();
@@ -624,7 +647,23 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
                     &cid,
                     &parsed.sender_public_key_hex,
                     "call_ended",
-                    Some("remote_hangup"),
+                    Some(history_reason),
+                );
+            } else {
+                // Outgoing ring declined / hung up before media started.
+                crate::call_history::record_ring_outcome(
+                    &cid,
+                    &parsed.sender_public_key_hex,
+                    false,
+                    history_reason,
+                );
+                crate::call_state::clear_peer(&parsed.sender_public_key_hex);
+                emit_call_media(
+                    &ctx.events_tx,
+                    &cid,
+                    &parsed.sender_public_key_hex,
+                    "call_ended",
+                    Some(history_reason),
                 );
             }
         }
@@ -652,7 +691,27 @@ struct CallStreamHeader {
 
 async fn handle_call_media_payload(payload: &[u8], ctx: &WireDispatchCtx, video: bool) {
     if let Ok(header) = serde_json::from_slice::<CallStreamHeader>(payload) {
-        let _ = header;
+        if video && !header.call_id.trim().is_empty() {
+            // Peer's first video mux frame is the stream header — open a receive
+            // session (camera off) so subsequent sealed chunks have a wire_in.
+            let _ = start_call_video_for_peer(
+                Arc::clone(&ctx.session),
+                ctx.writers.clone(),
+                header.call_id.clone(),
+                ctx.peer.clone(),
+                false,
+                ctx.events_tx.clone(),
+            )
+            .await;
+            crate::p2p::call_active::set_remote_video_on(&header.call_id, true);
+            emit_call_media(
+                &ctx.events_tx,
+                &header.call_id,
+                &ctx.peer,
+                "remote_video_on",
+                None,
+            );
+        }
         return;
     }
     if video {
@@ -989,6 +1048,12 @@ pub(crate) async fn start_call_video_for_peer(
         if camera_enabled {
             session.call_video_set_camera_off(&call_id, false);
             crate::p2p::call_active::set_camera_on(&call_id, true);
+            let _ = crate::p2p_runtime::p2p_call_signal(&serde_json::json!({
+                "recipient_public_key_hex": pk,
+                "call_id": call_id,
+                "signal": "video_on",
+                "payload": video_on_caps_payload(),
+            }));
         }
         crate::p2p::call_active::on_video_start(&call_id, &pk, camera_enabled);
         return Ok(());
@@ -1103,8 +1168,49 @@ pub(crate) async fn start_call_video_for_peer(
         }
     });
     crate::p2p::call_active::on_video_start(&call_id, &pk, camera_enabled);
+    if camera_enabled {
+        let _ = crate::p2p_runtime::p2p_call_signal(&serde_json::json!({
+            "recipient_public_key_hex": pk,
+            "call_id": call_id,
+            "signal": "video_on",
+            "payload": video_on_caps_payload(),
+        }));
+    }
     emit_call_media(&events_tx, &call_id, &pk, "video_started", None);
     Ok(())
+}
+
+/// Local capture/encode caps advertised on `video_on` (peer takes the min).
+fn video_on_caps_payload() -> serde_json::Value {
+    serde_json::json!({
+        "w": crate::call_video::CAP_WIDTH,
+        "h": crate::call_video::CAP_HEIGHT,
+        "fps": 30,
+        "codec": "h264",
+    })
+}
+
+fn apply_remote_video_caps(session: &SessionState, call_id: &str, payload: &serde_json::Value) {
+    let w = payload
+        .get("w")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::from(crate::call_video::CAP_WIDTH)) as u32;
+    let h = payload
+        .get("h")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::from(crate::call_video::CAP_HEIGHT)) as u32;
+    let codec = payload
+        .get("codec")
+        .and_then(|v| v.as_str())
+        .unwrap_or("h264");
+    if !codec.eq_ignore_ascii_case("h264") {
+        native_log::warn(
+            "call_video",
+            format!("peer video codec {codec:?} — shipping path is h264 only"),
+        );
+    }
+    let edge = w.max(h).min(crate::call_video::CAP_WIDTH);
+    let _ = session.call_video_set_remote_max_edge(call_id, edge.max(160));
 }
 
 fn derive_call_media_keys(

@@ -106,7 +106,7 @@ impl DecryptedIdentity {
         match &self.material {
             IdentityKeyMaterial::Secp256k1 { secret } => Ok(secret),
             _ => Err(format!(
-                "mailbox seal needs secp256k1 identity (have {})",
+                "secp256k1 secret required (have {})",
                 self.algorithm().wire_id()
             )),
         }

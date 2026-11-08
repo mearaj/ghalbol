@@ -23,6 +23,8 @@ mod attach_v1;
 #[cfg(not(target_arch = "wasm32"))]
 pub use app_paths::detect_keystore_app_namespace;
 #[cfg(not(target_arch = "wasm32"))]
+mod call_history;
+#[cfg(not(target_arch = "wasm32"))]
 mod call_media;
 #[cfg(not(target_arch = "wasm32"))]
 mod call_media_key;

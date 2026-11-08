@@ -33,7 +33,10 @@ pub use codec::NullVideoCodec;
 pub use codec::{RawVideoFrame, VideoDecoder, VideoEncoder};
 #[cfg(not(target_arch = "wasm32"))]
 pub use codec_h264::{H264Decoder, H264Encoder};
+pub use quality::{CAP_HEIGHT, CAP_WIDTH};
 pub use session::{VideoControls, VideoStreams, run_video_session};
+#[cfg(target_os = "android")]
+pub use android_video::flip_camera;
 
 use crate::call_media::{MediaCrypto, MediaFrame};
 use jitter::VideoJitter;

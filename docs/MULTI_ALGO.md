@@ -1,6 +1,6 @@
 # Multi-algorithm identity
 
-**Status:** Phase 1–5 **client complete** for `secp256k1`, `ed25519`, and `ecdsa-p256`. **Native-connect calls** run for **all three** algorithms. **Delivery-mailbox text** (the product chat path) seals to **secp256k1 recipients only** today — see Implementation status. **DM text**, **call signaling**, and **call audio/video** use **transport KEM v2** after `TransportKemHello`.
+**Status:** Phase 1–5 **client complete** for `secp256k1`, `ed25519`, and `ecdsa-p256`. **Native-connect calls** and **delivery-mailbox text/voice/files** run for **all three** algorithms (`offline_seal_v1` prefixes `0x10`/`0x11`/`0x12`). **DM text**, **call signaling**, and **call audio/video** use **transport KEM v2** after `TransportKemHello`.
 
 **Canonical user-facing overview:** [IDENTITY.md](IDENTITY.md). **This document** is the technical spec for multi-algorithm identity, the identity vs transport/E2E split, and what is implemented vs planned.
 
@@ -121,19 +121,19 @@ Identity may still be used for **signatures** on envelopes (algorithm-specific v
 | Call signaling | [`call_sig_v1.rs`](../ghalbol_core/src/call_sig_v1.rs) + transport KEM → `CALL_CIPHER_TRANSPORT_V2` (`0x04`) |
 | Call audio/video | [`call_media_key.rs`](../ghalbol_core/src/call_media_key.rs) — `derive_call_media_keys_from_transport` + HKDF(`call_id`) |
 | Envelope signatures | Per-algorithm sign with identity key (auth only) |
-| Offline seal | [`offline_seal_v1.rs`](../ghalbol_core/src/offline_seal_v1.rs) — encrypt-to-secp256k1 pubkey (`0x10`); auxiliary only |
+| Offline seal | [`offline_seal_v1.rs`](../ghalbol_core/src/offline_seal_v1.rs) — encrypt-to-identity: secp256k1 `0x10`, ed25519/X25519 `0x11`, ecdsa-p256 `0x12` |
 
 ---
 
 ## Where identity appears (impact map)
 
-| Surface | Field / path | Today | Future |
+| Surface | Field / path | Today | Notes |
 |---------|--------------|-------|--------|
-| Connect invite URI | path segment | Full `Identity` wire (bare secp256k1 or `algo:hex`) | format v3 split fields — TBD |
-| `ghalbol_connect_v1` wire map | `public_key_hex` | Full identity wire | optional split `algorithm` field — TBD |
+| Connect invite URI | path / query | Full `Identity` wire; format **v3** shipped (`global_alias`, algo-aware) | v2 still parsed for older QR/links |
+| `ghalbol_connect_v1` wire map | `public_key_hex` | Full identity wire (algo prefix when non-secp) | — |
 | [`contacts_v1.json`](../ghalbol_core/src/contacts_v1.rs) | contact key | Full identity wire | — |
 | [`keystore_v1.json`](../ghalbol_core/src/keystore_v1.rs) | `identity_algorithm` + encrypted secret | secp256k1 default; ed25519/ecdsa-p256 optional | — |
-| DM frames ([`ghalbol_msg_v1`](GHALBOL_DM_MSG_V1.md)) | `sender_public_key_hex` | Identity wire + session ciphertext outbound | Transport session keys for all algorithms |
+| DM frames ([`ghalbol_msg_v1`](GHALBOL_DM_MSG_V1.md)) | `sender_public_key_hex` | Identity wire; mailbox seal for all three algos; transport KEM v2 when online | — |
 | Coord `GET /v1/peers/{[algo:]hex}` | path key | Identity wire (URL-encoded) | — |
 | Coord agent string | `pk=…` | Full identity wire in identify `agent_version` | — |
 | Call signaling | payload ciphertext | Transport KEM (`CALL_CIPHER_TRANSPORT_V2`) | — |
@@ -168,7 +168,7 @@ Identity may still be used for **signatures** on envelopes (algorithm-specific v
 | Per-algorithm public key validate/encode (standalone crypto crates) | **Implemented** (`secp256k1` via `secp256k1` crate; `ed25519`/`ecdsa-p256` via Dalek/P-256) |
 | Invites / contacts / coord keyed by full `Identity` string (incl. algo prefix) | **Implemented** (`connect_invite_v1`, `contacts_v1`, `coord.rs` URL-encode) |
 | Identity parse through `host` | **Implemented** |
-| Delivery mailbox seal (text, voice, files — the product chat path) | **secp256k1 recipients only** — `delivery_msg_v1.rs` rejects ed25519 / ecdsa-p256 recipients (`offline_seal_v1` is secp256k1 ECDH). Identities of the other two algorithms can place calls but cannot receive mailbox messages until a per-algorithm seal is designed. |
+| Delivery mailbox seal (text, voice, files — the product chat path) | **Implemented for all three algorithms** — `seal_to_identity_public` / `open_sealed_for_identity` in `offline_seal_v1.rs` (`0x10` secp256k1 ECDH, `0x11` ed25519→X25519 ECDH, `0x12` P-256 ECDH). |
 | Transport KEM v2 (DM text) | **Implemented** — `DM_CIPHER_TRANSPORT_V2` (`0x03`) after `TransportKemHello` (`transport_kem_v1.rs`, `connect/transport_kem.rs`) |
 | DM outbound / inbound text | **Transport v2 only** — requires exchanged hello before send; decrypt `0x03` only |
 | Call signaling transport keys | **Implemented** — `CALL_CIPHER_TRANSPORT_V2` (`0x04`) after `TransportKemHello` (`call_sig_v1.rs`, `transport_kem_v1.rs`) |
@@ -183,7 +183,7 @@ Identity may still be used for **signatures** on envelopes (algorithm-specific v
 
 **Explicitly not required for the identity layer:** multi-key transport identity or transport feature flags for identity algorithms.
 
-**Native-connect sessions and calls** run for **all three** identity algorithms (`p2p_ready` for each); delivery-mailbox text is secp256k1-only (above).
+**Native-connect sessions and calls** and **delivery-mailbox text** run for **all three** identity algorithms (`p2p_ready` for each).
 
 **Removed algorithms:** `ml-dsa-65` was dropped — ML-DSA-65 public keys are ~3900 hex chars (~2700 base58), which breaks QR invites, connect URIs, and identity UI. Wires with `ml-dsa-65:` prefix are rejected at parse time. Existing keystores with that algorithm must be deleted and recreated with a supported algorithm.
 
@@ -225,9 +225,9 @@ Phases 0–4 track feature completeness in the repo. **All shipping apps use the
 
 ---
 
-## Open questions (TBD)
+## Open questions (settled / TBD)
 
-- Coord DB primary key: full identity string vs `(algorithm, public_key_hex)` columns.
+- ~~Coord DB primary key~~ — **settled:** full identity wire string in `peers.public_key_hex` (`ghalbol_coord/src/db.rs`). Prefixed algorithms (`ed25519:…`, `ecdsa-p256:…`) and bare secp256k1 share one TEXT primary key; no split `(algorithm, key)` columns.
 - **Transport KEM algorithm** — **DM (native connect path):** X25519 (`x25519-dalek`). **Delivery mailbox (server path):** identity-sealed ciphertext per [GHALBOL_DELIVERY_WIRE_V1.md](GHALBOL_DELIVERY_WIRE_V1.md).
 - ~~Call signaling transport KEM~~ — settled: `CALL_CIPHER_TRANSPORT_V2` (see Implementation status).
 
@@ -242,7 +242,7 @@ Phases 0–4 track feature completeness in the repo. **All shipping apps use the
 
 ## Related docs
 
-- [IDENTITY.md](IDENTITY.md) — user-facing identity model (today: secp256k1)
+- [IDENTITY.md](IDENTITY.md) — user-facing identity model (secp256k1 / ed25519 / ecdsa-p256)
 - [GHALBOL_URI_SCHEME.md](GHALBOL_URI_SCHEME.md) — connect invite URIs
 - [GHALBOL_DM_MSG_V1.md](GHALBOL_DM_MSG_V1.md) — DM envelopes (transport KEM v2)
 - [GHALBOL_CALL_NATIVE_V2.md](GHALBOL_CALL_NATIVE_V2.md) — call media keys (transport KEM `derive_call_media_keys_from_transport`)

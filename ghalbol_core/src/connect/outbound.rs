@@ -11,7 +11,7 @@ use super::frames::{
 use super::outbox_acks::{
     flush_pending_call_signals, handle_run_read_ack_catchup, handle_send_ack_cmd,
 };
-use super::peer_session::{prune_closed_writers, writer_open_for_peer};
+use super::peer_session::{dial_peer_tcp, prune_closed_writers, writer_open_for_peer};
 use super::prelude::*;
 use super::session::chrono_now_ms;
 use super::types::{
@@ -56,7 +56,10 @@ async fn process_one(
             if let Some(ref p) = peer {
                 begin_chat_room_session(session.as_ref(), p);
             }
-            session.set_foreground_peer(peer);
+            session.set_foreground_peer(peer.clone());
+            if let Some(ref pk) = peer {
+                crate::coord_runtime::note_peer_lookup_intent(pk);
+            }
         }
         OutboundCmd::RunReadAckCatchup { identity_wire } => {
             handle_run_read_ack_catchup(Arc::clone(&session), writers, identity_wire).await;
@@ -356,13 +359,99 @@ async fn process_one(
                     let pw = peer.clone();
                     let peer_hex = recipient_hex.clone();
                     let cid = call_id.clone();
+                    let writers_flush = Arc::clone(&writers);
+                    let events_flush = events_tx.clone();
                     native_log::info(
-                        "bridge",
-                        format!("wan call bridge requesting call_id={cid}"),
+                        "connect",
+                        format!("wan call path: public TCP dial then bridge call_id={cid}"),
                     );
                     tokio::spawn(async move {
+                        // Call intent beats 404 backoff (TRANSPORT.md scale invariant).
+                        crate::coord_runtime::clear_coord_lookup_backoff_for_pk(&peer_hex);
+
+                        // Prefer public TCP when the peer registered dialable endpoints.
+                        match crate::coord_runtime::lookup_dial_addrs_for_public_key_async(
+                            &peer_hex,
+                        )
+                        .await
+                        {
+                            Ok(addrs) if !addrs.is_empty() => {
+                                for addr in addrs.into_iter().take(3) {
+                                    if writer_open_for_peer(&reg.writers, &pw) {
+                                        break;
+                                    }
+                                    native_log::info(
+                                        "connect",
+                                        format!(
+                                            "wan public TCP dial {}:{} peer={}",
+                                            addr.host,
+                                            addr.port,
+                                            &pw[..pw.len().min(16)]
+                                        ),
+                                    );
+                                    let reg_d = Arc::clone(&reg);
+                                    let sess_d = Arc::clone(&sess);
+                                    let id_d = id.clone();
+                                    let ev_d = ev.clone();
+                                    let pw_d = pw.clone();
+                                    tokio::spawn(dial_peer_tcp(
+                                        reg_d,
+                                        sess_d,
+                                        id_d,
+                                        ev_d,
+                                        pw_d,
+                                        addr.host,
+                                        addr.port,
+                                    ));
+                                    for _ in 0..30 {
+                                        if writer_open_for_peer(&reg.writers, &pw) {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100))
+                                            .await;
+                                    }
+                                    if writer_open_for_peer(&reg.writers, &pw) {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                native_log::debug(
+                                    "connect",
+                                    "coord lookup ok but no dialable public TCP; bridge next",
+                                );
+                            }
+                            Err(e) => {
+                                native_log::debug(
+                                    "connect",
+                                    format!("coord public TCP lookup: {e}; bridge next"),
+                                );
+                            }
+                        }
+
+                        if writer_open_for_peer(&reg.writers, &pw) {
+                            flush_pending_call_signals(
+                                Arc::clone(&sess),
+                                writers_flush,
+                                vec![pw.clone()],
+                                events_flush,
+                            )
+                            .await;
+                            native_log::info(
+                                "connect",
+                                format!("wan public TCP up for call_id={cid}; skip bridge"),
+                            );
+                            return;
+                        }
+
+                        native_log::info(
+                            "bridge",
+                            format!("wan call bridge requesting call_id={cid}"),
+                        );
+                        let peer_hex_b = peer_hex.clone();
+                        let cid_b = cid.clone();
                         let bridge = match tokio::task::spawn_blocking(move || {
-                            bridge_request_for_call(&peer_hex, &cid)
+                            bridge_request_for_call(&peer_hex_b, &cid_b)
                         })
                         .await
                         {
@@ -453,12 +542,43 @@ async fn process_one(
         }
         OutboundCmd::CallVideoStop { call_id } => {
             session.call_video_stop(&call_id);
-            if let Some(pk) = crate::p2p::call_active::snapshot().map(|s| s.peer_public_key_hex) {
+            let peer_pk = crate::p2p::call_active::snapshot().map(|s| s.peer_public_key_hex);
+            crate::p2p::call_active::on_video_stop(&call_id);
+            if let Some(pk) = peer_pk {
+                let _ = crate::p2p_runtime::p2p_call_signal(&serde_json::json!({
+                    "recipient_public_key_hex": pk,
+                    "call_id": call_id,
+                    "signal": "video_off",
+                    "payload": {},
+                }));
                 emit_call_media(events_tx, &call_id, &pk, "video_stopped", None);
             }
         }
         OutboundCmd::CallVideoSetCameraEnabled { call_id, enabled } => {
             session.call_video_set_camera_off(&call_id, !enabled);
+            crate::p2p::call_active::set_camera_on(&call_id, enabled);
+            if let Some(pk) = crate::p2p::call_active::snapshot().map(|s| s.peer_public_key_hex) {
+                if enabled {
+                    let _ = crate::p2p_runtime::p2p_call_signal(&serde_json::json!({
+                        "recipient_public_key_hex": pk,
+                        "call_id": call_id,
+                        "signal": "video_on",
+                        "payload": {
+                            "w": crate::call_video::CAP_WIDTH,
+                            "h": crate::call_video::CAP_HEIGHT,
+                            "fps": 30,
+                            "codec": "h264",
+                        },
+                    }));
+                } else {
+                    let _ = crate::p2p_runtime::p2p_call_signal(&serde_json::json!({
+                        "recipient_public_key_hex": pk,
+                        "call_id": call_id,
+                        "signal": "video_off",
+                        "payload": {},
+                    }));
+                }
+            }
         }
     }
 }

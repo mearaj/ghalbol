@@ -109,3 +109,35 @@ fn classify_iface_transport(name: &str) -> OsDefaultTransport {
         OsDefaultTransport::Ethernet
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operstate_up_values() {
+        assert!(operstate_is_up("up"));
+        assert!(operstate_is_up(" unknown \n"));
+        assert!(operstate_is_up("dormant"));
+        assert!(!operstate_is_up("down"));
+        assert!(!operstate_is_up(""));
+    }
+
+    #[test]
+    fn iface_names_classify() {
+        assert!(iface_name_is_wifi("wlan0"));
+        assert!(iface_name_is_wifi("wlp2s0"));
+        assert!(iface_name_is_wifi("WiFi"));
+        assert!(!iface_name_is_wifi("eth0"));
+        assert!(iface_name_is_cellular("wwan0"));
+        assert!(iface_name_is_cellular("rmnet_data0"));
+        assert!(!iface_name_is_cellular("wlan0"));
+        assert_eq!(classify_iface_transport("wlan0"), OsDefaultTransport::Wifi);
+        assert_eq!(
+            classify_iface_transport("rmnet0"),
+            OsDefaultTransport::Cellular
+        );
+        assert_eq!(classify_iface_transport("eth0"), OsDefaultTransport::Ethernet);
+        assert_eq!(classify_iface_transport("lo"), OsDefaultTransport::None);
+    }
+}

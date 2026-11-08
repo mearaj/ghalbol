@@ -149,7 +149,36 @@ impl SessionState {
         }
     }
 
+    pub fn foreground_peer(&self) -> Option<SessionPeer> {
+        self.foreground_peer.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn list_dm_peer_wires(&self) -> Vec<SessionPeer> {
+        self.peers
+            .read()
+            .ok()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn peers_with_pending_outbox(&self) -> Vec<SessionPeer> {
+        self.outbox
+            .read()
+            .ok()
+            .map(|g| {
+                let mut out = Vec::new();
+                for row in g.values() {
+                    if !out.iter().any(|p: &SessionPeer| p == &row.peer) {
+                        out.push(row.peer.clone());
+                    }
+                }
+                out
+            })
+            .unwrap_or_default()
+    }
+
     pub fn track_outbound(&self, row: PendingOutbound) {
+        crate::coord_runtime::note_peer_lookup_intent(&row.peer);
         if let Ok(mut g) = self.outbox.write() {
             g.insert(row.message_id.clone(), row);
         }
@@ -209,6 +238,29 @@ impl SessionState {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// Apply peer `video_on` encode cap (min of both sides).
+    pub fn call_video_set_remote_max_edge(&self, call_id: &str, max_edge: u32) -> bool {
+        self.call_video
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.get(call_id).map(|e| {
+                    e.controls.set_remote_max_edge(max_edge);
+                    true
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when this call's camera is currently off (receive-only or muted).
+    pub fn call_video_camera_is_off(&self, call_id: &str) -> bool {
+        self.call_video
+            .lock()
+            .ok()
+            .and_then(|g| g.get(call_id).map(|e| e.controls.camera_off.load(Ordering::Relaxed)))
+            .unwrap_or(true)
     }
 
     /// Peer sent `key_request` — force the next local encoded frame to be an IDR.
