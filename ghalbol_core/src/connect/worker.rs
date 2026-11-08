@@ -29,6 +29,12 @@ static LAST_OS_DEFAULT_TRANSPORT: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0xff);
 /// Storm throttle for coord public-TCP sweep (urgent/priority still win inside the pass).
 const COORD_DIAL_SWEEP_MS: i64 = 5_000;
+/// Back off repeated mDNS-driven LAN dials while a prior attempt to the same endpoint failed.
+const LAN_MDNS_DIAL_BACKOFF_MS: i64 = 5_000;
+/// Outbound dial task uses a 4s connect timeout — wait before trying the next coord address.
+pub(crate) const DIAL_ADDR_ATTEMPT_WAIT_ITERS: u32 = 50;
+static LAN_MDNS_DIAL_BACKOFF: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 /// After a failed accept, wait before retrying the same bridge_id (avoids log storms).
 const BRIDGE_ACCEPT_RETRY_MS: i64 = 30_000;
 static BRIDGE_ACCEPT_BACKOFF: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
@@ -36,6 +42,8 @@ static BRIDGE_ACCEPT_BACKOFF: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
 /// bridge_ids currently in `accept_bridge_pending` — do not spawn duplicates.
 static BRIDGE_ACCEPT_INFLIGHT: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+/// Hard ceiling on concurrent bridge accepts (DoS / task fan-out).
+const MAX_BRIDGE_ACCEPT_INFLIGHT: usize = 32;
 
 pub struct ConnectWorkerState {
     pub registry: Arc<PeerSessionRegistry>,
@@ -45,12 +53,13 @@ pub struct ConnectWorkerState {
 }
 
 pub async fn run_connect_node_with_std_io(
-    config: ConnectConfig,
+    mut config: ConnectConfig,
     identity: crate::DecryptedIdentity,
     outbound_rx: std::sync::mpsc::Receiver<OutboundCmd>,
     events_tx: std::sync::mpsc::Sender<GossipChatEvent>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), ConnectError> {
+    config.cap_dm_peers();
     let ident_wire = identity.identity_wire();
     native_log::info("connect", "starting native connect worker");
 
@@ -137,6 +146,14 @@ pub async fn run_connect_node_with_std_io(
                         .ok()
                         .and_then(|d| d.wire_for_commitment(&identity_commitment));
                     if let Some(peer) = peer_wire {
+                        if super::peer_session::writer_open_for_peer(&registry.writers, &peer) {
+                            continue;
+                        }
+                        let now = chrono_now_ms();
+                        if lan_mdns_dial_backoff_active(&peer, &host, port, now) {
+                            continue;
+                        }
+                        record_lan_mdns_dial_attempt(&peer, &host, port, now);
                         native_log::info(
                             "connect",
                             format!("mdns discovered {host}:{port} peer={peer}"),
@@ -157,33 +174,12 @@ pub async fn run_connect_node_with_std_io(
                         .and_then(|d| d.wire_for_commitment(&identity_commitment))
                     {
                         native_log::info("connect", format!("mdns expired {peer}"));
+                        clear_lan_mdns_dial_backoff_for_peer(&peer);
                         registry.remove_session(&peer);
                         session.set_peer_on_local_lan(&peer, false);
                     }
                 }
             }
-        }
-
-        let connected: Vec<SessionPeer> = registry
-            .writers
-            .read()
-            .ok()
-            .map(|g| g.keys().cloned().collect())
-            .unwrap_or_default();
-        if !connected.is_empty() {
-            let sess = Arc::clone(&session);
-            let writers: SessionWriters = Arc::clone(&registry.writers);
-            let ev = events_tx.clone();
-            let peers = connected.clone();
-            tokio::spawn(async move {
-                super::outbox_acks::resync_pending_outbox(sess, writers, peers, Some(ev)).await;
-            });
-            run_ack_upkeep(
-                Arc::clone(&session),
-                Arc::clone(&registry.writers),
-                &connected,
-            )
-            .await;
         }
 
         select! {
@@ -213,7 +209,12 @@ pub async fn run_connect_node_with_std_io(
                     .map(|g| g.keys().cloned().collect())
                     .unwrap_or_default();
                 if !connected.is_empty() {
-                    run_delivery_ack_upkeep(
+                    let sess = Arc::clone(&session);
+                    let writers: SessionWriters = Arc::clone(&registry.writers);
+                    let ev = events_tx.clone();
+                    let peers = connected.clone();
+                    super::outbox_acks::resync_pending_outbox(sess, writers, peers, Some(ev)).await;
+                    run_ack_upkeep(
                         Arc::clone(&session),
                         Arc::clone(&registry.writers),
                         &connected,
@@ -225,16 +226,9 @@ pub async fn run_connect_node_with_std_io(
         }
     }
 
+    registry.abort_all_sessions();
     let _ = events_tx.send(GossipChatEvent::NodeStopped { error: None });
     Ok(())
-}
-
-async fn run_delivery_ack_upkeep(
-    session: Arc<SessionState>,
-    writers: SessionWriters,
-    connected_peers: &[SessionPeer],
-) {
-    super::outbox_acks::run_ack_upkeep_limited_delivery(session, writers, connected_peers).await;
 }
 
 pub fn mark_peer_connected(
@@ -305,7 +299,7 @@ fn run_connect_upkeep(
         crate::coord_runtime::coord_invalidate_presence_on_network_change();
     }
     if let Some(pub_ip) = net.primary_public_ipv4 {
-        if let Some(addr) = DmDialAddr::parse(&format!("{pub_ip}:{listen_port}")) {
+        if let Some(addr) = parse_listen_dm_addr(pub_ip, listen_port) {
             crate::coord_runtime::on_listen_dm_addr(&addr);
         }
     }
@@ -373,9 +367,13 @@ fn run_connect_upkeep(
                 let Ok(mut inflight) = BRIDGE_ACCEPT_INFLIGHT.lock() else {
                     continue;
                 };
-                if !inflight.insert(item.bridge_id.clone()) {
+                if inflight.contains(&item.bridge_id) {
                     continue; // already accepting this bridge_id
                 }
+                if inflight.len() >= MAX_BRIDGE_ACCEPT_INFLIGHT {
+                    continue; // global fan-out ceiling
+                }
+                inflight.insert(item.bridge_id.clone());
             }
             native_log::info(
                 "bridge",
@@ -400,6 +398,12 @@ fn run_connect_upkeep(
                     g.insert(bridge_id, now_ms + BRIDGE_ACCEPT_RETRY_MS);
                     if g.len() > 64 {
                         g.retain(|_, until| *until > now_ms);
+                    }
+                    while g.len() > 64 {
+                        let Some(oldest) = g.keys().next().cloned() else {
+                            break;
+                        };
+                        g.remove(&oldest);
                     }
                 }
             }
@@ -463,7 +467,7 @@ fn spawn_scheduled_coord_dials(
                 tokio::spawn(dial_peer_tcp(
                     reg, sess, id, ev, peer, addr.host, addr.port,
                 ));
-                for _ in 0..15 {
+                for _ in 0..DIAL_ADDR_ATTEMPT_WAIT_ITERS {
                     if super::peer_session::writer_open_for_peer(&registry.writers, &pk) {
                         break;
                     }
@@ -472,4 +476,101 @@ fn spawn_scheduled_coord_dials(
             }
         }
     });
+}
+
+fn lan_mdns_dial_key(peer: &SessionPeer, host: &str, port: u16) -> String {
+    format!("{peer}\n{host}\n{port}")
+}
+
+fn lan_mdns_dial_backoff_active(peer: &SessionPeer, host: &str, port: u16, now_ms: i64) -> bool {
+    let Ok(g) = LAN_MDNS_DIAL_BACKOFF.lock() else {
+        return false;
+    };
+    g.get(&lan_mdns_dial_key(peer, host, port))
+        .is_some_and(|last| now_ms.saturating_sub(*last) < LAN_MDNS_DIAL_BACKOFF_MS)
+}
+
+fn clear_lan_mdns_dial_backoff_for_peer(peer: &SessionPeer) {
+    if let Ok(mut g) = LAN_MDNS_DIAL_BACKOFF.lock() {
+        let prefix = format!("{peer}\n");
+        g.retain(|k, _| !k.starts_with(&prefix));
+    }
+}
+
+fn record_lan_mdns_dial_attempt(peer: &SessionPeer, host: &str, port: u16, now_ms: i64) {
+    if let Ok(mut g) = LAN_MDNS_DIAL_BACKOFF.lock() {
+        g.insert(lan_mdns_dial_key(peer, host, port), now_ms);
+        if g.len() > 256 {
+            g.retain(|_, ts| now_ms.saturating_sub(*ts) < LAN_MDNS_DIAL_BACKOFF_MS);
+        }
+        while g.len() > 256 {
+            let Some(oldest) = g.keys().next().cloned() else {
+                break;
+            };
+            g.remove(&oldest);
+        }
+    }
+}
+
+fn parse_listen_dm_addr(pub_ip: std::net::Ipv4Addr, listen_port: u16) -> Option<DmDialAddr> {
+    DmDialAddr::parse(&format!("{pub_ip}:{listen_port}"))
+}
+
+#[cfg(test)]
+mod dial_policy_tests {
+    use super::*;
+
+    #[test]
+    fn parse_listen_dm_addr_ipv4_host_port() {
+        let a = parse_listen_dm_addr("192.0.2.5".parse().unwrap(), 4242).unwrap();
+        assert_eq!(a.host, "192.0.2.5");
+        assert_eq!(a.port, 4242);
+    }
+
+    #[test]
+    fn lan_mdns_dial_backoff_per_endpoint() {
+        let peer = "0220899663decabbb1b9f19c2e7baa610e123badd98cfe6e43484f941c45a36d0c".to_string();
+        if let Ok(mut g) = LAN_MDNS_DIAL_BACKOFF.lock() {
+            g.clear();
+        }
+        record_lan_mdns_dial_attempt(&peer, "10.0.0.2", 9000, 1_000);
+        assert!(lan_mdns_dial_backoff_active(&peer, "10.0.0.2", 9000, 3_000));
+        assert!(!lan_mdns_dial_backoff_active(&peer, "10.0.0.2", 9000, 6_001));
+        assert!(!lan_mdns_dial_backoff_active(&peer, "10.0.0.3", 9000, 3_000));
+    }
+
+    #[test]
+    fn bridge_accept_inflight_respects_global_ceiling() {
+        let Ok(mut inflight) = BRIDGE_ACCEPT_INFLIGHT.lock() else {
+            return;
+        };
+        inflight.clear();
+        for i in 0..MAX_BRIDGE_ACCEPT_INFLIGHT {
+            assert!(
+                inflight.len() < MAX_BRIDGE_ACCEPT_INFLIGHT,
+                "precondition"
+            );
+            inflight.insert(format!("b{i}"));
+        }
+        assert_eq!(inflight.len(), MAX_BRIDGE_ACCEPT_INFLIGHT);
+        // Admission gate used by the accept loop.
+        let next = "b-overflow".to_string();
+        assert!(!inflight.contains(&next));
+        assert!(inflight.len() >= MAX_BRIDGE_ACCEPT_INFLIGHT);
+        inflight.clear();
+    }
+
+    #[test]
+    fn lan_mdns_dial_backoff_hard_caps_map_size() {
+        if let Ok(mut g) = LAN_MDNS_DIAL_BACKOFF.lock() {
+            g.clear();
+        }
+        let peer = "0220899663decabbb1b9f19c2e7baa610e123badd98cfe6e43484f941c45a36d0c".to_string();
+        // All timestamps "fresh" so retain alone would not shrink.
+        for i in 0..300 {
+            record_lan_mdns_dial_attempt(&peer, &format!("10.0.0.{i}"), 9000, 1_000_000);
+        }
+        let len = LAN_MDNS_DIAL_BACKOFF.lock().map(|g| g.len()).unwrap_or(0);
+        assert!(len <= 256, "backoff map grew to {len}");
+    }
 }

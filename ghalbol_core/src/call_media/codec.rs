@@ -58,6 +58,11 @@ impl AudioCodec for OpusEncoderCodec {
             .enc
             .encode(pcm, &mut self.buf)
             .map_err(|e| format!("opus encode: {e}"))?;
+        if n > OPUS_MAX_PACKET {
+            return Err(format!(
+                "opus encode output {n} bytes exceeds cap {OPUS_MAX_PACKET}"
+            ));
+        }
         Ok(self.buf[..n].to_vec())
     }
 
@@ -94,13 +99,62 @@ impl AudioCodec for OpusDecoderCodec {
                 .dec
                 .decode(None::<&[u8]>, &mut out[..], false)
                 .map_err(|e| format!("opus plc: {e}"))?,
-            Some(p) => self
-                .dec
-                .decode(Some(p), &mut out[..], false)
-                .map_err(|e| format!("opus decode: {e}"))?,
+            Some(p) => {
+                if p.len() > OPUS_MAX_PACKET {
+                    return Err(format!(
+                        "opus packet {} bytes exceeds cap {OPUS_MAX_PACKET}",
+                        p.len()
+                    ));
+                }
+                self.dec
+                    .decode(Some(p), &mut out[..], false)
+                    .map_err(|e| format!("opus decode: {e}"))?
+            }
         };
         out.truncate(n);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn opus_encode_output_stays_under_cap() {
+        let mut enc = OpusEncoderCodec::new().expect("encoder");
+        let pcm = vec![0i16; FRAME_SAMPLES];
+        let payload = enc.encode(&pcm).expect("encode");
+        assert!(payload.len() <= OPUS_MAX_PACKET);
+    }
+
+    #[test]
+    fn opus_decode_rejects_oversized_packet() {
+        let mut dec = OpusDecoderCodec::new().expect("decoder");
+        let mut out = Vec::new();
+        let huge = vec![0u8; OPUS_MAX_PACKET + 1];
+        let err = dec.decode(Some(&huge), &mut out).unwrap_err();
+        assert!(err.contains("exceeds cap"), "{err}");
+    }
+
+    /// Guardrail: reference decode must stay cheap (no accidental per-sample alloc).
+    #[test]
+    fn null_codec_decode_batch_stays_fast() {
+        let payload: Vec<u8> = (0..FRAME_SAMPLES)
+            .flat_map(|s| (s as i16).to_le_bytes())
+            .collect();
+        let mut codec = NullCodec;
+        let mut out = Vec::new();
+        let start = Instant::now();
+        for _ in 0..2000 {
+            codec.decode(Some(&payload), &mut out).unwrap();
+        }
+        assert!(
+            start.elapsed().as_millis() < 500,
+            "2000 null decodes took {:?}",
+            start.elapsed()
+        );
     }
 }
 

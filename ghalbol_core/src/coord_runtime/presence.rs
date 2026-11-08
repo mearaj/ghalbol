@@ -11,7 +11,7 @@ use super::recovery::{
 #[cfg(not(test))]
 use super::recovery::relay_presence_reschedule_min_ms;
 use super::register::{
-    has_public_coord_register_endpoints, spawn_register_presence_inner,
+    has_public_coord_register_endpoints, is_coord_publishable_host, spawn_register_presence_inner,
 };
 use super::state::*;
 use std::collections::HashSet;
@@ -132,10 +132,12 @@ pub(super) fn peer_record_has_coord_presence(record: &crate::coord::CoordPeerRec
     if peer_record_has_relay_circuit(record) {
         return true;
     }
-    record
-        .endpoints
-        .iter()
-        .any(|e| e.scheme == "tcp" && !e.host.trim().is_empty() && e.port != 0)
+    record.endpoints.iter().any(|e| {
+        e.scheme == "tcp"
+            && !e.host.trim().is_empty()
+            && e.port != 0
+            && is_coord_publishable_host(&e.host)
+    })
 }
 
 /// During LAN↔WAN handover coord HTTP may flap while the relay server still has our circuit.
@@ -308,6 +310,9 @@ pub(super) fn start_heartbeat_loop(public_key_hex: String) {
                         Err(e) if heartbeat_err_peer_not_on_coord(&e) => {
                             peer_gone = true;
                             COORD_REGISTERED.store(false, Ordering::Relaxed);
+                            if let Ok(mut r) = coord_globals().registered_on.lock() {
+                                r.clear();
+                            }
                             crate::flow_log::warn(
                                 "coord",
                                 format!(

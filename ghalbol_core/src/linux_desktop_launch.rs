@@ -1,5 +1,6 @@
 //! Best-effort raise of the Makepad desktop shell on Linux (D-Bus + gtk-launch + wake file).
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::desktop_wake::{touch_incoming_call_wake, touch_unlock_wake};
@@ -8,10 +9,35 @@ pub fn dbus_object_path(app_id: &str) -> String {
     format!("/{}", app_id.replace('.', "/"))
 }
 
+/// Freedesktop app ids are reverse-DNS tokens — reject anything that could confuse D-Bus / gtk-launch.
+fn app_id_is_safe(app_id: &str) -> bool {
+    let t = app_id.trim();
+    if t.is_empty() || t.len() > 128 {
+        return false;
+    }
+    t.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// Freedesktop `Exec=` quoting (spaces / reserved shell metacharacters).
+fn desktop_exec_quoted(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.bytes().any(|b| b == b' ' || b == b'\t' || b == b'"' || b == b'\\' || b == b'$' || b == b'`')
+    {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s
+    }
+}
+
+fn desktop_entry_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', " ").replace('\r', "")
+}
+
 /// Write [touch_wake], call `org.freedesktop.Application.Activate`, then `gtk-launch`.
 pub fn wake_desktop_app(app_id: &str, touch_wake: fn()) {
     let app_id = app_id.trim();
-    if app_id.is_empty() {
+    if !app_id_is_safe(app_id) {
         return;
     }
     touch_wake();
@@ -49,6 +75,9 @@ pub fn install_user_autostart() {
         return;
     };
     let app_id = crate::host::default_app_namespace();
+    if !app_id_is_safe(&app_id) {
+        return;
+    }
     let label = std::env::var("GHALBOL_APP_LABEL")
         .ok()
         .filter(|l| !l.trim().is_empty())
@@ -61,13 +90,14 @@ pub fn install_user_autostart() {
         let icon_path = icon_dir.join(format!("{app_id}.png"));
         let _ = std::fs::write(&icon_path, include_bytes!("../../apps/ghalbol/resources/icon_128.png"));
     }
+    // Quote Exec so paths with spaces (or desktop reserved chars) stay one argv token.
+    let exe_q = desktop_exec_quoted(&exe);
+    let label_safe = desktop_entry_escape(&label);
     let autostart = format!(
-        "[Desktop Entry]\nType=Application\nName={label}\nExec={exe}\nIcon={app_id}\nStartupNotify=true\nX-GNOME-Autostart-enabled=true\n",
-        exe = exe.display(),
+        "[Desktop Entry]\nType=Application\nName={label_safe}\nExec={exe_q}\nIcon={app_id}\nStartupNotify=true\nX-GNOME-Autostart-enabled=true\n",
     );
     let applications = format!(
-        "[Desktop Entry]\nType=Application\nName={label}\nExec={exe} %u\nIcon={app_id}\nStartupNotify=true\nMimeType=x-scheme-handler/ghalbol;\n",
-        exe = exe.display(),
+        "[Desktop Entry]\nType=Application\nName={label_safe}\nExec={exe_q} %u\nIcon={app_id}\nStartupNotify=true\nMimeType=x-scheme-handler/ghalbol;\n",
     );
     let auto_dir = std::path::PathBuf::from(format!("{home}/.config/autostart"));
     let apps_dir = std::path::PathBuf::from(format!("{home}/.local/share/applications"));
@@ -149,6 +179,24 @@ mod tests {
     #[test]
     fn dbus_object_path_from_app_id() {
         assert_eq!(dbus_object_path("com.ghalbol.debug"), "/com/ghalbol/debug");
+    }
+
+    #[test]
+    fn app_id_is_safe_rejects_injection_shapes() {
+        assert!(app_id_is_safe("com.ghalbol.debug"));
+        assert!(!app_id_is_safe(""));
+        assert!(!app_id_is_safe("com.ghalbol;rm -rf /"));
+        assert!(!app_id_is_safe("../evil"));
+        assert!(!app_id_is_safe(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn desktop_exec_quotes_paths_with_spaces() {
+        let plain = desktop_exec_quoted(Path::new("/opt/ghalbol/bin"));
+        assert_eq!(plain, "/opt/ghalbol/bin");
+        let spaced = desktop_exec_quoted(Path::new("/opt/Ghal Bol/bin"));
+        assert_eq!(spaced, "\"/opt/Ghal Bol/bin\"");
+        assert_eq!(desktop_entry_escape("A\nB"), "A B");
     }
 
     #[test]

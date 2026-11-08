@@ -7,7 +7,8 @@
 //! moves it once so existing contacts, transcripts, voice notes, and attachments stay visible.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::storage::{KeystoreStorageError, StorageConfig, namespace_data_dir};
@@ -122,6 +123,49 @@ pub fn storage_config_for_namespace(app_namespace: &str) -> StorageConfig {
     resolved_storage_config(app_namespace)
 }
 
+/// Canonicalize a chat attachment / voice file path and ensure it lives under this install's `ghalbol/` store.
+///
+/// Used when opening or exporting files already referenced by the transcript — not for arbitrary OS picker paths.
+pub fn resolve_user_file_path(
+    cfg: &StorageConfig,
+    path: &str,
+) -> Result<PathBuf, KeystoreStorageError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(KeystoreStorageError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid file path",
+        )));
+    }
+    let p = Path::new(trimmed);
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(KeystoreStorageError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "file path not allowed",
+        )));
+    }
+    let canonical = p.canonicalize().map_err(KeystoreStorageError::Io)?;
+    if !canonical.is_file() {
+        return Err(KeystoreStorageError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "not a file",
+        )));
+    }
+    let root = ui_data_dir(cfg)?;
+    let root_canon = if root.exists() {
+        root.canonicalize().map_err(KeystoreStorageError::Io)?
+    } else {
+        root
+    };
+    if !canonical.starts_with(&root_canon) {
+        return Err(KeystoreStorageError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "file path outside app storage",
+        )));
+    }
+    Ok(canonical)
+}
+
 /// Resolve the installed app namespace when the daemon starts without an unlocked session.
 ///
 /// Order: `GHALBOL_APP_NAMESPACE` (when that keystore exists), then release, then debug.
@@ -221,6 +265,65 @@ mod tests {
         let contacts = contacts_v1_path(&cfg).unwrap();
         assert_eq!(fs::read_to_string(&contacts).unwrap(), "new");
         assert_eq!(fs::read_to_string(legacy.join("contacts_v1.json")).unwrap(), "old");
+    }
+
+    #[test]
+    fn bad_namespace_rejects_ui_data_paths() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("com/../../etc").with_override_data_dir(td.path());
+        assert!(matches!(
+            contacts_v1_path(&cfg),
+            Err(KeystoreStorageError::BadNamespace)
+        ));
+    }
+
+    #[test]
+    fn resolve_user_file_path_rejects_nul_byte() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.nul").with_override_data_dir(td.path());
+        let ui = ui_data_dir(&cfg).unwrap();
+        fs::create_dir_all(ui.join("attach")).unwrap();
+        let inside = ui.join("attach").join("ok.txt");
+        fs::write(&inside, b"ok").unwrap();
+        let mut bad = inside.to_string_lossy().into_owned();
+        bad.push('\0');
+        bad.push_str("extra");
+        assert!(resolve_user_file_path(&cfg, &bad).is_err());
+    }
+
+    #[test]
+    fn resolve_user_file_path_rejects_outside_ui_store() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.paths").with_override_data_dir(td.path());
+        let ui = ui_data_dir(&cfg).unwrap();
+        fs::create_dir_all(ui.join("attach")).unwrap();
+        let inside = ui.join("attach").join("note.txt");
+        fs::write(&inside, b"ok").unwrap();
+        assert_eq!(
+            resolve_user_file_path(&cfg, inside.to_str().unwrap()).unwrap(),
+            inside.canonicalize().unwrap()
+        );
+        let outside = td.path().join("outside.txt");
+        fs::write(&outside, b"nope").unwrap();
+        assert!(matches!(
+            resolve_user_file_path(&cfg, outside.to_str().unwrap()),
+            Err(KeystoreStorageError::Io(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_user_file_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.symlink").with_override_data_dir(td.path());
+        let ui = ui_data_dir(&cfg).unwrap();
+        fs::create_dir_all(ui.join("attach")).unwrap();
+        let secret = td.path().join("secret.txt");
+        fs::write(&secret, b"secret").unwrap();
+        let link = ui.join("attach").join("escape.txt");
+        symlink(&secret, &link).unwrap();
+        assert!(resolve_user_file_path(&cfg, link.to_str().unwrap()).is_err());
     }
 
     #[test]

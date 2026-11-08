@@ -21,8 +21,8 @@ load_ghalbol_env development
 makepad_enable_package_dir
 
 OUT="$ROOT/dist/windows-dev"
-rm -rf "$OUT"
-mkdir -p "$OUT"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ghalbol-windows-dev.XXXXXX")"
+trap '[[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"' EXIT
 TARGET="$(windows_default_target)"
 
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
@@ -34,6 +34,7 @@ else
 fi
 
 # Release binary + development.env (console stays — GHALBOL_ENV).
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 cargo build -p ghalbol_app --release --target "$TARGET"
 
 source "$ROOT/scripts/cargo-target-dir.sh"
@@ -54,13 +55,14 @@ if [[ -z "$EXE" ]]; then
   exit 1
 fi
 
-cp -f "$EXE" "$OUT/ghalbol-app.exe"
-makepad_copy_desktop_resources "$OUT"
-stage_desktop_package "$OUT" windows
+WIN_EXE="$(desktop_bin_name).exe"
+cp -f "$EXE" "$STAGE/$WIN_EXE"
+makepad_copy_desktop_resources "$STAGE"
+stage_desktop_package "$STAGE" windows
 
-SIZE="$(du -h "$OUT/ghalbol-app.exe" | awk '{print $1}')"
+SIZE="$(du -h "$STAGE/$WIN_EXE" | awk '{print $1}')"
 
-cat >"$OUT/README.txt" <<EOF
+cat >"$STAGE/README.txt" <<EOF
 GhalBol Chat Windows (development)
 ===================================
 App id:   ${GHALBOL_APP_ID}
@@ -81,6 +83,12 @@ Uninstall:
 Prod:   scripts/package-windows.sh      → dist/windows/
 Dev:    tools/ghalbol-windows-dev/main.rs → dist/windows-dev/
 EOF
+
+rm -rf "$OUT"
+mkdir -p "$(dirname "$OUT")"
+mv "$STAGE" "$OUT"
+STAGE=""
+trap - EXIT
 
 echo "Windows Dev package: $OUT/  (exe ${SIZE})"
 echo "Copy the whole folder to Windows (exe + ghalbol_app/resources + Setup.bat)."

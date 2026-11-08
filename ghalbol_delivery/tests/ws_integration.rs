@@ -44,7 +44,11 @@ async fn session_ready(
     let ch = read.next().await.unwrap().unwrap();
     let ch: Value = serde_json::from_str(&ch.into_text().unwrap()).unwrap();
     let nonce = parse_nonce(ch["nonce_hex"].as_str().unwrap());
-    let sig = sign_delivery_challenge(ident, &session_challenge_bytes(&nonce, &wire)).unwrap();
+    let sig = sign_delivery_challenge(
+        ident,
+        session_challenge_bytes(&nonce, &wire).as_ref().unwrap(),
+    )
+    .unwrap();
     write
         .send(tokio_tungstenite::tungstenite::Message::Text(
             json!({
@@ -97,7 +101,9 @@ async fn ws_upload_ack_and_sender_mailbox() {
     let op_nonce = parse_nonce(&op_a);
     let upload_sig = sign_delivery_challenge(
         &sender,
-        &upload_challenge_bytes(&op_nonce, message_id, recipient.identity_wire().as_str()),
+        upload_challenge_bytes(&op_nonce, message_id, recipient.identity_wire().as_str())
+            .as_ref()
+            .unwrap(),
     )
     .unwrap();
     sender_write

@@ -77,6 +77,26 @@ pub(super) fn lookup_backoff_map() -> &'static Mutex<HashMap<String, CoordLookup
     COORD_LOOKUP_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Bound daemon/UI + native upkeep backoff entries (large rosters).
+pub(super) const MAX_LOOKUP_BACKOFF_ENTRIES: usize = 4096;
+
+pub(super) fn insert_lookup_backoff(
+    m: &mut HashMap<String, CoordLookupBackoff>,
+    pk: String,
+    backoff: CoordLookupBackoff,
+) {
+    if m.len() >= MAX_LOOKUP_BACKOFF_ENTRIES && !m.contains_key(&pk) {
+        if let Some(victim) = m
+            .iter()
+            .min_by_key(|(_, b)| b.next_allowed_ms)
+            .map(|(k, _)| k.clone())
+        {
+            m.remove(&victim);
+        }
+    }
+    m.insert(pk, backoff);
+}
+
 /// Min gap between full challenge+register cycles when already registered (reduces coord HTTP 401 storms).
 pub(super) const MIN_REGISTER_INTERVAL_MS: u64 = 10_000;
 /// Retry sooner when never successfully registered.

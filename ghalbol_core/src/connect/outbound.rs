@@ -19,7 +19,7 @@ use super::types::{
     session_peer_from_identity_wire,
 };
 use super::ui_session::{emit_call_media, on_local_call_signal_sent};
-use super::worker::ConnectWorkerState;
+use super::worker::{ConnectWorkerState, DIAL_ADDR_ATTEMPT_WAIT_ITERS};
 
 pub(crate) async fn process_outbound_cmds(
     worker: Arc<ConnectWorkerState>,
@@ -48,8 +48,11 @@ async fn process_one(
         }
         OutboundCmd::SetForegroundPeer {
             identity_wire,
-            generation: _,
+            generation,
         } => {
+            if !super::ui_session::foreground_peer_cmd_apply(generation) {
+                return;
+            }
             let peer = identity_wire
                 .as_deref()
                 .and_then(|w| session_peer_from_identity_wire(w).ok());
@@ -380,6 +383,7 @@ async fn process_one(
                         {
                             Ok(addrs) if !addrs.is_empty() => {
                                 for addr in addrs.into_iter().take(3) {
+                                    prune_closed_writers(&reg.writers);
                                     if writer_open_for_peer(&reg.writers, &pw) {
                                         break;
                                     }
@@ -406,7 +410,7 @@ async fn process_one(
                                         addr.host,
                                         addr.port,
                                     ));
-                                    for _ in 0..30 {
+                                    for _ in 0..DIAL_ADDR_ATTEMPT_WAIT_ITERS {
                                         if writer_open_for_peer(&reg.writers, &pw) {
                                             break;
                                         }

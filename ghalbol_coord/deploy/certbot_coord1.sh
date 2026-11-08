@@ -10,17 +10,25 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST="${COORD1_HOST:-coord1.ghalbol.com}"
-EMAIL="${CERTBOT_EMAIL:-mearajbhagad@gmail.com}"
+EMAIL="${CERTBOT_EMAIL:-}"
 LE_FULLCHAIN="/etc/letsencrypt/live/${HOST}/fullchain.pem"
 
 if [[ "${1:-}" == "--issue" ]]; then
+  if [[ -z "${EMAIL}" ]]; then
+    echo "error: set CERTBOT_EMAIL for Let's Encrypt" >&2
+    exit 1
+  fi
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    exec sudo -E /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --issue
+    echo "== certbot_coord1.sh: sudo once for certbot + nginx =="
+    exec sudo \
+      CERTBOT_EMAIL="${CERTBOT_EMAIL}" \
+      COORD1_HOST="${COORD1_HOST:-coord1.ghalbol.com}" \
+      /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --issue
   fi
   echo "== bootstrap nginx :80 for ACME =="
   mkdir -p /etc/nginx/conf.d /var/www/certbot/.well-known/acme-challenge
   cp "${DEPLOY_DIR}/nginx-coord1-bootstrap.conf" /etc/nginx/conf.d/ghalbol-coord1.conf
-  nginx -t
+  nginx -t || { echo "nginx -t failed" >&2; exit 1; }
   systemctl reload nginx
   echo "== certbot manual DNS (add TXT record at GoDaddy when prompted) =="
   certbot certonly --manual --preferred-challenges dns \

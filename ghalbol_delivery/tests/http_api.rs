@@ -23,4 +23,10 @@ async fn health_ok() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["service"], "ghalbol_delivery");
     assert_eq!(json["ok"], true);
+    assert_eq!(json["rejected_frames"], 0);
+    assert_eq!(json["rejected_connections"], 0);
+    assert_eq!(json["auth_failures"], 0);
+    assert_eq!(json["uploads_total"], 0);
+    assert!(json["messages_expired"].is_number());
+    assert!(json["live_sockets"].is_number());
 }

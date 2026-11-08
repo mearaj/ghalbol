@@ -559,7 +559,10 @@ script_mod! {
                                         call_label := Label{
                                             width: Fill
                                             text: state.call_line
-                                            draw_text.color: #7A8B9C
+                                            if state.call_line_is_error == "1"
+                                                draw_text.color: #C62828
+                                            else
+                                                draw_text.color: #7A8B9C
                                         }
                                         if state.lines.len() == 0
                                             Label{
@@ -1285,7 +1288,10 @@ script_mod! {
                                     call_screen_title := Label{
                                         width: Fill
                                         text: state.call_line
-                                        draw_text.color: #AEC4CF
+                                        if state.call_line_is_error == "1"
+                                            draw_text.color: #FF8A80
+                                        else
+                                            draw_text.color: #AEC4CF
                                         draw_text.text_style.font_size: 16
                                         draw_text.max_lines: 3
                                         draw_text.text_overflow: Ellipsis

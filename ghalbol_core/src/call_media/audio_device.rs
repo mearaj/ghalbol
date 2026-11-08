@@ -175,7 +175,19 @@ impl AudioBackend for SilenceAudioBackend {
                 }
             }
         });
-        tokio::spawn(async move { while playout_rx.recv().await.is_some() {} });
+        let stop_play = Arc::clone(&self.stop);
+        tokio::spawn(async move {
+            loop {
+                if stop_play.load(Ordering::Relaxed) {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(50), playout_rx.recv()).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        });
         Ok(AudioStreams {
             capture_rx,
             playout_tx,
@@ -239,6 +251,7 @@ mod cpal_backend {
             let (cap_tx, capture_rx) = mpsc::channel::<Vec<i16>>(64);
             let (playout_tx, playout_rx) = mpsc::channel::<Vec<i16>>(256);
             let stop = Arc::clone(&self.stop);
+            let stop_thread = Arc::clone(&stop);
 
             // The audio thread builds + owns both cpal streams (not Send) and
             // signals readiness/error back through a oneshot-style channel.
@@ -246,7 +259,7 @@ mod cpal_backend {
             let thread = std::thread::Builder::new()
                 .name("ghalbol-audio".into())
                 .spawn(move || {
-                    audio_thread_main(stop, cap_tx, playout_rx, ready_tx);
+                    audio_thread_main(stop_thread, cap_tx, playout_rx, ready_tx);
                 })
                 .map_err(|e| format!("spawn audio thread: {e}"))?;
 
@@ -258,8 +271,16 @@ mod cpal_backend {
                         playout_tx,
                     })
                 }
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err("audio device init timed out".to_string()),
+                Ok(Err(e)) => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = thread.join();
+                    Err(e)
+                }
+                Err(_) => {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = thread.join();
+                    Err("audio device init timed out".to_string())
+                }
             }
         }
 
@@ -555,5 +576,6 @@ mod tests {
             .expect("frame present");
         assert_eq!(f.len(), FRAME_SAMPLES);
         b.stop();
+        tokio::time::sleep(Duration::from_millis(120)).await;
     }
 }

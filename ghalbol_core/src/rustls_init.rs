@@ -7,8 +7,18 @@ static INSTALL: Once = Once::new();
 /// Install aws-lc-rs as the default rustls `CryptoProvider` once per process.
 pub fn ensure_rustls_crypto_provider() {
     INSTALL.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("rustls CryptoProvider install_default");
+        // Already-installed (tests / double start) is fine — do not panic the process.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_rustls_crypto_provider;
+
+    #[test]
+    fn ensure_rustls_is_idempotent() {
+        ensure_rustls_crypto_provider();
+        ensure_rustls_crypto_provider();
+    }
 }

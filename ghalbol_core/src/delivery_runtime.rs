@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -55,6 +56,8 @@ fn worker_mx() -> &'static Mutex<Option<JoinHandle<()>>> {
 
 const DELIVERY_OUTBOX_RESEND_INTERVAL_MS: i64 = 1_000;
 const DELIVERY_OUTBOX_MAX_PER_TICK: usize = 16;
+/// Cap process-local outbox throttle entries (one row per attempted upload).
+const MAX_OUTBOX_LAST_ATTEMPT_TRACKED: usize = 4_096;
 
 fn outbox_last_attempt_mx() -> &'static Mutex<HashMap<String, i64>> {
     static M: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
@@ -187,6 +190,24 @@ pub fn delivery_start() {
     );
 }
 
+/// Delivery WSS reconnect storm guardrail (TRANSPORT.md § Event-driven async).
+fn delivery_reconnect_backoff_step(secs: u64) -> (u64, u64) {
+    let wait = secs.min(60);
+    let next = secs.saturating_mul(2).min(60);
+    (wait, next)
+}
+
+fn is_delivery_stopped_err(err: &str) -> bool {
+    err == "delivery stopped"
+}
+
+/// After worker stop, drop stale upload claims so outbox upkeep is not blocked.
+pub(crate) fn clear_delivery_outbox_in_flight() {
+    if let Ok(mut g) = outbox_in_flight_mx().lock() {
+        g.clear();
+    }
+}
+
 pub fn delivery_stop() {
     stop_flag().store(true, Ordering::SeqCst);
     if let Ok(mut g) = worker_mx().lock() {
@@ -194,6 +215,8 @@ pub fn delivery_stop() {
             let _ = h.join();
         }
     }
+    crate::delivery_read_acks::clear_delivery_read_ack_in_flight();
+    clear_delivery_outbox_in_flight();
     if let Ok(mut m) = mirror_mx().lock() {
         m.connected = false;
     }
@@ -211,20 +234,24 @@ fn delivery_worker_loop(ws_url: String) {
         }
     };
     rt.block_on(async {
-        while !stop_flag().load(Ordering::SeqCst) {
+        let mut reconnect_backoff_secs: u64 = 1;
+        let stop = stop_flag();
+        while !stop.load(Ordering::SeqCst) {
             let ident = match unlocked_identity_clone() {
                 Ok(i) => i,
                 Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    sleep_secs_interruptible(2, stop).await;
                     continue;
                 }
             };
-            match connect_and_auth(&ws_url, &ident).await {
+            match connect_and_auth(&ws_url, &ident, Some(stop_flag())).await {
                 Ok(mut session) => {
+                    reconnect_backoff_secs = 1;
                     update_mirror_connected(&session.quota, &session.policy);
                     delivery_outbox_upkeep();
+                    let mut session_drop_err: Option<String> = None;
                     loop {
-                        if stop_flag().load(Ordering::SeqCst) {
+                        if stop.load(Ordering::SeqCst) {
                             break;
                         }
                         match tokio::time::timeout(
@@ -241,15 +268,37 @@ fn delivery_worker_loop(ws_url: String) {
                                 delivery_outbox_upkeep();
                             }
                             Ok(Err(e)) => {
+                                if is_delivery_stopped_err(&e) {
+                                    break;
+                                }
                                 set_mirror_error(&e);
+                                session_drop_err = Some(e);
                                 break;
                             }
                         }
                     }
+                    if let Ok(mut m) = mirror_mx().lock() {
+                        m.connected = false;
+                    }
+                    // Previously reconnected immediately after a live session drop — storm.
+                    if session_drop_err.is_some() && !stop.load(Ordering::SeqCst) {
+                        let (wait, next) = delivery_reconnect_backoff_step(reconnect_backoff_secs);
+                        reconnect_backoff_secs = next;
+                        native_log::warn(
+                            "delivery",
+                            format!("session dropped; reconnect in {wait}s"),
+                        );
+                        sleep_secs_interruptible(wait, stop).await;
+                    }
                 }
                 Err(e) => {
+                    if is_delivery_stopped_err(&e) {
+                        break;
+                    }
                     set_mirror_error(&e);
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let (wait, next) = delivery_reconnect_backoff_step(reconnect_backoff_secs);
+                    reconnect_backoff_secs = next;
+                    sleep_secs_interruptible(wait, stop).await;
                 }
             }
         }
@@ -525,11 +574,20 @@ async fn handle_push_frame(
             let message_id = frame
                 .get("message_id")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
                 .unwrap_or("");
             let recipient = frame
                 .get("recipient_wire")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
                 .unwrap_or("");
+            if message_id.is_empty() || !is_valid_public_key_hex(recipient) {
+                native_log::warn(
+                    "delivery",
+                    format!("message.ack_to_sender dropped: bad mid or recipient"),
+                );
+                return;
+            }
             // Server field is `delivered_at_ms`; transcript/ack path uses `received_at_ms`
             // (recipient-authoritative first-accept time).
             let received_at_ms = frame
@@ -555,11 +613,20 @@ async fn handle_push_frame(
             let message_id = frame
                 .get("message_id")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
                 .unwrap_or("");
             let recipient = frame
                 .get("recipient_wire")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
                 .unwrap_or("");
+            if message_id.is_empty() || !is_valid_public_key_hex(recipient) {
+                native_log::warn(
+                    "delivery",
+                    format!("message.read_to_sender dropped: bad mid or recipient"),
+                );
+                return;
+            }
             let ev = json!({
                 "kind": "dm_message",
                 "msg_kind": "ack_read",
@@ -792,10 +859,37 @@ fn append_outbound_voice_transcript(
     audio_path
 }
 
+fn prune_outbox_last_attempt_map(m: &mut HashMap<String, i64>) {
+    while m.len() > MAX_OUTBOX_LAST_ATTEMPT_TRACKED {
+        let Some(oldest_key) = m
+            .iter()
+            .min_by_key(|(_, t)| *t)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        m.remove(&oldest_key);
+    }
+}
+
 fn mark_outbox_attempt(message_id: &str, now: i64) {
     if let Ok(mut m) = outbox_last_attempt_mx().lock() {
         m.insert(message_id.to_string(), now);
+        prune_outbox_last_attempt_map(&mut m);
     }
+}
+
+fn clear_outbox_attempt(message_id: &str) {
+    if let Ok(mut m) = outbox_last_attempt_mx().lock() {
+        m.remove(message_id);
+    }
+}
+
+fn outbox_upload_in_flight(message_id: &str) -> bool {
+    outbox_in_flight_mx()
+        .lock()
+        .map(|g| g.contains(message_id))
+        .unwrap_or(false)
 }
 
 fn outbox_due_for_retry(message_id: &str, now: i64) -> bool {
@@ -806,6 +900,15 @@ fn outbox_due_for_retry(message_id: &str, now: i64) -> bool {
         None => true,
         Some(last) => now.saturating_sub(*last) >= DELIVERY_OUTBOX_RESEND_INTERVAL_MS,
     }
+}
+
+/// Outbox burst/resync may retry after [`DELIVERY_OUTBOX_RESEND_INTERVAL_MS`], but not while an
+/// upload thread still holds the in-flight claim (mirrors native `on_wire` throttling).
+fn outbox_row_eligible_for_resync(message_id: &str, now: i64) -> bool {
+    if outbox_upload_in_flight(message_id) {
+        return false;
+    }
+    outbox_due_for_retry(message_id, now)
 }
 
 fn try_claim_outbox_upload(message_id: &str) -> bool {
@@ -825,7 +928,36 @@ fn release_outbox_upload(message_id: &str) {
     }
 }
 
+struct OutboxUploadGuard {
+    message_id: String,
+}
+
+impl OutboxUploadGuard {
+    fn new(message_id: &str) -> Self {
+        Self {
+            message_id: message_id.to_string(),
+        }
+    }
+}
+
+impl Drop for OutboxUploadGuard {
+    fn drop(&mut self) {
+        release_outbox_upload(&self.message_id);
+    }
+}
+
+/// Backoff sleep that returns promptly when [`delivery_stop`] sets the stop flag.
+async fn sleep_secs_interruptible(secs: u64, stop: &AtomicBool) {
+    for _ in 0..secs {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn apply_delivery_upload_ok(recipient: &str, message_id: &str, resp: &Value) {
+    clear_outbox_attempt(message_id);
     if let Some(ns) = active_app_namespace() {
         let _ = patch_outgoing_delivery(&ns, recipient, message_id, "sent");
     }
@@ -848,30 +980,39 @@ fn spawn_delivery_upload(recipient: String, text: String, message_id: String) {
         return;
     }
     mark_outbox_attempt(&message_id, now_ms());
-    std::thread::Builder::new()
+    let mid = message_id.clone();
+    match std::thread::Builder::new()
         .name("delivery_upload".into())
         .spawn(move || {
-            let result = blocking_upload_text(&url, &recipient, &text, &message_id, None);
-            release_outbox_upload(&message_id);
+            let _guard = OutboxUploadGuard::new(&mid);
+            let result = blocking_upload_text(&url, &recipient, &text, &mid, None);
             match result {
-                Ok(resp) => apply_delivery_upload_ok(&recipient, &message_id, &resp),
+                Ok(resp) => apply_delivery_upload_ok(&recipient, &mid, &resp),
                 Err(e) => {
                     native_log::warn(
                         "delivery",
-                        format!("upload failed message_id={message_id}: {e}"),
+                        format!("upload failed message_id={mid}: {e}"),
                     );
                     // Permanent client/auth/size errors — stop retrying as pending.
                     if is_hard_upload_error(&e) {
                         if let Some(ns) = active_app_namespace() {
                             let _ = crate::dm_transcript_store::patch_outgoing_failed(
-                                &ns, &recipient, &message_id,
+                                &ns, &recipient, &mid,
                             );
                         }
                     }
                 }
             }
-        })
-        .ok();
+        }) {
+        Ok(_) => {}
+        Err(e) => {
+            release_outbox_upload(&message_id);
+            native_log::warn(
+                "delivery",
+                format!("upload thread spawn failed message_id={message_id}: {e}"),
+            );
+        }
+    }
 }
 
 fn spawn_delivery_voice_upload(
@@ -887,30 +1028,39 @@ fn spawn_delivery_voice_upload(
         return;
     }
     mark_outbox_attempt(&message_id, now_ms());
-    std::thread::Builder::new()
+    let mid = message_id.clone();
+    match std::thread::Builder::new()
         .name("delivery_upload".into())
         .spawn(move || {
+            let _guard = OutboxUploadGuard::new(&mid);
             let result =
-                blocking_upload_voice(&url, &recipient, duration_ms, &opus_blob, &message_id, None);
-            release_outbox_upload(&message_id);
+                blocking_upload_voice(&url, &recipient, duration_ms, &opus_blob, &mid, None);
             match result {
-                Ok(resp) => apply_delivery_upload_ok(&recipient, &message_id, &resp),
+                Ok(resp) => apply_delivery_upload_ok(&recipient, &mid, &resp),
                 Err(e) => {
                     native_log::warn(
                         "delivery",
-                        format!("voice upload failed message_id={message_id}: {e}"),
+                        format!("voice upload failed message_id={mid}: {e}"),
                     );
                     if is_hard_upload_error(&e) {
                         if let Some(ns) = active_app_namespace() {
                             let _ = crate::dm_transcript_store::patch_outgoing_failed(
-                                &ns, &recipient, &message_id,
+                                &ns, &recipient, &mid,
                             );
                         }
                     }
                 }
             }
-        })
-        .ok();
+        }) {
+        Ok(_) => {}
+        Err(e) => {
+            release_outbox_upload(&message_id);
+            native_log::warn(
+                "delivery",
+                format!("voice upload thread spawn failed message_id={message_id}: {e}"),
+            );
+        }
+    }
 }
 
 fn spawn_delivery_attachment_upload(
@@ -925,30 +1075,38 @@ fn spawn_delivery_attachment_upload(
         return;
     }
     mark_outbox_attempt(&message_id, now_ms());
-    std::thread::Builder::new()
+    let mid = message_id.clone();
+    match std::thread::Builder::new()
         .name("delivery_upload".into())
         .spawn(move || {
-            let result =
-                blocking_upload_attachment(&url, &recipient, &inner, &message_id, None);
-            release_outbox_upload(&message_id);
+            let _guard = OutboxUploadGuard::new(&mid);
+            let result = blocking_upload_attachment(&url, &recipient, &inner, &mid, None);
             match result {
-                Ok(resp) => apply_delivery_upload_ok(&recipient, &message_id, &resp),
+                Ok(resp) => apply_delivery_upload_ok(&recipient, &mid, &resp),
                 Err(e) => {
                     native_log::warn(
                         "delivery",
-                        format!("attachment upload failed message_id={message_id}: {e}"),
+                        format!("attachment upload failed message_id={mid}: {e}"),
                     );
                     if is_hard_upload_error(&e) {
                         if let Some(ns) = active_app_namespace() {
                             let _ = crate::dm_transcript_store::patch_outgoing_failed(
-                                &ns, &recipient, &message_id,
+                                &ns, &recipient, &mid,
                             );
                         }
                     }
                 }
             }
-        })
-        .ok();
+        }) {
+        Ok(_) => {}
+        Err(e) => {
+            release_outbox_upload(&message_id);
+            native_log::warn(
+                "delivery",
+                format!("attachment upload thread spawn failed message_id={message_id}: {e}"),
+            );
+        }
+    }
 }
 
 /// Retry outbound transcript rows stuck at `delivery=pending` (failed one-shot uploads).
@@ -987,7 +1145,7 @@ pub fn delivery_outbox_upkeep() {
             else {
                 continue;
             };
-            if !outbox_due_for_retry(mid, now) {
+            if !outbox_row_eligible_for_resync(mid, now) {
                 continue;
             }
             if spawned + due_text.len() >= DELIVERY_OUTBOX_MAX_PER_TICK {
@@ -1106,6 +1264,15 @@ pub fn delivery_outbox_upkeep() {
 pub fn delivery_send_text_dm(recipient: &str, text: &str, message_id: &str) -> Value {
     if delivery_url().is_none() {
         return json!({ "ok": false, "error": "GHALBOL_DELIVERY_URL not set" });
+    }
+    if text.len() > crate::host::MAX_TEXT_DM_BYTES {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "message longer than {} bytes",
+                crate::host::MAX_TEXT_DM_BYTES
+            ),
+        });
     }
     let recipient_trim = recipient.trim().to_lowercase();
     if let Ok(ident) = unlocked_identity_clone() {
@@ -1294,7 +1461,7 @@ pub fn delivery_extend_ttl(message_id: &str, extend_secs: u64) -> Value {
         Err(e) => return json!({ "ok": false, "error": e.to_string() }),
     };
     match rt.block_on(async {
-        let mut session = connect_and_auth(&ws_url, &ident).await?;
+        let mut session = connect_and_auth(&ws_url, &ident, None).await?;
         session.extend_ttl(&ident, &mid, extend_secs).await
     }) {
         Ok(resp) => json!({ "ok": true, "extended": resp }),
@@ -1319,7 +1486,7 @@ pub fn delivery_mailbox_list(include_expired: bool) -> Value {
         Err(e) => return json!({ "ok": false, "error": e.to_string() }),
     };
     match rt.block_on(async {
-        let mut session = connect_and_auth(&ws_url, &ident).await?;
+        let mut session = connect_and_auth(&ws_url, &ident, None).await?;
         session.mailbox_list(include_expired).await
     }) {
         Ok(snapshot) => {
@@ -1339,6 +1506,27 @@ pub fn delivery_mailbox_list(include_expired: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn outbox_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn delivery_reconnect_backoff_doubles_to_cap() {
+        assert_eq!(delivery_reconnect_backoff_step(1), (1, 2));
+        assert_eq!(delivery_reconnect_backoff_step(32), (32, 60));
+        assert_eq!(delivery_reconnect_backoff_step(60), (60, 60));
+    }
+
+    #[test]
+    fn delivery_stopped_err_is_recognized() {
+        assert!(is_delivery_stopped_err("delivery stopped"));
+        assert!(!is_delivery_stopped_err("ws closed"));
+    }
 
     #[test]
     fn hard_upload_errors_are_classified() {
@@ -1358,6 +1546,111 @@ mod tests {
         assert!(is_permanent_inbound_open_error("unsupported attachment_version=1"));
         assert!(!is_permanent_inbound_open_error("disk full writing attach dir"));
         assert!(!is_permanent_inbound_open_error("app namespace not set"));
+    }
+
+    #[test]
+    fn outbox_last_attempt_evicts_oldest_when_capped() {
+        let _serial = outbox_test_lock();
+        let mut m = HashMap::new();
+        for i in 0..MAX_OUTBOX_LAST_ATTEMPT_TRACKED {
+            m.insert(format!("cap-mid-{i}"), i as i64);
+        }
+        m.insert("cap-mid-newest".into(), i64::MAX);
+        prune_outbox_last_attempt_map(&mut m);
+        assert_eq!(m.len(), MAX_OUTBOX_LAST_ATTEMPT_TRACKED);
+        assert!(!m.contains_key("cap-mid-0"));
+        assert!(m.contains_key("cap-mid-newest"));
+    }
+
+    #[test]
+    fn clear_outbox_attempt_removes_throttle_entry() {
+        let _serial = outbox_test_lock();
+        let mid = "clear-attempt-mid";
+        mark_outbox_attempt(mid, 42);
+        clear_outbox_attempt(mid);
+        let Ok(m) = outbox_last_attempt_mx().lock() else {
+            return;
+        };
+        assert!(!m.contains_key(mid));
+    }
+
+    #[test]
+    fn outbox_resync_throttle_skips_in_flight_and_recent_attempts() {
+        let _serial = outbox_test_lock();
+        let mid = "outbox-eligible-resync-mid";
+        let now = 10_000i64;
+        if let Ok(mut g) = outbox_in_flight_mx().lock() {
+            g.insert(mid.to_string());
+        }
+        if let Ok(mut m) = outbox_last_attempt_mx().lock() {
+            m.insert(mid.to_string(), now - DELIVERY_OUTBOX_RESEND_INTERVAL_MS);
+        }
+        assert!(!outbox_row_eligible_for_resync(mid, now));
+        release_outbox_upload(mid);
+        assert!(outbox_row_eligible_for_resync(mid, now));
+        if let Ok(mut m) = outbox_last_attempt_mx().lock() {
+            m.insert(mid.to_string(), now);
+        }
+        assert!(!outbox_row_eligible_for_resync(mid, now));
+        if let Ok(mut m) = outbox_last_attempt_mx().lock() {
+            m.remove(mid);
+        }
+    }
+
+    #[test]
+    fn outbox_upload_guard_releases_in_flight_on_drop() {
+        let _serial = outbox_test_lock();
+        let mid = "outbox-guard-drop-test-mid";
+        if let Ok(mut g) = outbox_in_flight_mx().lock() {
+            g.remove(mid);
+        }
+        assert!(try_claim_outbox_upload(mid));
+        {
+            let _guard = OutboxUploadGuard::new(mid);
+            assert!(!try_claim_outbox_upload(mid));
+        }
+        assert!(try_claim_outbox_upload(mid));
+        release_outbox_upload(mid);
+    }
+
+    #[tokio::test]
+    async fn interruptible_sleep_stops_when_flag_set() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_in_task = stop.clone();
+        let handle = tokio::spawn(async move {
+            sleep_secs_interruptible(60, &stop_in_task).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("sleep did not exit after stop")
+            .expect("join");
+    }
+
+    #[test]
+    fn delivery_tick_push_rejects_empty_mid_or_bad_recipient() {
+        assert!(!is_valid_public_key_hex(""));
+        assert!(!is_valid_public_key_hex("not-a-key"));
+        let secret = crate::identity::generate_secret(crate::identity::IdentityAlgorithm::Secp256k1)
+            .expect("secret");
+        let pk = crate::identity::public_key_from_secret(
+            crate::identity::IdentityAlgorithm::Secp256k1,
+            &secret,
+        )
+        .expect("pk");
+        let valid = hex::encode(pk);
+        assert!(is_valid_public_key_hex(&valid));
+    }
+
+    #[test]
+    fn clear_outbox_in_flight_unblocks_resync() {
+        let _serial = outbox_test_lock();
+        let mid = "clear-outbox-flight-mid";
+        assert!(try_claim_outbox_upload(mid));
+        clear_delivery_outbox_in_flight();
+        assert!(try_claim_outbox_upload(mid));
+        release_outbox_upload(mid);
     }
 
     #[test]

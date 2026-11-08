@@ -42,4 +42,32 @@ impl DeliveryError {
             _ => "error",
         }
     }
+
+    /// Text safe to return to a peer. Database and internal details stay in the log.
+    pub fn client_message(&self) -> String {
+        let raw = match self {
+            Self::Db(_) | Self::Internal(_) | Self::Io(_) => return "internal error".to_string(),
+            other => other.to_string(),
+        };
+        const MAX_CHARS: usize = 240;
+        if raw.chars().count() <= MAX_CHARS {
+            raw
+        } else {
+            let trimmed: String = raw.chars().take(MAX_CHARS).collect();
+            format!("{trimmed}…")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_errors_are_not_echoed_to_clients() {
+        let err = DeliveryError::Internal("db path /var/lib/secret".into());
+        assert_eq!(err.client_message(), "internal error");
+        let long = DeliveryError::BadRequest("x".repeat(500));
+        assert!(long.client_message().chars().count() <= 241);
+    }
 }

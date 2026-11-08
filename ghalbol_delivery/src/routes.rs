@@ -5,9 +5,10 @@ use axum::{
     routing::get,
 };
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::ws::{WsState, handle_socket, spawn_ttl_sweeper};
+use crate::ws::{ConnLimits, WsState, handle_socket, spawn_ttl_sweeper};
 use crate::AppState;
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -19,6 +20,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     let connected = state.registry.connected_count().await;
+    let live_sockets = state.registry.live_sockets();
     let body = match state.store.aggregate_health(connected) {
         Ok(metrics) => json!({
             "ok": true,
@@ -26,15 +28,24 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
             "instance_id": crate::instance::instance_id(),
             "schema_version": crate::db::SCHEMA_VERSION,
             "connected_peers": metrics.connected_peers,
+            "live_sockets": live_sockets,
             "pending_messages": metrics.pending_messages,
             "pending_bytes": metrics.pending_bytes,
             "oldest_pending_age_secs": metrics.oldest_pending_age_secs,
+            "rejected_frames": state.ops.rejected_frames.load(Ordering::Relaxed),
+            "rejected_connections": state.ops.rejected_connections.load(Ordering::Relaxed),
+            "auth_failures": state.ops.auth_failures.load(Ordering::Relaxed),
+            "uploads_total": state.ops.uploads_total.load(Ordering::Relaxed),
+            "messages_expired": state.ops.messages_expired.load(Ordering::Relaxed),
         }),
-        Err(e) => json!({
-            "ok": false,
-            "service": "ghalbol_delivery",
-            "error": e.to_string(),
-        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "health query failed");
+            json!({
+                "ok": false,
+                "service": "ghalbol_delivery",
+                "error": "unavailable",
+            })
+        }
     };
     Json(body)
 }
@@ -43,15 +54,25 @@ async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let max_bytes = state.config.max_ws_message_bytes;
     let ws_state = Arc::new(WsState {
         store: state.store.clone(),
         policy: state.policy.clone(),
         registry: state.registry.clone(),
-        challenges: state.challenges.clone(),
+        shutdown: state.shutdown.subscribe(),
+        ops: state.ops.clone(),
+        limits: ConnLimits::from_config(&state.config),
     });
-    ws.on_upgrade(move |socket| handle_socket(socket, ws_state))
+    ws.max_message_size(max_bytes)
+        .max_frame_size(max_bytes)
+        .on_upgrade(move |socket| handle_socket(socket, ws_state))
 }
 
 pub fn spawn_background_tasks(state: Arc<AppState>) {
-    spawn_ttl_sweeper(state.store.clone(), state.registry.clone());
+    let _ = spawn_ttl_sweeper(
+        state.store.clone(),
+        state.registry.clone(),
+        state.shutdown.subscribe(),
+        state.ops.clone(),
+    );
 }

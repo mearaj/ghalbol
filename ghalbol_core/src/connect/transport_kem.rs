@@ -10,13 +10,27 @@ use x25519_dalek::{PublicKey, StaticSecret};
 static PEER_TRANSPORT_PKS: OnceLock<Mutex<std::collections::HashMap<String, [u8; 32]>>> =
     OnceLock::new();
 
+/// Align with ConnectConfig peer caps — refuse unbounded KEM cache growth.
+const MAX_PEER_TRANSPORT_PKS: usize = 512;
+
 fn peer_map() -> &'static Mutex<std::collections::HashMap<String, [u8; 32]>> {
     PEER_TRANSPORT_PKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 pub(crate) fn set_peer_transport_pk(peer_wire: &str, pk: [u8; 32]) {
     if let Ok(mut m) = peer_map().lock() {
+        if !m.contains_key(peer_wire) && m.len() >= MAX_PEER_TRANSPORT_PKS {
+            if let Some(old) = m.keys().next().cloned() {
+                m.remove(&old);
+            }
+        }
         m.insert(peer_wire.to_string(), pk);
+    }
+}
+
+pub(crate) fn clear_peer_transport_pk(peer_wire: &str) {
+    if let Ok(mut m) = peer_map().lock() {
+        m.remove(peer_wire);
     }
 }
 
@@ -71,6 +85,18 @@ mod tests {
     }
 
     #[test]
+    fn clear_peer_transport_pk_drops_session_cache() {
+        let peer = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        set_peer_transport_pk(peer, [3u8; 32]);
+        assert_eq!(
+            peer_map().lock().unwrap().get(peer).copied(),
+            Some([3u8; 32])
+        );
+        clear_peer_transport_pk(peer);
+        assert!(!peer_map().lock().unwrap().contains_key(peer));
+    }
+
+    #[test]
     fn transport_kem_roundtrip_after_set() {
         let (_ks, id) = crate::create_keystore_v1("pw", None).unwrap();
         crate::session_runtime::install_unlocked_identity(id).unwrap();
@@ -81,5 +107,20 @@ mod tests {
         assert_eq!(got, pk);
         let _ = PublicKey::from(got);
         let _ = sk;
+    }
+
+    #[test]
+    fn peer_transport_pk_map_stays_capped() {
+        if let Ok(mut m) = peer_map().lock() {
+            m.clear();
+        }
+        for i in 0..(MAX_PEER_TRANSPORT_PKS + 40) {
+            set_peer_transport_pk(&format!("peer-{i:04}"), [i as u8; 32]);
+        }
+        let len = peer_map().lock().map(|g| g.len()).unwrap_or(usize::MAX);
+        assert!(len <= MAX_PEER_TRANSPORT_PKS, "kem cache grew past cap: {len}");
+        if let Ok(mut m) = peer_map().lock() {
+            m.clear();
+        }
     }
 }

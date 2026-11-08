@@ -25,6 +25,26 @@ pub const CONNECT_APP_SCHEME: &str = "ghalbol";
 pub const CONNECT_PATH_SEGMENT: &str = "connect";
 
 const DEFAULT_TOPIC: &str = "ghalbol-chat";
+/// QR / paste URI hard cap (DoS / UI hang on pathological clipboard paste).
+const MAX_INVITE_URI_CHARS: usize = 8 * 1024;
+/// Display alias in invite query / wire — keep roster rows bounded.
+const MAX_INVITE_ALIAS_CHARS: usize = 128;
+/// Path segment cap before/after percent-decode (identity wire + `algo:` prefix).
+const MAX_INVITE_IDENTITY_PATH_CHARS: usize = 192;
+const MAX_INVITE_TOPIC_CHARS: usize = 128;
+
+fn normalize_invite_alias(alias: &str) -> Result<Option<String>, String> {
+    let t = alias.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.chars().count() > MAX_INVITE_ALIAS_CHARS {
+        return Err(format!(
+            "alias longer than {MAX_INVITE_ALIAS_CHARS} characters"
+        ));
+    }
+    Ok(Some(t.to_string()))
+}
 
 fn identity_wire_from_field(label: &str, wire_s: &str) -> Result<String, String> {
     Identity::parse(wire_s).map_err(|e| format!("{label}: {e}"))?;
@@ -35,6 +55,17 @@ fn field_nonempty_string(v: &Value, key: &str) -> bool {
     v.get(key)
         .and_then(|x| x.as_str())
         .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn verify_invite_topic(v: &Value) -> Result<(), String> {
+    let topic = v
+        .get("topic")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing topic".to_string())?;
+    if topic.len() > MAX_INVITE_TOPIC_CHARS {
+        return Err("topic too long".to_string());
+    }
+    Ok(())
 }
 
 fn wire_share_from_value(v: &Value) -> Result<&str, String> {
@@ -58,9 +89,7 @@ fn verify_v3(v: &Value) -> Result<(), String> {
             CONNECT_INVITE_FORMAT_VERSION_V3
         ));
     }
-    if v.get("topic").and_then(|x| x.as_str()).is_none() {
-        return Err("missing topic".to_string());
-    }
+    verify_invite_topic(v)?;
     if field_nonempty_string(v, "invite_signature_hex") {
         return Err("invite_signature_hex is not supported".to_string());
     }
@@ -70,21 +99,19 @@ fn verify_v3(v: &Value) -> Result<(), String> {
     if v.get("multiaddrs").is_some() {
         return Err("multiaddrs must not appear on wire".to_string());
     }
-    let wire = v
-        .get("identity_wire")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| "missing identity_wire".to_string())?;
-    identity_wire_from_field("identity_wire", wire)?;
     if v.get("public_key_hex").is_some() {
         return Err("public_key_hex must not appear on v3 wire (use identity_wire)".to_string());
     }
     if v.get("peer_alias").is_some() {
         return Err("peer_alias must not appear on v3 wire (use global_alias)".to_string());
     }
+    let wire = v
+        .get("identity_wire")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "missing identity_wire".to_string())?;
+    identity_wire_from_field("identity_wire", wire)?;
     if let Some(alias) = v.get("global_alias").and_then(|x| x.as_str()) {
-        if alias.trim().is_empty() {
-            return Err("global_alias must not be empty when present".to_string());
-        }
+        let _ = normalize_invite_alias(alias)?;
     }
     Ok(())
 }
@@ -104,9 +131,7 @@ fn verify_v2(v: &Value) -> Result<(), String> {
             CONNECT_INVITE_FORMAT_VERSION
         ));
     }
-    if v.get("topic").and_then(|x| x.as_str()).is_none() {
-        return Err("missing topic".to_string());
-    }
+    verify_invite_topic(v)?;
     if field_nonempty_string(v, "invite_signature_hex") {
         return Err("invite_signature_hex is not supported".to_string());
     }
@@ -115,6 +140,12 @@ fn verify_v2(v: &Value) -> Result<(), String> {
     }
     if v.get("multiaddrs").is_some() {
         return Err("multiaddrs must not appear on wire (use coordination lookup)".to_string());
+    }
+    if v.get("identity_wire").is_some() {
+        return Err("identity_wire must not appear on v2 wire (use public_key_hex)".to_string());
+    }
+    if v.get("global_alias").is_some() {
+        return Err("global_alias must not appear on v2 wire (use peer_alias)".to_string());
     }
     let pk_hex = v
         .get("public_key_hex")
@@ -128,6 +159,9 @@ fn verify_v2(v: &Value) -> Result<(), String> {
         return Err(
             "coord_base_url must not appear on invite wire (use app env / preferences)".to_string(),
         );
+    }
+    if let Some(alias) = v.get("peer_alias").and_then(|x| x.as_str()) {
+        let _ = normalize_invite_alias(alias)?;
     }
     Ok(())
 }
@@ -146,9 +180,8 @@ pub fn build_connect_invite_wire_map(
         "identity_wire": wire,
     });
     if let Some(a) = peer_alias {
-        let t = a.trim();
-        if !t.is_empty() {
-            m["global_alias"] = Value::String(t.to_string());
+        if let Some(t) = normalize_invite_alias(a)? {
+            m["global_alias"] = Value::String(t);
         }
     }
     Ok(m)
@@ -179,16 +212,11 @@ pub fn identity_wire_from_invite(v: &Value) -> Result<String, String> {
 /// Global alias from invite wire (v3 `global_alias`, v2 `peer_alias`).
 pub fn global_alias_from_invite(v: &Value) -> Option<String> {
     if let Some(a) = v.get("global_alias").and_then(|x| x.as_str()) {
-        let t = a.trim();
-        if !t.is_empty() {
-            return Some(t.to_string());
-        }
+        return normalize_invite_alias(a).ok().flatten();
     }
     v.get("peer_alias")
         .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+        .and_then(|a| normalize_invite_alias(a).ok().flatten())
 }
 
 fn percent_encode_query_component(s: &str) -> String {
@@ -238,18 +266,20 @@ pub fn connect_invite_app_uri_from_wire_map(v: &Value) -> Result<String, String>
     Ok(url)
 }
 
-fn parse_alias_query(query: Option<&str>) -> Option<String> {
-    let q = query?;
+fn parse_alias_query(query: Option<&str>) -> Result<Option<String>, String> {
+    let Some(q) = query else {
+        return Ok(None);
+    };
+    if q.len() > MAX_INVITE_URI_CHARS {
+        return Err("invite query too long".to_string());
+    }
     for part in q.split('&') {
         if let Some(v) = part.strip_prefix("alias=") {
             let decoded = percent_decode_query_component(v);
-            let t = decoded.trim();
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
+            return normalize_invite_alias(&decoded);
         }
     }
-    None
+    Ok(None)
 }
 
 fn percent_decode_query_component(s: &str) -> String {
@@ -272,20 +302,63 @@ fn percent_decode_query_component(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn invite_identity_path_rejected(seg: &str) -> bool {
+    if seg.is_empty() {
+        return true;
+    }
+    seg.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '/' | '\\' | '#' | '?' | '@' | '\0')
+    })
+}
+
 fn parse_public_key_path_segment(seg: &str) -> Result<String, String> {
-    let seg = percent_decode_uri_component(seg.trim().trim_end_matches('/'));
-    identity_wire_from_field("public_key_hex", &seg)
+    let seg = seg.trim().trim_end_matches('/');
+    if seg.len() > MAX_INVITE_IDENTITY_PATH_CHARS {
+        return Err("invite identity path too long".to_string());
+    }
+    if invite_identity_path_rejected(seg) {
+        return Err("invite identity path rejected".to_string());
+    }
+    let decoded = percent_decode_uri_component(seg);
+    if decoded.len() > MAX_INVITE_IDENTITY_PATH_CHARS {
+        return Err("invite identity path too long".to_string());
+    }
+    if invite_identity_path_rejected(&decoded) {
+        return Err("invite identity path rejected".to_string());
+    }
+    identity_wire_from_field("public_key_hex", &decoded)
+}
+
+fn identity_path_segment_only(pk_seg: &str) -> Result<&str, String> {
+    let t = pk_seg.trim();
+    let (head, tail) = t
+        .split_once('/')
+        .map(|(h, r)| (h, r.trim()))
+        .unwrap_or((t, ""));
+    if !tail.is_empty() {
+        return Err("invite has extra path segments".to_string());
+    }
+    Ok(head.trim())
 }
 
 fn parse_path_style_invite(input: &str) -> Result<Value, String> {
     let t = input.trim();
+    if t.len() > MAX_INVITE_URI_CHARS {
+        return Err("invite URI too long".to_string());
+    }
     let lower = t.to_ascii_lowercase();
 
     let (path_and_host, query) = match t.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (t, None),
     };
-    let alias = parse_alias_query(query);
+    let path_and_host = path_and_host
+        .split('#')
+        .next()
+        .unwrap_or(path_and_host)
+        .trim();
+    let alias = parse_alias_query(query)?;
 
     // ghalbol://connect/<pk>
     let app_prefix = format!("{CONNECT_APP_SCHEME}://");
@@ -296,6 +369,7 @@ fn parse_path_style_invite(input: &str) -> Result<Value, String> {
             .or_else(|| rest.strip_prefix(&format!("{CONNECT_PATH_SEGMENT}/")))
             .ok_or_else(|| "not a Ghal Bol connect invite".to_string())?
             .trim_start_matches('/');
+        let pk_seg = identity_path_segment_only(pk_seg)?;
         let pk = parse_public_key_path_segment(pk_seg)?;
         return wire_map_from_public_key_and_alias(&pk, alias.as_deref());
     }
@@ -310,6 +384,7 @@ fn parse_path_style_invite(input: &str) -> Result<Value, String> {
                 .or_else(|| rest.strip_prefix(&format!("{CONNECT_PATH_SEGMENT}/")))
                 .ok_or_else(|| "not a Ghal Bol connect invite".to_string())?
                 .trim_start_matches('/');
+            let pk_seg = identity_path_segment_only(pk_seg)?;
             let pk = parse_public_key_path_segment(pk_seg)?;
             return wire_map_from_public_key_and_alias(&pk, alias.as_deref());
         }
@@ -321,6 +396,9 @@ fn parse_path_style_invite(input: &str) -> Result<Value, String> {
 /// Parse invite URI → wire map (before verification).
 pub fn parse_connect_invite_uri(input: &str) -> Result<Value, String> {
     let t = input.trim().replace([' ', '\n', '\r', '\t'], "");
+    if t.len() > MAX_INVITE_URI_CHARS {
+        return Err("invite URI too long".to_string());
+    }
     parse_path_style_invite(&t)
 }
 
@@ -426,5 +504,129 @@ mod tests {
         verify_ghalbol_connect_invite_value(&wire).unwrap();
         assert_eq!(wire["format_version"], CONNECT_INVITE_FORMAT_VERSION_V3);
         assert_eq!(wire["global_alias"], "Bob");
+    }
+
+    #[test]
+    fn rejects_oversized_uri_and_alias() {
+        let huge = format!("ghalbol://connect/{}", "a".repeat(MAX_INVITE_URI_CHARS));
+        assert!(parse_connect_invite_uri(&huge).is_err());
+        let long_alias = "x".repeat(MAX_INVITE_ALIAS_CHARS + 1);
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        assert!(
+            build_connect_invite_wire_map("ghalbol-chat", &id.public_key_hex(), Some(&long_alias))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_rejects_oversized_peer_alias() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let pk = id.public_key_hex();
+        let long_alias = "y".repeat(MAX_INVITE_ALIAS_CHARS + 1);
+        let v = serde_json::json!({
+            "ghalbol.share": SHARE,
+            "format_version": CONNECT_INVITE_FORMAT_VERSION,
+            "topic": "ghalbol-chat",
+            "public_key_hex": pk,
+            "peer_alias": long_alias,
+        });
+        assert!(verify_ghalbol_connect_invite_value(&v).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_oversized_alias_query() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let pk = id.public_key_hex();
+        let long_alias = "z".repeat(MAX_INVITE_ALIAS_CHARS + 1);
+        let uri = format!("ghalbol://connect/{pk}?alias={long_alias}");
+        assert!(parse_connect_invite_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_extra_path_and_injection_segments() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let pk = id.public_key_hex();
+        assert!(parse_connect_invite_uri(&format!("ghalbol://connect/{pk}/evil")).is_err());
+        assert!(parse_connect_invite_uri(&format!("ghalbol://connect/{pk}%2fevil")).is_err());
+        let frag = parse_connect_invite_uri(&format!("ghalbol://connect/{pk}#alias=Evil")).unwrap();
+        assert!(global_alias_from_invite(&frag).is_none());
+        assert!(parse_connect_invite_uri(&format!("ghalbol://connect/@{pk}")).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_ghalbol_https_host() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let pk = id.public_key_hex();
+        let uri = format!("https://evil.example/connect/{pk}");
+        assert!(parse_connect_invite_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn v2_rejects_v3_only_fields_and_oversized_topic() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let pk = id.public_key_hex();
+        let v = serde_json::json!({
+            "ghalbol.share": SHARE,
+            "format_version": CONNECT_INVITE_FORMAT_VERSION,
+            "topic": "ghalbol-chat",
+            "public_key_hex": pk,
+            "identity_wire": pk,
+        });
+        assert!(verify_ghalbol_connect_invite_value(&v).is_err());
+        let v2 = serde_json::json!({
+            "ghalbol.share": SHARE,
+            "format_version": CONNECT_INVITE_FORMAT_VERSION,
+            "topic": "ghalbol-chat",
+            "public_key_hex": pk,
+            "global_alias": "Ada",
+        });
+        assert!(verify_ghalbol_connect_invite_value(&v2).is_err());
+        let long_topic = "t".repeat(MAX_INVITE_TOPIC_CHARS + 1);
+        let v3 = serde_json::json!({
+            "ghalbol.share": SHARE,
+            "format_version": CONNECT_INVITE_FORMAT_VERSION,
+            "topic": long_topic,
+            "public_key_hex": pk,
+        });
+        assert!(verify_ghalbol_connect_invite_value(&v3).is_err());
+    }
+
+    #[test]
+    fn v3_rejects_v2_only_fields() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let wire = id.identity_wire();
+        let v = serde_json::json!({
+            "ghalbol.share": SHARE,
+            "format_version": CONNECT_INVITE_FORMAT_VERSION_V3,
+            "topic": "ghalbol-chat",
+            "identity_wire": wire,
+            "public_key_hex": id.public_key_hex(),
+        });
+        assert!(verify_ghalbol_connect_invite_value(&v).is_err());
+        let v2 = serde_json::json!({
+            "ghalbol.share": SHARE,
+            "format_version": CONNECT_INVITE_FORMAT_VERSION_V3,
+            "topic": "ghalbol-chat",
+            "identity_wire": wire,
+            "peer_alias": "Bob",
+        });
+        assert!(verify_ghalbol_connect_invite_value(&v2).is_err());
+    }
+
+    #[test]
+    fn parse_invite_uri_stays_under_soft_latency_budget() {
+        let (_ks, id) = create_keystore_v1("pw-lat", None).unwrap();
+        let map = build_connect_invite_wire_map("ghalbol-chat", &id.public_key_hex(), None).unwrap();
+        let uri = connect_invite_app_uri_from_wire_map(&map).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            let parsed = parse_connect_invite_uri(&uri).unwrap();
+            verify_ghalbol_connect_invite_value(&parsed).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "200× invite URI parse took {elapsed:?} (budget 1s)"
+        );
     }
 }

@@ -124,7 +124,7 @@ pub fn transcript_poll_view_key(app_namespace: &str, ev: &Value) -> Option<Strin
 fn dm_ack_sender_matches(sender_pk: &str, contact: &SavedContact) -> bool {
     is_valid_public_key_hex(sender_pk)
         && contact.has_public_key()
-        && contact.public_key_hex == sender_pk
+        && crate::public_key_util::same_contact_pk(sender_pk, &contact.public_key_hex)
 }
 
 fn outbound_delivery_for_ack(msg_kind: &str) -> &'static str {
@@ -133,6 +133,37 @@ fn outbound_delivery_for_ack(msg_kind: &str) -> &'static str {
         "attachment_complete" => "downloaded",
         _ => "delivered",
     }
+}
+
+/// Outbound rows can live under a peer-id bucket until identity merge — patch every lookup key.
+fn patch_outgoing_delivery_merged(
+    ns: &str,
+    lookup_keys: &[String],
+    ref_id: &str,
+    delivery: &str,
+) -> Result<bool, crate::dm_transcript_store::TranscriptStoreError> {
+    let mut changed = false;
+    for key in lookup_keys {
+        if patch_outgoing_delivery(ns, key, ref_id, delivery)? {
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn patch_outgoing_received_at_merged(
+    ns: &str,
+    lookup_keys: &[String],
+    ref_id: &str,
+    received_at_ms: i64,
+) -> Result<bool, crate::dm_transcript_store::TranscriptStoreError> {
+    let mut changed = false;
+    for key in lookup_keys {
+        if patch_outgoing_received_at(ns, key, ref_id, received_at_ms)? {
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Persist inbound text as soon as the DM stream delivers it (must not wait for UI poll).
@@ -922,6 +953,13 @@ fn apply_inbound_attachment_offer(ns: &str, ev: &Value) -> bool {
     changed
 }
 
+fn outbound_row_message_id_matches(row: &StoredChatLine, ref_id: &str) -> bool {
+    row.message_id
+        .as_deref()
+        .map(str::trim)
+        == Some(ref_id.trim())
+}
+
 fn apply_inbound_ack(ns: &str, ev: &Value, msg_kind: &str) -> bool {
     let ref_id = ev
         .get("ref_id")
@@ -931,7 +969,10 @@ fn apply_inbound_ack(ns: &str, ev: &Value, msg_kind: &str) -> bool {
         .trim();
     let from_key = conversation_key_from_event(ev);
     let sender_pk = public_key_hex_from_event(ev);
-    if ref_id.is_empty() || from_key.is_empty() {
+    let wire_peer_id = ev.get("from").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if ref_id.is_empty()
+        || (!is_valid_public_key_hex(&sender_pk) && from_key.is_empty() && wire_peer_id.is_empty())
+    {
         flow_log::warn("DM/store", "inbound ack dropped: missing ref_id or from");
         return false;
     }
@@ -941,8 +982,34 @@ fn apply_inbound_ack(ns: &str, ev: &Value, msg_kind: &str) -> bool {
     } else {
         None
     }
-    .or_else(|| find_by_peer_id(ns, &from_key).ok().flatten());
-    let Some(contact) = contact else {
+    .or_else(|| find_by_peer_id(ns, &from_key).ok().flatten())
+    .or_else(|| {
+        if wire_peer_id.is_empty() {
+            None
+        } else {
+            find_by_peer_id(ns, wire_peer_id).ok().flatten()
+        }
+    });
+
+    let conv = if let Some(c) = &contact {
+        if !dm_ack_sender_matches(&sender_pk, c) {
+            flow_log::warn(
+                "DM/store",
+                format!(
+                    "inbound ack rejected: sender pk={} does not match contact ref={ref_id}",
+                    short_hex(&sender_pk)
+                ),
+            );
+            return false;
+        }
+        c.conversation_key()
+    } else if is_valid_public_key_hex(&sender_pk)
+        && crate::public_key_util::same_contact_pk(&sender_pk, &from_key)
+    {
+        // Delivery ticks may land with transcript-only state — `is_known` / `is_blocked` do not gate acks.
+        crate::public_key_util::normalize_contact_identity_wire(&sender_pk)
+            .unwrap_or_else(|_| sender_pk.trim().to_lowercase())
+    } else {
         flow_log::warn(
             "DM/store",
             format!(
@@ -951,35 +1018,22 @@ fn apply_inbound_ack(ns: &str, ev: &Value, msg_kind: &str) -> bool {
         );
         return false;
     };
-    if !dm_ack_sender_matches(&sender_pk, &contact) {
-        flow_log::warn(
-            "DM/store",
-            format!(
-                "inbound ack rejected: sender pk={} does not match contact ref={ref_id}",
-                short_hex(&sender_pk)
-            ),
-        );
-        return false;
-    }
 
     if is_valid_public_key_hex(&sender_pk) {
         let _ = merge_discovered_peer_id(ns, &sender_pk, "");
     }
-
-    let conv = contact.conversation_key();
-    let wire_peer_id = ev.get("from").and_then(|v| v.as_str()).unwrap_or("").trim();
     let lookup_keys = inbound_transcript_lookup_keys(ns, &conv, &sender_pk, wire_peer_id);
     let rows = load_merged(ns, &lookup_keys, Some(wire_peer_id)).unwrap_or_default();
     let has_outgoing = rows
         .iter()
-        .any(|r| r.outgoing && r.message_id.as_deref() == Some(ref_id));
+        .any(|r| r.outgoing && outbound_row_message_id_matches(r, ref_id));
     let has_inbound = rows
         .iter()
-        .any(|r| !r.outgoing && r.message_id.as_deref() == Some(ref_id));
+        .any(|r| !r.outgoing && outbound_row_message_id_matches(r, ref_id));
 
     if (msg_kind == "ack_read" || msg_kind == "attachment_complete") && has_outgoing {
         let delivery = outbound_delivery_for_ack(msg_kind);
-        match patch_outgoing_delivery(ns, &conv, ref_id, delivery) {
+        match patch_outgoing_delivery_merged(ns, &lookup_keys, ref_id, delivery) {
             Ok(true) => {
                 flow_log::info(
                     "DM/store",
@@ -1005,7 +1059,7 @@ fn apply_inbound_ack(ns: &str, ev: &Value, msg_kind: &str) -> bool {
                 .and_then(|v| v.as_i64())
                 .filter(|&t| t > 0);
             let mut changed = false;
-            match patch_outgoing_delivery(ns, &conv, ref_id, "delivered") {
+            match patch_outgoing_delivery_merged(ns, &lookup_keys, ref_id, "delivered") {
                 Ok(true) => {
                     flow_log::info(
                         "DM/store",
@@ -1023,7 +1077,7 @@ fn apply_inbound_ack(ns: &str, ev: &Value, msg_kind: &str) -> bool {
                 }
             }
             if let Some(at) = peer_received_at {
-                match patch_outgoing_received_at(ns, &conv, ref_id, at) {
+                match patch_outgoing_received_at_merged(ns, &lookup_keys, ref_id, at) {
                     Ok(true) => changed = true,
                     Ok(false) => {}
                     Err(e) => {
@@ -1216,6 +1270,346 @@ mod tests {
         crate::p2p::sync_foreground_peer_now(None);
         crate::p2p::set_app_ui_visible(true);
         crate::p2p::set_app_ack_read_enabled(false);
+    }
+
+    #[test]
+    fn apply_inbound_ack_read_before_received_preserves_read_delivery() {
+        const NS: &str = "test.ack.read_before_received";
+        let _store = isolated_store(NS);
+        let _ = crate::contacts_v1::upsert_contact(
+            NS,
+            crate::contacts_v1::SavedContact {
+                public_key_hex: PK_A.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        );
+        append_if_new(
+            NS,
+            PK_A,
+            StoredChatLine {
+                local_id: "out-read-first".to_string(),
+                text: "sent".to_string(),
+                outgoing: true,
+                from: None,
+                message_id: Some("ack-ref-read-first".to_string()),
+                delivery: "pending".to_string(),
+                created_at_ms: Some(1000),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let read = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_read",
+            "ref_id": "ack-ref-read-first",
+            "sender_public_key_hex": PK_A,
+        });
+        assert!(apply_p2p_event_json(&read));
+        let received = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_received",
+            "ref_id": "ack-ref-read-first",
+            "sender_public_key_hex": PK_A,
+            "received_at_ms": 2000
+        });
+        assert!(apply_p2p_event_json(&received));
+        let rows = load_merged(NS, &[PK_A.to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].delivery, "read");
+        assert_eq!(rows[0].received_at_ms, Some(2000));
+        clear_p2p_handler_context();
+    }
+
+    #[test]
+    fn apply_inbound_ack_read_then_received_preserves_read_delivery() {
+        const NS: &str = "test.ack.read_then_received";
+        let _store = isolated_store(NS);
+        let _ = crate::contacts_v1::upsert_contact(
+            NS,
+            crate::contacts_v1::SavedContact {
+                public_key_hex: PK_A.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        );
+        let line = StoredChatLine {
+            local_id: "out-1".to_string(),
+            text: "sent".to_string(),
+            outgoing: true,
+            from: None,
+            message_id: Some("ack-ref-1".to_string()),
+            delivery: "pending".to_string(),
+            created_at_ms: Some(1000),
+            received_at_ms: None,
+            read_ack_sent: false,
+            msg_kind: "text".into(),
+            duration_ms: None,
+            audio_path: None,
+            file_name: None,
+            mime_type: None,
+            size_bytes: None,
+            local_path: None,
+        };
+        append_if_new(NS, PK_A, line).unwrap();
+        let received = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_received",
+            "ref_id": "ack-ref-1",
+            "sender_public_key_hex": PK_A,
+            "received_at_ms": 2000
+        });
+        assert!(apply_p2p_event_json(&received));
+        let read = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_read",
+            "ref_id": "ack-ref-1",
+            "sender_public_key_hex": PK_A,
+        });
+        assert!(apply_p2p_event_json(&read));
+        let rows = load_merged(NS, &[PK_A.to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].delivery, "read");
+        assert_eq!(rows[0].received_at_ms, Some(2000));
+        clear_p2p_handler_context();
+    }
+
+    #[test]
+    fn apply_inbound_ack_patches_outbound_in_peer_id_transcript_bucket() {
+        const NS: &str = "test.ack.peer_id_bucket";
+        let _store = isolated_store(NS);
+        const PEER_ID: &str = "16Uiu2HAmAckPeerIdBucket";
+        let _ = crate::contacts_v1::upsert_contact(
+            NS,
+            crate::contacts_v1::SavedContact {
+                public_key_hex: PK_A.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        );
+        append_if_new(
+            NS,
+            PEER_ID,
+            StoredChatLine {
+                local_id: "out-peer-bucket".to_string(),
+                text: "sent".to_string(),
+                outgoing: true,
+                from: None,
+                message_id: Some("out-peer-mid".to_string()),
+                delivery: "pending".to_string(),
+                created_at_ms: Some(1000),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let ev_ack = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_received",
+            "ref_id": "out-peer-mid",
+            "from": PEER_ID,
+            "sender_public_key_hex": PK_A,
+            "received_at_ms": 1500
+        });
+        assert!(apply_p2p_event_json(&ev_ack));
+        let rows = load_merged(NS, &[PK_A.to_string(), PEER_ID.to_string()], Some(PEER_ID)).unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.outgoing && r.message_id.as_deref() == Some("out-peer-mid"))
+            .expect("outbound row");
+        assert_eq!(row.delivery, "delivered");
+        clear_p2p_handler_context();
+    }
+
+    #[test]
+    fn apply_inbound_ack_received_unknown_contact_case_insensitive_pk() {
+        const NS: &str = "test.ack.unknown_case";
+        let _store = isolated_store(NS);
+        let ev_in = json!({
+            "kind": "dm_message",
+            "msg_kind": "text",
+            "id": "in-1",
+            "text": "hello",
+            "sender_public_key_hex": PK_A,
+            "created_at_ms": 1000
+        });
+        assert!(apply_p2p_event_json(&ev_in));
+        let c = find_by_public_key(NS, PK_A).unwrap().unwrap();
+        assert!(!c.is_known);
+        append_if_new(
+            NS,
+            PK_A,
+            StoredChatLine {
+                local_id: "loc-1".to_string(),
+                text: "hello".to_string(),
+                outgoing: true,
+                from: None,
+                message_id: Some("out-ack-1".to_string()),
+                delivery: "pending".to_string(),
+                created_at_ms: Some(1000),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let upper = PK_A.to_ascii_uppercase();
+        let ev_ack = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_received",
+            "ref_id": "out-ack-1",
+            "id": "ack_received:out-ack-1",
+            "sender_public_key_hex": upper,
+            "public_key_hex": upper,
+            "received_at_ms": 2000
+        });
+        assert!(apply_p2p_event_json(&ev_ack));
+        let rows = load_merged(NS, &[PK_A.to_string()], None).unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.outgoing && r.message_id.as_deref() == Some("out-ack-1"))
+            .expect("outbound row");
+        assert_eq!(row.delivery, "delivered");
+        clear_p2p_handler_context();
+    }
+
+    #[test]
+    fn apply_inbound_text_poll_replay_fires_notify_once() {
+        const NS: &str = "test.notify.poll_replay";
+        let _store = isolated_store(NS);
+        crate::message_notify::test_reset_inbound_notify_counts();
+        let ev = json!({
+            "kind": "dm_message",
+            "msg_kind": "text",
+            "id": "wire-notify-1",
+            "text": "ping",
+            "sender_public_key_hex": PK_A,
+            "created_at_ms": 1000
+        });
+        assert!(apply_p2p_event_json(&ev));
+        assert!(!apply_p2p_event_json(&ev));
+        assert_eq!(crate::message_notify::test_inbound_notify_count(PK_A), 1);
+        clear_p2p_handler_context();
+        crate::message_notify::test_reset_inbound_notify_counts();
+    }
+
+    #[test]
+    fn apply_inbound_ack_matches_outbound_message_id_with_surrounding_whitespace() {
+        const NS: &str = "test.ack.mid_whitespace";
+        let _store = isolated_store(NS);
+        let _ = crate::contacts_v1::upsert_contact(
+            NS,
+            crate::contacts_v1::SavedContact {
+                public_key_hex: PK_A.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        );
+        append_if_new(
+            NS,
+            PK_A,
+            StoredChatLine {
+                local_id: "out-ws".to_string(),
+                text: "sent".to_string(),
+                outgoing: true,
+                from: None,
+                message_id: Some("  ws-mid  ".to_string()),
+                delivery: "pending".to_string(),
+                created_at_ms: Some(1000),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let ev_ack = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_received",
+            "ref_id": "ws-mid",
+            "sender_public_key_hex": PK_A,
+            "received_at_ms": 2000
+        });
+        assert!(apply_p2p_event_json(&ev_ack));
+        let rows = load_merged(NS, &[PK_A.to_string()], None).unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.outgoing)
+            .expect("outbound row");
+        assert_eq!(row.delivery, "delivered");
+        clear_p2p_handler_context();
+    }
+
+    #[test]
+    fn apply_inbound_ack_dropped_when_ref_id_blank() {
+        const NS: &str = "test.ack.blank_ref";
+        let _store = isolated_store(NS);
+        let ev = json!({
+            "kind": "dm_message",
+            "msg_kind": "ack_received",
+            "ref_id": "   ",
+            "sender_public_key_hex": PK_A,
+        });
+        assert!(!apply_p2p_event_json(&ev));
+        clear_p2p_handler_context();
     }
 
     #[test]

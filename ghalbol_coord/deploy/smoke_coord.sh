@@ -10,6 +10,8 @@ DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${DEPLOY_DIR}/../.." && pwd)"
 cd "${WORKSPACE_ROOT}"
 
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
+
 if [[ "${LIVE_ONLY:-0}" != "1" ]]; then
   echo "== ghalbol_coord: in-process API tests =="
   cargo test -p ghalbol_coord --test http_api

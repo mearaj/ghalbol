@@ -31,8 +31,9 @@ pub fn add_contact(
     public_key_hex: &str,
     alias: Option<&str>,
 ) -> Result<(), String> {
+    let pk = super::require_contact_pk(public_key_hex)?;
     let contact = SavedContact {
-        public_key_hex: public_key_hex.trim().to_string(),
+        public_key_hex: pk,
         display_alias: alias.map(str::to_string),
         availability_status: None,
         last_message_preview: None,
@@ -77,7 +78,8 @@ pub fn rename_contact(
 }
 
 pub fn mark_known(app_namespace: &str, public_key_hex: &str) -> Result<(), String> {
-    contacts_v1::set_contact_trust(app_namespace, public_key_hex, Some(true), Some(false))
+    let pk = super::require_contact_pk(public_key_hex)?;
+    contacts_v1::set_contact_trust(app_namespace, &pk, Some(true), Some(false))
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -104,7 +106,8 @@ pub fn remove_contact(app_namespace: &str, public_key_hex: &str) -> Result<(), S
 }
 
 pub fn set_blocked(app_namespace: &str, public_key_hex: &str, blocked: bool) -> Result<(), String> {
-    contacts_v1::set_contact_trust(app_namespace, public_key_hex, None, Some(blocked))
+    let pk = super::require_contact_pk(public_key_hex)?;
+    contacts_v1::set_contact_trust(app_namespace, &pk, None, Some(blocked))
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -170,7 +173,8 @@ pub(crate) fn peer_display_name(peer_pk_hex: &str) -> String {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    return alias.to_string();
+                    // Notification summaries / call banners must not carry unbounded aliases.
+                    return alias.chars().take(128).collect();
                 }
             }
         }

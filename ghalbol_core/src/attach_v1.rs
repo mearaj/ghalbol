@@ -75,6 +75,27 @@ struct FetchState {
     done: std::sync::mpsc::Sender<Result<String, String>>,
 }
 
+fn sanitize_download_stem(id: &str) -> Result<String, String> {
+    let t = id.trim();
+    if t.is_empty() {
+        return Ok("attach".to_string());
+    }
+    if t.contains('/') || t.contains('\\') || t.contains("..") {
+        return Err("invalid download id".to_string());
+    }
+    if t.chars().count() > 128 {
+        return Err("download id too long".to_string());
+    }
+    Ok(t.to_string())
+}
+
+/// Bound in-memory serve slots (LAN mux). Expired / terminal slots are dropped first.
+const MAX_SERVE_SLOTS: usize = 64;
+/// Bound remembered inbound offers (keyed by message id and blob id — up to 2 entries each).
+const MAX_OFFER_ENTRIES: usize = 512;
+/// Concurrent LAN fetches in flight for this process.
+const MAX_FETCH_INFLIGHT: usize = 16;
+
 fn serve_mx() -> &'static Mutex<HashMap<String, ServeSlot>> {
     static S: OnceLock<Mutex<HashMap<String, ServeSlot>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
@@ -88,6 +109,59 @@ fn offers_mx() -> &'static Mutex<HashMap<String, AttachmentOfferMeta>> {
 fn fetch_mx() -> &'static Mutex<HashMap<String, FetchState>> {
     static S: OnceLock<Mutex<HashMap<String, FetchState>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prune_serve_slots(g: &mut HashMap<String, ServeSlot>, now: i64) {
+    g.retain(|_, slot| {
+        if slot.state == ServeState::Cancelled || slot.state == ServeState::Complete {
+            return false;
+        }
+        if slot.expires_at_ms > 0 && now > slot.expires_at_ms {
+            return false;
+        }
+        true
+    });
+    while g.len() >= MAX_SERVE_SLOTS {
+        // Drop the soonest-to-expire (or already-stale) entry to make room.
+        let victim = g
+            .iter()
+            .min_by_key(|(_, s)| {
+                if s.expires_at_ms > 0 {
+                    s.expires_at_ms
+                } else {
+                    i64::MAX
+                }
+            })
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                g.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
+fn prune_offer_entries(g: &mut HashMap<String, AttachmentOfferMeta>, now: i64) {
+    g.retain(|_, meta| meta.expires_at_ms <= 0 || now <= meta.expires_at_ms);
+    while g.len() >= MAX_OFFER_ENTRIES {
+        let victim = g
+            .iter()
+            .min_by_key(|(_, m)| {
+                if m.expires_at_ms > 0 {
+                    m.expires_at_ms
+                } else {
+                    i64::MAX
+                }
+            })
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                g.remove(&k);
+            }
+            None => break,
+        }
+    }
 }
 
 pub fn attachment_preview(file_name: &str) -> String {
@@ -157,14 +231,26 @@ impl AttachmentInner {
                 self.attachment_version
             ));
         }
-        if self.file_name.trim().is_empty() {
+        let name = self.file_name.trim();
+        if name.is_empty() {
             return Err("attachment file_name empty".to_string());
+        }
+        if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+            return Err("attachment file_name invalid".to_string());
         }
         if self.file_b64.trim().is_empty() {
             return Err("attachment file_b64 empty".to_string());
         }
         if self.size_plaintext == 0 {
             return Err("attachment size_plaintext must be > 0".to_string());
+        }
+        if self.size_plaintext > MAX_FILE_SIZE_BYTES {
+            return Err(format!(
+                "attachment size_plaintext exceeds {MAX_FILE_SIZE_BYTES} bytes"
+            ));
+        }
+        if self.file_name.chars().count() > 512 {
+            return Err("attachment file_name too long".to_string());
         }
         if self.sha256_plaintext.trim().is_empty() {
             return Err("attachment sha256_plaintext empty".to_string());
@@ -173,6 +259,11 @@ impl AttachmentInner {
     }
 
     pub fn file_bytes(&self) -> Result<Vec<u8>, String> {
+        // Reject pathological base64 before allocating decoded buffer.
+        let b64_len = self.file_b64.trim().len();
+        if b64_len > (MAX_FILE_SIZE_BYTES as usize) * 2 {
+            return Err("attachment file_b64 too large".to_string());
+        }
         let plain = B64
             .decode(self.file_b64.trim())
             .map_err(|e| format!("file_b64: {e}"))?;
@@ -277,7 +368,7 @@ pub fn write_attachment_file(
     let mut path = downloads_root(app_namespace)?;
     path.push(format!(
         "{}-{}",
-        message_id.trim().if_empty("attach"),
+        sanitize_download_stem(message_id)?,
         sanitize_file_name(file_name)
     ));
     if let Some(parent) = path.parent() {
@@ -338,10 +429,16 @@ pub fn stage_file_for_offer(
         expected_peer: expected_peer.trim().to_string(),
         state: ServeState::Serving,
     };
-    serve_mx()
-        .lock()
-        .map_err(|_| "serve table lock poisoned".to_string())?
-        .insert(blob_id.to_string(), slot);
+    {
+        let mut g = serve_mx()
+            .lock()
+            .map_err(|_| "serve table lock poisoned".to_string())?;
+        prune_serve_slots(&mut g, now_ms());
+        if g.len() >= MAX_SERVE_SLOTS {
+            return Err("too many attachments serving".to_string());
+        }
+        g.insert(blob_id.to_string(), slot);
+    }
     Ok(StagedAttachment {
         blob_id: blob_id.to_string(),
         preview: attachment_preview(&clean_name),
@@ -357,6 +454,17 @@ pub fn remember_offer(meta: AttachmentOfferMeta) {
         return;
     }
     if let Ok(mut g) = offers_mx().lock() {
+        prune_offer_entries(&mut g, now_ms());
+        // Two keys per offer; leave headroom so both inserts succeed under the cap.
+        while g.len() + 2 > MAX_OFFER_ENTRIES {
+            let victim = g.keys().next().cloned();
+            match victim {
+                Some(k) => {
+                    g.remove(&k);
+                }
+                None => break,
+            }
+        }
         g.insert(meta.id.clone(), meta.clone());
         g.insert(meta.blob_id.clone(), meta);
     }
@@ -450,12 +558,22 @@ pub fn start_fetch(
         return Err("attachment offer expired".to_string());
     }
     let path = match save_path.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(p) => PathBuf::from(p),
+        Some(p) => {
+            let path = PathBuf::from(p);
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err("attachment save path invalid".to_string());
+            }
+            path
+        }
         None => {
             let mut p = downloads_root(app_namespace)?;
             p.push(format!(
-                "{}-{}",
+                "{}-{:08x}-{}",
                 offer.blob_id,
+                OsRng.next_u32(),
                 sanitize_file_name(&offer.file_name)
             ));
             p
@@ -465,10 +583,17 @@ pub fn start_fetch(
         fs::create_dir_all(parent).map_err(|e| format!("create download dir: {e}"))?;
     }
     let blob_id = offer.blob_id.clone();
-    fetch_mx()
-        .lock()
-        .map_err(|_| "fetch table lock poisoned".to_string())?
-        .insert(
+    {
+        let mut g = fetch_mx()
+            .lock()
+            .map_err(|_| "fetch table lock poisoned".to_string())?;
+        if g.contains_key(&blob_id) {
+            return Err("attachment fetch already in progress".to_string());
+        }
+        if g.len() >= MAX_FETCH_INFLIGHT {
+            return Err("too many attachment fetches in progress".to_string());
+        }
+        g.insert(
             blob_id.clone(),
             FetchState {
                 peer: peer.to_string(),
@@ -478,6 +603,7 @@ pub fn start_fetch(
                 done,
             },
         );
+    }
     let req = build_fetch_request(&blob_id);
     Ok((blob_id, req))
 }
@@ -496,15 +622,57 @@ pub fn fail_fetch(blob_id: &str, error: &str) -> bool {
     }
 }
 
-fn sanitize_file_name(name: &str) -> String {
+const MAX_SANITIZED_FILE_NAME_CHARS: usize = 200;
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+pub(crate) fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '\0' => '_',
+            '/' | '\\' | ':' | '\0' | '<' | '>' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
             _ => c,
         })
+        .take(MAX_SANITIZED_FILE_NAME_CHARS)
         .collect();
-    cleaned.trim().if_empty("file").to_string()
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
+    // Bare `.` / `..` would climb out of the unique staging directory on Path::push.
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return "file".to_string();
+    }
+    // Windows reserved device names break create/open even under a unique parent dir.
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    if is_windows_reserved_stem(stem) {
+        return format!("_{trimmed}");
+    }
+    trimmed.to_string()
 }
 
 pub fn handle_fetch_response(peer: &str, payload: &[u8]) -> Option<(String, String)> {
@@ -522,11 +690,39 @@ pub fn handle_fetch_response(peer: &str, payload: &[u8]) -> Option<(String, Stri
         "chunk" => {
             let data = v.get("data_b64").and_then(|x| x.as_str()).unwrap_or("");
             let chunk = B64.decode(data.trim()).ok()?;
+            // Reject absurd single chunks (wire DoS) before touching the buffer.
+            if chunk.len() > CHUNK_SIZE_BYTES.saturating_mul(2) {
+                if let Ok(mut g) = fetch_mx().lock() {
+                    if let Some(st) = g.remove(blob_id) {
+                        let _ = st.done.send(Err("attachment chunk too large".into()));
+                    }
+                }
+                return None;
+            }
+            let offset = v.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
+            let offset = usize::try_from(offset).ok()?;
             if let Ok(mut g) = fetch_mx().lock() {
                 if let Some(st) = g.get_mut(blob_id) {
-                    if crate::public_key_util::same_contact_pk(peer, &st.peer) {
-                        st.ciphertext.extend_from_slice(&chunk);
+                    if !crate::public_key_util::same_contact_pk(peer, &st.peer) {
+                        return None;
                     }
+                    if offset != st.ciphertext.len() {
+                        let st = g.remove(blob_id)?;
+                        let _ = st.done.send(Err("attachment chunk offset mismatch".into()));
+                        return None;
+                    }
+                    // Ciphertext ≈ plaintext + AEAD overhead; never grow past the offer.
+                    let cap = (st.offer.size_plaintext as usize)
+                        .saturating_add(64)
+                        .min(MAX_FILE_SIZE_BYTES as usize + 64);
+                    if st.ciphertext.len().saturating_add(chunk.len()) > cap {
+                        let st = g.remove(blob_id)?;
+                        let _ = st
+                            .done
+                            .send(Err("attachment ciphertext exceeds offer size".into()));
+                        return None;
+                    }
+                    st.ciphertext.extend_from_slice(&chunk);
                 }
             }
             None
@@ -642,5 +838,221 @@ mod tests {
         let plain = inner.file_bytes().unwrap();
         assert_eq!(plain, b"hello attachment mailbox");
         let _ = fs::remove_dir_all(&dir);
+        inner.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_oversize_and_long_name() {
+        let mut inner = AttachmentInner {
+            attachment_version: ATTACH_MSG_VERSION,
+            file_name: "ok.txt".into(),
+            mime_type: "text/plain".into(),
+            size_plaintext: MAX_FILE_SIZE_BYTES + 1,
+            sha256_plaintext: "ab".repeat(32),
+            file_b64: "YQ==".into(),
+        };
+        assert!(inner.validate().is_err());
+        inner.size_plaintext = 1;
+        inner.file_name = "x".repeat(513);
+        assert!(inner.validate().is_err());
+        inner.file_name = "../x".into();
+        assert!(inner.validate().is_err());
+    }
+
+    #[test]
+    fn sanitize_file_name_blocks_path_climb() {
+        assert_eq!(sanitize_file_name(".."), "file");
+        assert_eq!(sanitize_file_name("."), "file");
+        assert_eq!(sanitize_file_name("../secret"), ".._secret");
+        assert_eq!(sanitize_file_name("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_file_name("  "), "file");
+        let long = "n".repeat(MAX_SANITIZED_FILE_NAME_CHARS + 50);
+        assert_eq!(
+            sanitize_file_name(&long).chars().count(),
+            MAX_SANITIZED_FILE_NAME_CHARS
+        );
+        assert_eq!(sanitize_file_name("NUL"), "_NUL");
+        assert_eq!(sanitize_file_name("con.txt"), "_con.txt");
+        assert_eq!(sanitize_file_name("ok?.bin"), "ok_.bin");
+    }
+
+    #[test]
+    fn validate_rejects_empty_filename() {
+        let inner = AttachmentInner {
+            attachment_version: ATTACH_MSG_VERSION,
+            file_name: "   ".into(),
+            mime_type: "text/plain".into(),
+            size_plaintext: 1,
+            sha256_plaintext: hex::encode(Sha256::digest(b"a")),
+            file_b64: B64.encode(b"a"),
+        };
+        assert!(inner.validate().is_err());
+    }
+
+    #[test]
+    fn write_attachment_rejects_path_climb_message_id() {
+        let err = write_attachment_file(
+            "com.ghalbol.debug",
+            "../escape",
+            "safe.txt",
+            b"x",
+        )
+        .unwrap_err();
+        assert!(err.contains("download id"));
+    }
+
+    fn test_peer_hex() -> String {
+        use secp256k1::{Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let seed = [7u8; 32];
+        let sk = SecretKey::from_byte_array(seed).unwrap();
+        hex::encode(sk.public_key(&secp).serialize())
+    }
+
+    #[test]
+    fn fetch_rejects_concurrent_duplicate_and_bad_offset() {
+        let peer = test_peer_hex();
+        let offer_id = format!("offer-{}", OsRng.next_u32());
+        let blob_id = format!("blob-{}", OsRng.next_u32());
+        remember_offer(AttachmentOfferMeta {
+            id: offer_id.clone(),
+            sender_public_key_hex: peer.clone(),
+            blob_id: blob_id.clone(),
+            file_name: "x.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            size_plaintext: 1024,
+            sha256_plaintext: "00".repeat(32),
+            content_key_b64: B64.encode([0u8; 32]),
+            expires_at_ms: now_ms().saturating_add(60_000),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        start_fetch(
+            "com.ghalbol.debug",
+            &peer,
+            &offer_id,
+            None,
+            done_tx,
+        )
+        .unwrap();
+        let (done_tx2, _) = std::sync::mpsc::channel();
+        assert_eq!(
+            start_fetch("com.ghalbol.debug", &peer, &offer_id, None, done_tx2)
+                .unwrap_err(),
+            "attachment fetch already in progress"
+        );
+        let chunk0 = json_frame(&json!({
+            "action": "chunk",
+            "blob_id": blob_id,
+            "offset": 0,
+            "data_b64": B64.encode(b"abc"),
+        }));
+        assert!(handle_fetch_response(&peer, &chunk0).is_none());
+        let bad_off = json_frame(&json!({
+            "action": "chunk",
+            "blob_id": blob_id,
+            "offset": 0,
+            "data_b64": B64.encode(b"xyz"),
+        }));
+        assert!(handle_fetch_response(&peer, &bad_off).is_none());
+        assert_eq!(
+            done_rx.recv().unwrap().unwrap_err(),
+            "attachment chunk offset mismatch"
+        );
+    }
+
+    #[test]
+    fn fetch_oversized_chunk_aborts() {
+        let peer = test_peer_hex();
+        let offer_id = format!("offer-{}", OsRng.next_u32());
+        let blob_id = format!("blob-{}", OsRng.next_u32());
+        remember_offer(AttachmentOfferMeta {
+            id: offer_id.clone(),
+            sender_public_key_hex: peer.clone(),
+            blob_id: blob_id.clone(),
+            file_name: "y.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            size_plaintext: 64,
+            sha256_plaintext: "11".repeat(32),
+            content_key_b64: B64.encode([1u8; 32]),
+            expires_at_ms: now_ms().saturating_add(60_000),
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        start_fetch("com.ghalbol.debug", &peer, &offer_id, None, done_tx).unwrap();
+        let huge = vec![0u8; CHUNK_SIZE_BYTES.saturating_mul(2) + 1];
+        let oversize_frame = json_frame(&json!({
+            "action": "chunk",
+            "blob_id": blob_id,
+            "offset": 0,
+            "data_b64": B64.encode(&huge),
+        }));
+        assert!(handle_fetch_response(&peer, &oversize_frame).is_none());
+        assert_eq!(
+            done_rx.recv().unwrap().unwrap_err(),
+            "attachment chunk too large"
+        );
+    }
+
+    #[test]
+    fn offer_table_evicts_expired_and_stays_capped() {
+        let peer = test_peer_hex();
+        let now = now_ms();
+        // Fill past the cap with already-expired offers; prune should drop them.
+        for i in 0..(MAX_OFFER_ENTRIES + 8) {
+            remember_offer(AttachmentOfferMeta {
+                id: format!("cap-offer-{i}"),
+                sender_public_key_hex: peer.clone(),
+                blob_id: format!("cap-blob-{i}"),
+                file_name: "z.bin".into(),
+                mime_type: "application/octet-stream".into(),
+                size_plaintext: 1,
+                sha256_plaintext: "22".repeat(32),
+                content_key_b64: B64.encode([2u8; 32]),
+                expires_at_ms: now.saturating_sub(1_000),
+            });
+        }
+        let len = offers_mx().lock().map(|g| g.len()).unwrap_or(usize::MAX);
+        assert!(
+            len <= MAX_OFFER_ENTRIES,
+            "offer table grew past cap: {len}"
+        );
+        // Fresh offer still accepted after expiry sweep.
+        remember_offer(AttachmentOfferMeta {
+            id: "fresh-offer".into(),
+            sender_public_key_hex: peer,
+            blob_id: "fresh-blob".into(),
+            file_name: "ok.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            size_plaintext: 1,
+            sha256_plaintext: "33".repeat(32),
+            content_key_b64: B64.encode([3u8; 32]),
+            expires_at_ms: now.saturating_add(60_000),
+        });
+        assert!(offer_for_id("fresh-offer").is_some());
+        assert!(offer_for_id("fresh-blob").is_some());
+    }
+
+    #[test]
+    fn serve_table_drops_terminal_before_rejecting() {
+        let mut g = HashMap::new();
+        for i in 0..MAX_SERVE_SLOTS {
+            g.insert(
+                format!("blob-{i}"),
+                ServeSlot {
+                    path: PathBuf::from("/tmp/x"),
+                    content_key: [0u8; 32],
+                    sha256_plaintext: "aa".repeat(32),
+                    expires_at_ms: now_ms().saturating_add(60_000),
+                    expected_peer: "p".into(),
+                    state: if i < 4 {
+                        ServeState::Complete
+                    } else {
+                        ServeState::Serving
+                    },
+                },
+            );
+        }
+        prune_serve_slots(&mut g, now_ms());
+        assert!(g.len() < MAX_SERVE_SLOTS);
+        assert!(g.values().all(|s| s.state == ServeState::Serving));
     }
 }

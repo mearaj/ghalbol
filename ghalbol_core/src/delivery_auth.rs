@@ -5,32 +5,63 @@ use sha2::{Digest, Sha256};
 use crate::identity::IdentityAlgorithm;
 use crate::keystore_v1::DecryptedIdentity;
 
-pub fn session_challenge_bytes(nonce: &[u8; 32], identity_wire: &str) -> Vec<u8> {
-    format!(
+/// Matches `ghalbol_delivery::envelope::MAX_MESSAGE_ID_BYTES`.
+pub const MAX_DELIVERY_MESSAGE_ID_BYTES: usize = 128;
+/// Matches `ghalbol_delivery::identity` wire cap.
+pub const MAX_DELIVERY_IDENTITY_WIRE_BYTES: usize = 256;
+
+fn reject_challenge_field_too_long(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!("{field} too long (max {max_bytes} bytes)"));
+    }
+    Ok(())
+}
+
+fn reject_challenge_field_empty(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(())
+}
+
+pub fn session_challenge_bytes(nonce: &[u8; 32], identity_wire: &str) -> Result<Vec<u8>, String> {
+    let wire = identity_wire.trim().to_ascii_lowercase();
+    reject_challenge_field_empty("identity_wire", &wire)?;
+    reject_challenge_field_too_long("identity_wire", &wire, MAX_DELIVERY_IDENTITY_WIRE_BYTES)?;
+    Ok(format!(
         "ghalbol:delivery:session:v1\n{}\n{}",
         hex::encode(nonce),
-        identity_wire.trim().to_ascii_lowercase()
+        wire
     )
-    .into_bytes()
+    .into_bytes())
 }
 
-pub fn upload_challenge_bytes(nonce: &[u8; 32], message_id: &str, recipient_wire: &str) -> Vec<u8> {
-    format!(
+pub fn upload_challenge_bytes(nonce: &[u8; 32], message_id: &str, recipient_wire: &str) -> Result<Vec<u8>, String> {
+    let mid = message_id.trim();
+    let recipient = recipient_wire.trim().to_ascii_lowercase();
+    reject_challenge_field_empty("message_id", mid)?;
+    reject_challenge_field_empty("recipient_wire", &recipient)?;
+    reject_challenge_field_too_long("message_id", mid, MAX_DELIVERY_MESSAGE_ID_BYTES)?;
+    reject_challenge_field_too_long("recipient_wire", &recipient, MAX_DELIVERY_IDENTITY_WIRE_BYTES)?;
+    Ok(format!(
         "ghalbol:delivery:upload:v1\n{}\n{}\n{}",
         hex::encode(nonce),
-        message_id.trim(),
-        recipient_wire.trim().to_ascii_lowercase()
+        mid,
+        recipient
     )
-    .into_bytes()
+    .into_bytes())
 }
 
-pub fn extend_challenge_bytes(nonce: &[u8; 32], message_id: &str) -> Vec<u8> {
-    format!(
+pub fn extend_challenge_bytes(nonce: &[u8; 32], message_id: &str) -> Result<Vec<u8>, String> {
+    let mid = message_id.trim();
+    reject_challenge_field_empty("message_id", mid)?;
+    reject_challenge_field_too_long("message_id", mid, MAX_DELIVERY_MESSAGE_ID_BYTES)?;
+    Ok(format!(
         "ghalbol:delivery:extend:v1\n{}\n{}",
         hex::encode(nonce),
-        message_id.trim()
+        mid
     )
-    .into_bytes()
+    .into_bytes())
 }
 
 pub fn sign_delivery_challenge(ident: &DecryptedIdentity, msg: &[u8]) -> Result<Vec<u8>, String> {
@@ -47,11 +78,16 @@ pub fn sign_delivery_challenge(ident: &DecryptedIdentity, msg: &[u8]) -> Result<
 }
 
 /// Verify delivery-server signatures (DER secp256k1 — matches `ghalbol_delivery::auth`).
+const MAX_DELIVERY_SIGNATURE_LEN: usize = 256;
+
 pub fn verify_delivery_signature(
     identity_wire: &str,
     msg: &[u8],
     signature: &[u8],
 ) -> Result<(), String> {
+    if signature.is_empty() || signature.len() > MAX_DELIVERY_SIGNATURE_LEN {
+        return Err("signature length out of range".to_string());
+    }
     use crate::identity::Identity;
     use crate::public_key_util::normalize_contact_identity_wire;
     use ed25519_dalek::{Signature as Ed25519Sig, Verifier, VerifyingKey};
@@ -109,8 +145,8 @@ mod tests {
     #[test]
     fn session_challenge_is_stable_and_case_folds_wire() {
         let nonce = [7u8; 32];
-        let a = session_challenge_bytes(&nonce, "ABCD");
-        let b = session_challenge_bytes(&nonce, "abcd");
+        let a = session_challenge_bytes(&nonce, "ABCD").unwrap();
+        let b = session_challenge_bytes(&nonce, "abcd").unwrap();
         assert_eq!(a, b);
         let s = String::from_utf8(a).unwrap();
         assert!(s.starts_with("ghalbol:delivery:session:v1\n"));
@@ -121,19 +157,29 @@ mod tests {
     #[test]
     fn upload_and_extend_challenges_include_fields() {
         let nonce = [1u8; 32];
-        let up = String::from_utf8(upload_challenge_bytes(&nonce, " mid ", "EEFF")).unwrap();
+        let up = String::from_utf8(upload_challenge_bytes(&nonce, " mid ", "EEFF").unwrap()).unwrap();
         assert!(up.contains("ghalbol:delivery:upload:v1\n"));
         assert!(up.contains("\nmid\n"));
         assert!(up.ends_with("\neeff"));
-        let ex = String::from_utf8(extend_challenge_bytes(&nonce, " mid ")).unwrap();
+        let ex = String::from_utf8(extend_challenge_bytes(&nonce, " mid ").unwrap()).unwrap();
         assert!(ex.contains("ghalbol:delivery:extend:v1\n"));
         assert!(ex.ends_with("\nmid"));
     }
 
     #[test]
+    fn challenge_bytes_reject_oversized_fields() {
+        let nonce = [0u8; 32];
+        let long_id = "x".repeat(MAX_DELIVERY_MESSAGE_ID_BYTES + 1);
+        let long_wire = "w".repeat(MAX_DELIVERY_IDENTITY_WIRE_BYTES + 1);
+        assert!(upload_challenge_bytes(&nonce, &long_id, "ok").is_err());
+        assert!(extend_challenge_bytes(&nonce, &long_id).is_err());
+        assert!(session_challenge_bytes(&nonce, &long_wire).is_err());
+    }
+
+    #[test]
     fn secp256k1_sign_verify_roundtrip() {
         let (_ks, id) = create_keystore_v1("pw", None).unwrap();
-        let msg = session_challenge_bytes(&[9u8; 32], &id.identity_wire());
+        let msg = session_challenge_bytes(&[9u8; 32], &id.identity_wire()).unwrap();
         let sig = sign_delivery_challenge(&id, &msg).unwrap();
         verify_delivery_signature(&id.identity_wire(), &msg, &sig).unwrap();
     }
@@ -142,7 +188,7 @@ mod tests {
     fn ed25519_and_p256_sign_verify_roundtrip() {
         for algo in [IdentityAlgorithm::Ed25519, IdentityAlgorithm::EcdsaP256] {
             let (_ks, id) = create_keystore_v1_with_algorithm("pw", algo, None).unwrap();
-            let msg = upload_challenge_bytes(&[3u8; 32], "m1", &id.identity_wire());
+            let msg = upload_challenge_bytes(&[3u8; 32], "m1", &id.identity_wire()).unwrap();
             let sig = sign_delivery_challenge(&id, &msg).unwrap();
             verify_delivery_signature(&id.identity_wire(), &msg, &sig).unwrap();
         }
@@ -151,9 +197,27 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_message() {
         let (_ks, id) = create_keystore_v1("pw", None).unwrap();
-        let msg = extend_challenge_bytes(&[2u8; 32], "ok");
+        let msg = extend_challenge_bytes(&[2u8; 32], "ok").unwrap();
         let sig = sign_delivery_challenge(&id, &msg).unwrap();
-        let bad = extend_challenge_bytes(&[2u8; 32], "nope");
+        let bad = extend_challenge_bytes(&[2u8; 32], "nope").unwrap();
         assert!(verify_delivery_signature(&id.identity_wire(), &bad, &sig).is_err());
+    }
+
+    #[test]
+    fn challenge_bytes_reject_blank_fields_after_trim() {
+        let nonce = [5u8; 32];
+        assert!(upload_challenge_bytes(&nonce, "   ", "wire").is_err());
+        assert!(extend_challenge_bytes(&nonce, "  \t").is_err());
+        assert!(session_challenge_bytes(&nonce, "  ").is_err());
+        assert!(upload_challenge_bytes(&nonce, "ok", "  ").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_empty_and_oversized_signature() {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        let msg = session_challenge_bytes(&[4u8; 32], &id.identity_wire()).unwrap();
+        assert!(verify_delivery_signature(&id.identity_wire(), &msg, &[]).is_err());
+        let huge = vec![0u8; MAX_DELIVERY_SIGNATURE_LEN + 1];
+        assert!(verify_delivery_signature(&id.identity_wire(), &msg, &huge).is_err());
     }
 }

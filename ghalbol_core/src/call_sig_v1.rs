@@ -17,6 +17,43 @@ use crate::transport_kem_v1::{CALL_CIPHER_TRANSPORT_V2, derive_call_sig_transpor
 pub const CALL_SHARE: &str = "ghalbol_call_v1";
 pub const CALL_FORMAT_VERSION: u64 = 1;
 
+/// Length-prefixed JSON body cap on the DM stream (defense in depth; connect also enforces).
+pub const MAX_CALL_SIGNAL_FRAME_BODY_BYTES: usize = 256 * 1024;
+/// Matches `derive_call_media_transport_keys` / bridge call_id cap.
+pub const MAX_CALL_ID_LEN: usize = 128;
+/// Inner call signaling ciphertext (`CALL_CIPHER_TRANSPORT_V2` + symmetric seal).
+const MAX_CALL_CIPHERTEXT_BYTES: usize = 128 * 1024;
+const MAX_CALL_CIPHERTEXT_HEX_CHARS: usize = MAX_CALL_CIPHERTEXT_BYTES * 2;
+
+fn validate_call_id(call_id: &str) -> Result<&str, String> {
+    let call_id = call_id.trim();
+    if call_id.is_empty() {
+        return Err("call_id empty".to_string());
+    }
+    if call_id.len() > MAX_CALL_ID_LEN {
+        return Err("call_id too long".to_string());
+    }
+    Ok(call_id)
+}
+
+fn decode_call_ciphertext_hex(ciphertext_hex: &str) -> Result<Vec<u8>, String> {
+    let t = ciphertext_hex.trim();
+    if t.is_empty() {
+        return Err("empty ciphertext".to_string());
+    }
+    if t.len() > MAX_CALL_CIPHERTEXT_HEX_CHARS {
+        return Err("ciphertext hex too long".to_string());
+    }
+    if !t.len().is_multiple_of(2) {
+        return Err("ciphertext hex: odd length".to_string());
+    }
+    let sealed = hex::decode(t).map_err(|e| format!("ciphertext hex: {e}"))?;
+    if sealed.len() > MAX_CALL_CIPHERTEXT_BYTES {
+        return Err("ciphertext too large".to_string());
+    }
+    Ok(sealed)
+}
+
 /// Transport KEM context for outbound call signaling.
 pub struct CallSealTransportCtx<'a> {
     pub local_sk: &'a StaticSecret,
@@ -147,6 +184,9 @@ pub fn call_envelope_from_frame(frame: &[u8]) -> Result<CallSigEnvelope, String>
         return Err("frame too short".to_string());
     }
     let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if len > MAX_CALL_SIGNAL_FRAME_BODY_BYTES {
+        return Err("frame body too large".to_string());
+    }
     if frame.len() < 4 + len {
         return Err("frame truncated".to_string());
     }
@@ -159,6 +199,9 @@ pub fn frame_wire_share(frame: &[u8]) -> Result<String, String> {
         return Err("frame too short".to_string());
     }
     let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if len > MAX_CALL_SIGNAL_FRAME_BODY_BYTES {
+        return Err("frame body too large".to_string());
+    }
     if frame.len() < 4 + len {
         return Err("frame truncated".to_string());
     }
@@ -182,6 +225,7 @@ pub fn build_call_envelope(
 ) -> Result<CallSigEnvelope, String> {
     let sender_wire = sender.identity_wire();
     let recipient_wire = normalize_contact_identity_wire(recipient_identity_wire)?;
+    let call_id = validate_call_id(call_id)?;
     let inner_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let sealed = seal_call_payload_outbound(sender, &recipient_wire, &inner_bytes, transport)?;
     let mut env = CallSigEnvelope {
@@ -209,18 +253,16 @@ pub fn parse_call_envelope_with_transport(
     if !envelope_recipient_ok(env, &local.identity_wire()) {
         return Err("call envelope not addressed to this identity".to_string());
     }
-    let call_id = env
-        .ref_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "call envelope missing ref_id (call_id)".to_string())?
-        .to_string();
+    let call_id = validate_call_id(
+        env.ref_id
+            .as_deref()
+            .ok_or_else(|| "call envelope missing ref_id (call_id)".to_string())?,
+    )?
+    .to_string();
     let payload = if env.ciphertext_hex.trim().is_empty() {
         Value::Object(Default::default())
     } else {
-        let sealed =
-            hex::decode(env.ciphertext_hex.trim()).map_err(|e| format!("ciphertext hex: {e}"))?;
+        let sealed = decode_call_ciphertext_hex(&env.ciphertext_hex)?;
         let plain = open_call_payload_ciphertext(
             local,
             env.sender_public_key_hex.trim(),
@@ -343,6 +385,77 @@ mod tests {
         assert_eq!(parsed.call_id, "call-abc");
         assert_eq!(parsed.kind, CallSigKind::Invite);
         assert_eq!(parsed.payload["sdp"], "v=0");
+    }
+
+    #[test]
+    fn call_frame_rejects_oversize_length_prefix() {
+        let len = (MAX_CALL_SIGNAL_FRAME_BODY_BYTES + 1) as u32;
+        let frame = len.to_le_bytes().to_vec();
+        assert!(call_envelope_from_frame(&frame).unwrap_err().contains("too large"));
+        assert!(frame_wire_share(&frame).unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn ciphertext_hex_rejected_before_hex_decode() {
+        let huge = "aa".repeat(MAX_CALL_CIPHERTEXT_HEX_CHARS + 2);
+        let err = decode_call_ciphertext_hex(&huge).unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn build_rejects_oversized_call_id() {
+        let (_ks_a, alice) = create_keystore_v1("pw", None).unwrap();
+        let (_ks_b, bob) = create_keystore_v1("pw2", None).unwrap();
+        let (sk_a, _, _, pk_b) = transport_pair();
+        let huge = "x".repeat(MAX_CALL_ID_LEN + 1);
+        let err = build_call_envelope(
+            "sig-3",
+            &huge,
+            CallSigKind::Invite,
+            &alice,
+            &bob.identity_wire(),
+            serde_json::json!({}),
+            1,
+            CallSealTransportCtx {
+                local_sk: &sk_a,
+                peer_pk: &pk_b,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_oversized_call_id_ref() {
+        let (_ks_a, alice) = create_keystore_v1("pw", None).unwrap();
+        let (_ks_b, bob) = create_keystore_v1("pw2", None).unwrap();
+        let (sk_a, pk_a, sk_b, pk_b) = transport_pair();
+        let mut env = build_call_envelope(
+            "sig-4",
+            "ok-id",
+            CallSigKind::Hangup,
+            &alice,
+            &bob.identity_wire(),
+            serde_json::json!({}),
+            1,
+            CallSealTransportCtx {
+                local_sk: &sk_a,
+                peer_pk: &pk_b,
+            },
+        )
+        .unwrap();
+        env.ref_id = Some("y".repeat(MAX_CALL_ID_LEN + 1));
+        sign_call_envelope(&mut env, &alice).unwrap();
+        let err = parse_call_envelope_with_transport(
+            &env,
+            &bob,
+            Some(CallOpenTransportCtx {
+                local_sk: &sk_b,
+                peer_pk: &pk_a,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("too long"), "{err}");
     }
 
     #[test]

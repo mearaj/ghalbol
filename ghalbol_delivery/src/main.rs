@@ -6,6 +6,7 @@ use ghalbol_delivery::{
 };
 use ghalbol_ddns::{DdnsConfig, spawn_ddns_task};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tracing_subscriber::EnvFilter;
@@ -62,11 +63,20 @@ fn parse_flag(args: &[String], flag: &str) -> Option<String> {
 async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = DeliveryConfig::from_env();
     let state = AppState::new(config.clone())?;
-    let shutdown = Arc::new(Notify::new());
-    let ddns = DdnsConfig::from_env().map(|cfg| spawn_ddns_task(cfg, Arc::clone(&shutdown)));
+    let ddns_shutdown = Arc::new(Notify::new());
 
-    let router = app(state);
     let tls = config.tls_cert.as_ref().zip(config.tls_key.as_ref());
+    if let Some((cert, key)) = &tls {
+        if !cert.is_file() {
+            return Err(format!("TLS cert not found: {}", cert.display()).into());
+        }
+        if !key.is_file() {
+            return Err(format!("TLS key not found: {}", key.display()).into());
+        }
+    }
+
+    let ddns = DdnsConfig::from_env().map(|cfg| spawn_ddns_task(cfg, Arc::clone(&ddns_shutdown)));
+    let router = app(state.clone());
     tracing::info!(
         listen = %config.listen,
         tls = tls.is_some(),
@@ -75,41 +85,69 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         min_ttl_secs = config.min_ttl_secs,
         max_ttl_secs = config.max_ttl_secs,
         quota_bytes = config.quota_bytes_per_peer,
+        max_connections = config.max_connections,
         "ghalbol_delivery listening"
     );
 
-    let serve = if let Some((cert, key)) = tls {
-        if !cert.is_file() {
-            return Err(format!("TLS cert not found: {}", cert.display()).into());
-        }
-        if !key.is_file() {
-            return Err(format!("TLS key not found: {}", key.display()).into());
-        }
-        let tls_config = RustlsConfig::from_pem_file(cert, key).await?;
-        let handle = axum_server::bind_rustls(config.listen, tls_config)
-            .serve(router.into_make_service());
-        tokio::select! {
-            r = handle => r?,
-            _ = tokio::signal::ctrl_c() => {
+    let serve_result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
+        if let Some((cert, key)) = tls {
+            let tls_config = RustlsConfig::from_pem_file(cert, key).await?;
+            let handle = axum_server::Handle::new();
+            let signal_handle = handle.clone();
+            let signal_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                if let Err(e) = wait_for_os_shutdown().await {
+                    tracing::error!(error = %e, "failed to listen for shutdown signal");
+                    return;
+                }
                 tracing::info!("shutdown signal received");
-            }
-        }
-    } else {
-        let listener = TcpListener::bind(config.listen).await?;
-        let handle = axum::serve(listener, router);
-        tokio::select! {
-            r = handle => r?,
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutdown signal received");
-            }
-        }
-    };
+                signal_state.shutdown.signal();
+                signal_handle.graceful_shutdown(Some(Duration::from_secs(15)));
+            });
+            axum_server::bind_rustls(config.listen, tls_config)
+                .handle(handle)
+                .serve(router.into_make_service())
+                .await
+                .map_err(|e| e.into())
+        } else {
+            let listener = TcpListener::bind(config.listen).await?;
+            let signal_state = Arc::clone(&state);
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    if let Err(e) = wait_for_os_shutdown().await {
+                        tracing::error!(error = %e, "failed to listen for shutdown signal");
+                        return;
+                    }
+                    tracing::info!("shutdown signal received");
+                    signal_state.shutdown.signal();
+                })
+                .await
+                .map_err(|e| e.into())
+        };
 
-    let _ = serve;
-
-    shutdown.notify_waiters();
+    if let Err(e) = state.store.checkpoint() {
+        tracing::warn!(error = %e, "wal checkpoint on shutdown failed");
+    }
+    ddns_shutdown.notify_waiters();
     if let Some(handle) = ddns {
         let _ = handle.await;
     }
-    Ok(())
+    tracing::info!("ghalbol_delivery stopped");
+    serve_result
+}
+
+async fn wait_for_os_shutdown() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }

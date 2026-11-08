@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(AppState::open(config.clone())?);
 
     let shutdown = Arc::new(Notify::new());
+    let state_shutdown = Arc::clone(&state);
     let purge = spawn_purge_task(Arc::clone(&state), Arc::clone(&shutdown));
     let bridge_sweep = spawn_bridge_sweep_task(Arc::clone(&state), Arc::clone(&shutdown));
     let ddns = DdnsConfig::from_env().map(|cfg| spawn_ddns_task(cfg, Arc::clone(&shutdown)));
@@ -42,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let shutdown_notify = Arc::clone(&shutdown);
         tokio::spawn(async move {
             shutdown_signal().await;
+            state_shutdown.request_shutdown();
             shutdown_notify.notify_waiters();
         });
     }

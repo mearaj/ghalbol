@@ -53,6 +53,7 @@ pub fn desktop_speaker_on() -> bool {
 }
 
 pub(crate) use crypto::MediaCrypto;
+use crypto::MAX_AUDIO_CODEC_BYTES;
 use jitter::JitterBuffer;
 
 /// One decoded/encoded media frame moving through the engine.
@@ -146,6 +147,12 @@ impl MediaEngine {
     /// Capture path: encode + seal one 20 ms PCM frame into wire bytes to send.
     pub fn on_capture(&mut self, pcm: &[i16]) -> Result<Vec<u8>, String> {
         let payload = self.encoder.encode(pcm)?;
+        if payload.len() > MAX_AUDIO_CODEC_BYTES {
+            return Err("encoded media frame too large".to_string());
+        }
+        if self.tx_seq == u64::MAX {
+            return Err("media tx counter exhausted".to_string());
+        }
         let seq = self.tx_seq;
         self.tx_seq += 1;
         let frame = MediaFrame {
@@ -162,6 +169,13 @@ impl MediaEngine {
     pub fn on_wire(&mut self, wire: &[u8]) -> Result<(), String> {
         match self.crypto.open(wire) {
             Ok(frame) => {
+                if frame.payload.len() > MAX_AUDIO_CODEC_BYTES {
+                    #[cfg(test)]
+                    {
+                        self.rx_open_failures += 1;
+                    }
+                    return Err("decoded media frame too large".to_string());
+                }
                 #[cfg(test)]
                 {
                     self.rx_count += 1;
@@ -200,6 +214,22 @@ impl MediaEngine {
     #[cfg(test)]
     pub fn open_failures(&self) -> u64 {
         self.rx_open_failures
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tx_seq_for_test(&mut self, v: u64) {
+        self.tx_seq = v;
+    }
+
+    /// Teardown: drop jitter state so codec payloads are not retained after stop.
+    pub fn reset_receive_state(&mut self) {
+        self.jitter.clear();
+    }
+}
+
+impl Drop for MediaEngine {
+    fn drop(&mut self) {
+        self.jitter.clear();
     }
 }
 
@@ -341,6 +371,30 @@ mod tests {
     fn local_is_a_orders_by_pubkey() {
         assert!(local_is_a("02aa", "03bb"));
         assert!(!local_is_a("03bb", "02aa"));
+    }
+
+    #[test]
+    fn reset_receive_state_clears_jitter() {
+        let mut a = engine_a();
+        let mut b = engine_b();
+        let wire = a.on_capture(&ramp(1)).unwrap();
+        b.on_wire(&wire).unwrap();
+        assert_eq!(b.frames_received(), 1);
+        b.reset_receive_state();
+        let mut out = Vec::new();
+        b.on_playout(&mut out).unwrap();
+        assert_eq!(out, vec![0i16; FRAME_SAMPLES]);
+    }
+
+    #[test]
+    fn tx_counter_exhaustion_rejects_capture() {
+        let mut a = engine_a();
+        a.set_tx_seq_for_test(u64::MAX);
+        assert!(
+            a.on_capture(&ramp(0))
+                .unwrap_err()
+                .contains("counter exhausted")
+        );
     }
 
     #[test]

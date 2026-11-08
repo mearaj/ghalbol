@@ -6,16 +6,20 @@ use crate::coord_runtime::parse_coord_urls;
 use crate::p2p_runtime::{self, p2p_poll_event, p2p_start, p2p_sync_ui_session};
 use crate::preferences_v1;
 
-use super::{cfg, json_error};
+use super::{
+    cfg, json_error, require_app_namespace, require_contact_pk, require_delivery_message_id,
+};
 use super::contacts::note_outbound_trust;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use super::identity::{keystore_exists, session_unlocked};
 use crate::contacts_v1;
 
 pub fn fetch_attachment(peer_public_key_hex: &str, offer_id: &str) -> Result<String, String> {
+    let peer = require_contact_pk(peer_public_key_hex)?;
+    let offer = require_delivery_message_id(offer_id)?;
     let v = p2p_runtime::p2p_attachment_fetch(&json!({
-        "peer_public_key_hex": peer_public_key_hex,
-        "offer_id": offer_id,
+        "peer_public_key_hex": peer,
+        "offer_id": offer,
     }));
     json_error(&v, "could not download attachment")?;
     if v.get("downloading").and_then(|x| x.as_bool()) == Some(true) {
@@ -27,11 +31,32 @@ pub fn fetch_attachment(peer_public_key_hex: &str, offer_id: &str) -> Result<Str
         .to_string())
 }
 
+fn validate_outbound_attachment_path(file_path: &str) -> Result<String, String> {
+    let path = file_path.trim();
+    if path.is_empty() || path.contains('\0') {
+        return Err("file path is required".into());
+    }
+    if path.contains("..") {
+        return Err("That file path is not allowed.".into());
+    }
+    let pb = std::path::Path::new(path);
+    let meta = std::fs::metadata(pb).map_err(|_| "could not open attachment file".to_string())?;
+    if !meta.is_file() {
+        return Err("attachment path must be a file".into());
+    }
+    if meta.len() > crate::attach_v1::MAX_FILE_SIZE_BYTES {
+        return Err("attachment file is too large".into());
+    }
+    Ok(path.to_string())
+}
+
 pub fn send_attachment(peer_public_key_hex: &str, file_path: &str) -> Result<(), String> {
-    note_outbound_trust(peer_public_key_hex);
-    let cfg = json!({ "file_path": file_path.trim() });
+    let peer = require_contact_pk(peer_public_key_hex)?;
+    let path = validate_outbound_attachment_path(file_path)?;
+    note_outbound_trust(&peer);
+    let cfg = json!({ "file_path": path });
     json_error(
-        &p2p_runtime::p2p_send_attachment(peer_public_key_hex, &cfg),
+        &p2p_runtime::p2p_send_attachment(&peer, &cfg),
         "could not send attachment",
     )
 }
@@ -142,7 +167,8 @@ fn format_bytes(n: u64) -> String {
 
 /// Extend TTL for a still-queued mailbox message (default +7 days).
 pub fn extend_mailbox_ttl(message_id: &str) -> Result<(), String> {
-    let v = crate::delivery_runtime::delivery_extend_ttl(message_id, 7 * 24 * 3600);
+    let mid = require_delivery_message_id(message_id)?;
+    let v = crate::delivery_runtime::delivery_extend_ttl(&mid, 7 * 24 * 3600);
     if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
         Ok(())
     } else {
@@ -156,14 +182,11 @@ pub fn extend_mailbox_ttl(message_id: &str) -> Result<(), String> {
 
 /// Resend a failed/expired outbound text, voice note, or attachment as a **new** upload.
 pub fn resend_failed(peer_public_key_hex: &str, old_message_id: &str) -> Result<(), String> {
-    let peer = peer_public_key_hex.trim();
-    let mid = old_message_id.trim();
-    if peer.is_empty() || mid.is_empty() {
-        return Err("missing peer or message id".into());
-    }
+    let peer = require_contact_pk(peer_public_key_hex)?;
+    let mid = require_delivery_message_id(old_message_id)?;
     let ns = crate::dm_event_handler::active_app_namespace()
         .ok_or_else(|| "not unlocked".to_string())?;
-    let lines = crate::dm_transcript_store::load_merged(&ns, &[peer.to_string()], None)
+    let lines = crate::dm_transcript_store::load_merged(&ns, &[peer.clone()], None)
         .map_err(|e| e.to_string())?;
     let line = lines
         .into_iter()
@@ -179,7 +202,7 @@ pub fn resend_failed(peer_public_key_hex: &str, old_message_id: &str) -> Result<
         if text.is_empty() {
             return Err("message body empty".into());
         }
-        return send_text(peer, text);
+        return send_text(&peer, text);
     }
     if kind == "voice" {
         let path = line
@@ -191,7 +214,7 @@ pub fn resend_failed(peer_public_key_hex: &str, old_message_id: &str) -> Result<
             .ok_or_else(|| "voice file missing for resend".to_string())?;
         let opus = std::fs::read(path).map_err(|e| format!("read voice: {e}"))?;
         let duration_ms = line.duration_ms.unwrap_or(1).max(1);
-        return send_voice_note(peer, duration_ms, opus);
+        return send_voice_note(&peer, duration_ms, opus);
     }
     if kind == "attachment_offer" {
         let path = line
@@ -200,7 +223,7 @@ pub fn resend_failed(peer_public_key_hex: &str, old_message_id: &str) -> Result<
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "attachment file missing for resend".to_string())?;
-        return send_attachment(peer, path);
+        return send_attachment(&peer, path);
     }
     Err(format!("cannot resend msg_kind={kind}"))
 }
@@ -251,6 +274,7 @@ pub fn app_log_text() -> String {
 
 /// Start native connect in this process and register saved contacts.
 pub fn start_network(app_namespace: &str) -> Result<Value, String> {
+    let app_namespace = require_app_namespace(app_namespace)?;
     let roster = contacts_v1::list_contacts(app_namespace).map_err(|e| e.to_string())?;
     let dm_peers: Vec<Value> = roster
         .into_iter()
@@ -280,8 +304,26 @@ pub fn start_network(app_namespace: &str) -> Result<Value, String> {
     #[cfg(target_os = "linux")]
     crate::linux_desktop_launch::install_user_autostart();
     #[cfg(target_os = "android")]
-    crate::android_network::hold_multicast_lock(true);
+    {
+        crate::android_network::hold_multicast_lock(true);
+        crate::incoming_call_android::dismiss_unlock_prompt();
+    }
     Ok(result)
+}
+
+/// Android: `set_open_room` must not force the native read gate on when the app is backgrounded.
+/// Desktop: the hub never calls `set_app_visible`, so an open room implies visible.
+fn ui_visible_for_open_room_sync(opening_room: bool) -> bool {
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = opening_room;
+        true
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = opening_room;
+        crate::p2p::app_ui_visible()
+    }
 }
 
 /// First launch on the desktop: install login start, and ask for the password if a keystore exists.
@@ -303,14 +345,25 @@ pub fn desktop_session_start(app_namespace: &str) {
 pub fn set_open_room(public_key_hex: Option<&str>) {
     if let Some(peer) = public_key_hex {
         crate::message_notify::clear_for_peer(peer);
+        // Hub unread suppression keys off foreground pk even when the read gate is off
+        // (Android background). `p2p_sync_ui_session` may skip `SetForegroundPeer` when invisible.
+        crate::p2p::sync_foreground_peer_now(Some(peer.to_string()));
     }
-    let _ = p2p_sync_ui_session(true, public_key_hex);
+    let opening = public_key_hex.is_some();
+    let _ = p2p_sync_ui_session(ui_visible_for_open_room_sync(opening), public_key_hex);
 }
 
 /// Android background: the open room stays, and new read acks stop until the app is visible again.
 /// Linux does not call this for a brief focus change.
 pub fn set_app_visible(visible: bool) {
     let room = crate::p2p::live_foreground_peer_pk();
+    if visible {
+        if let Some(peer) = room.as_deref() {
+            crate::message_notify::clear_for_peer(peer);
+        }
+        #[cfg(target_os = "android")]
+        crate::incoming_call_android::dismiss_unlock_prompt();
+    }
     let _ = p2p_sync_ui_session(visible, room.as_deref());
 }
 
@@ -338,21 +391,25 @@ pub struct TranscriptPage {
 /// and reloads the open room only when it changed — cheap, and independent of
 /// whether the originating event was surfaced through `poll_event`.
 pub fn transcript_revision(app_namespace: &str, peer_public_key_hex: &str) -> u64 {
-    crate::dm_transcript_store::thread_revision_for_keys(
-        app_namespace,
-        &[peer_public_key_hex.to_string()],
-    )
+    let Ok(peer) = require_contact_pk(peer_public_key_hex) else {
+        return 0;
+    };
+    crate::dm_transcript_store::thread_revision_for_keys(app_namespace, &[peer])
 }
+
+/// UI page size ceiling — larger requests still work but are clamped for responsiveness.
+const MAX_TRANSCRIPT_PAGE: usize = 500;
 
 pub fn load_transcript(
     app_namespace: &str,
     peer_public_key_hex: &str,
     limit: usize,
 ) -> Result<TranscriptPage, String> {
+    let peer = require_contact_pk(peer_public_key_hex)?;
     let cfg = json!({
         "app_namespace": app_namespace,
-        "conversation_keys": [peer_public_key_hex],
-        "limit": limit.max(1),
+        "conversation_keys": [peer],
+        "limit": limit.clamp(1, MAX_TRANSCRIPT_PAGE),
     });
     let v = p2p_runtime::p2p_transcript_load_merged(&cfg);
     if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
@@ -418,8 +475,18 @@ pub fn load_transcript(
 }
 
 pub fn send_voice_note(peer_public_key_hex: &str, duration_ms: u32, opus: Vec<u8>) -> Result<(), String> {
-    note_outbound_trust(peer_public_key_hex);
-    let v = p2p_runtime::p2p_send_voice_dm(peer_public_key_hex, duration_ms, opus);
+    let peer = require_contact_pk(peer_public_key_hex)?;
+    if opus.is_empty() {
+        return Err("voice note is empty".into());
+    }
+    if duration_ms == 0 || duration_ms > crate::voice_msg_v1::VOICE_MAX_DURATION_MS {
+        return Err(format!(
+            "voice duration must be 1..={}",
+            crate::voice_msg_v1::VOICE_MAX_DURATION_MS
+        ));
+    }
+    note_outbound_trust(&peer);
+    let v = p2p_runtime::p2p_send_voice_dm(&peer, duration_ms, opus);
     if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
         let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("voice send failed");
         return Err(err.to_string());
@@ -446,21 +513,37 @@ pub fn voice_note_toggle() -> Result<Option<(u32, Vec<u8>)>, String> {
     crate::voice_note::voice_note_toggle()
 }
 
+fn host_user_file_cfg() -> crate::storage::StorageConfig {
+    let ns = crate::dm_event_handler::active_app_namespace()
+        .or_else(crate::app_paths::detect_keystore_app_namespace)
+        .unwrap_or_else(super::identity::default_app_namespace);
+    crate::app_paths::storage_config_for_namespace(&ns)
+}
+
+fn resolve_host_user_file(path: &str) -> Result<std::path::PathBuf, String> {
+    let cfg = host_user_file_cfg();
+    crate::app_paths::resolve_user_file_path(&cfg, path)
+        .map_err(|_| "Attachment file is missing".into())
+}
+
 /// Copy a downloaded attachment into the user's Downloads folder.
 /// Returns a short status string suitable for the chat status line.
 pub fn save_attachment(local_path: &str) -> Result<String, String> {
-    let src = local_path.trim();
-    if src.is_empty() || !std::path::Path::new(src).is_file() {
-        return Err("Attachment file is missing".into());
+    let src_path = resolve_host_user_file(local_path)?;
+    let meta = std::fs::metadata(&src_path).map_err(|e| e.to_string())?;
+    if meta.len() > crate::attach_v1::MAX_FILE_SIZE_BYTES {
+        return Err("Attachment file is too large to save".into());
     }
-    let name = std::path::Path::new(src)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("attachment")
-        .to_string();
+    let name = crate::attach_v1::sanitize_file_name(
+        src_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment"),
+    );
     #[cfg(target_os = "android")]
     {
-        return crate::incoming_call_android::save_file_to_downloads(src, &name);
+        let src = src_path.to_string_lossy();
+        return crate::incoming_call_android::save_file_to_downloads(&src, &name);
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -499,7 +582,7 @@ pub fn save_attachment(local_path: &str) -> Result<String, String> {
                 }
             }
         }
-        std::fs::copy(src, &dest).map_err(|e| format!("Could not save attachment: {e}"))?;
+        std::fs::copy(&src_path, &dest).map_err(|e| format!("Could not save attachment: {e}"))?;
         Ok(format!("Saved to {}", dest.display()))
     }
 }
@@ -518,18 +601,17 @@ pub fn voice_play_progress() -> Option<(String, u32, u32)> {
 }
 
 pub fn open_local_file(path: &str) -> Result<(), String> {
-    let path = path.trim();
-    if path.is_empty() || !std::path::Path::new(path).is_file() {
-        return Err("That file is not on this device yet.".into());
-    }
+    let path = resolve_host_user_file(path)
+        .map_err(|_| "That file is not on this device yet.".to_string())?;
+    let path = path.to_string_lossy();
     #[cfg(target_os = "android")]
     {
-        return crate::incoming_call_android::open_file(path);
+        return crate::incoming_call_android::open_file(path.as_ref());
     }
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", path])
+            .args(["/C", "start", "", path.as_ref()])
             .spawn()
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -537,7 +619,7 @@ pub fn open_local_file(path: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .arg(path)
+            .arg(path.as_ref())
             .spawn()
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -549,20 +631,29 @@ pub fn open_local_file(path: &str) -> Result<(), String> {
     ))]
     {
         std::process::Command::new("xdg-open")
-            .arg(path)
+            .arg(path.as_ref())
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
 
+/// Soft UI/API ceiling — sealed delivery blobs stay well under the 4 MiB ciphertext cap.
+pub const MAX_TEXT_DM_BYTES: usize = 64 * 1024;
+
 pub fn send_text(peer_public_key_hex: &str, text: &str) -> Result<(), String> {
+    let peer = require_contact_pk(peer_public_key_hex)?;
     let text = text.trim();
     if text.is_empty() {
         return Err("message is empty".into());
     }
-    note_outbound_trust(peer_public_key_hex);
-    let v = p2p_runtime::p2p_send_text_dm(peer_public_key_hex, text);
+    if text.len() > MAX_TEXT_DM_BYTES {
+        return Err(format!(
+            "message longer than {MAX_TEXT_DM_BYTES} bytes"
+        ));
+    }
+    note_outbound_trust(&peer);
+    let v = p2p_runtime::p2p_send_text_dm(&peer, text);
     if v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
         let err = v
             .get("error")

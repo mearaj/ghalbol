@@ -63,6 +63,7 @@ echo "  coord verify     : ${COORD_URL}"
 echo "  coord listen     : ${GHALBOL_COORD_LISTEN}"
 
 echo "== build ghalbol_coord (release) =="
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 cargo build --release -p ghalbol_coord
 
 if [[ ! -x "${BIN}" ]]; then
@@ -101,13 +102,14 @@ sudo cp "${HOME}/coord-stats-logrotate" /etc/logrotate.d/ghalbol-coord-stats
 sudo cp "${HOME}/coord-vm-monitor.service" /etc/systemd/system/coord-vm-monitor.service
 sudo cp "${HOME}/coord-vm-monitor.timer" /etc/systemd/system/coord-vm-monitor.timer
 
+sudo systemctl stop ghalbol-coord 2>/dev/null || true
 mv "${HOME}/ghalbol_coord.new" "${HOME}/ghalbol_coord"
 chmod +x "${HOME}/ghalbol_coord"
 
 sudo systemctl daemon-reload
 sudo systemctl enable ghalbol-coord coord-vm-monitor.timer
 sudo systemctl disable --now relay-egress-cap 2>/dev/null || true
-sudo systemctl restart ghalbol-coord
+sudo systemctl start ghalbol-coord
 sudo systemctl status ghalbol-coord --no-pager
 REMOTE_EOF
 

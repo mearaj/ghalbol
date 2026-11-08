@@ -9,7 +9,11 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Cap adversarial manifest.json in import archives.
+const MAX_MANIFEST_JSON_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MailboxStats {
     pub schema_version: i32,
     pub instance_id: String,
@@ -21,6 +25,7 @@ pub struct MailboxStats {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExportManifest {
     schema_version: i32,
     exported_at_ms: i64,
@@ -87,6 +92,15 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn parse_export_manifest(raw: &str) -> Result<ExportManifest> {
+    if raw.len() > MAX_MANIFEST_JSON_BYTES {
+        return Err(DeliveryError::BadRequest("manifest.json too large".into()));
+    }
+    serde_json::from_str(raw).map_err(|e| {
+        DeliveryError::BadRequest(format!("invalid manifest.json: {e}"))
+    })
 }
 
 pub fn export_mailbox(config: &DeliveryConfig, out_path: &Path) -> Result<()> {
@@ -177,9 +191,7 @@ pub fn import_mailbox(config: &DeliveryConfig, in_path: &Path, replace: bool) ->
     }
 
     let manifest_raw = std::fs::read_to_string(&manifest_path)?;
-    let manifest: ExportManifest = serde_json::from_str(&manifest_raw).map_err(|e| {
-        DeliveryError::BadRequest(format!("invalid manifest.json: {e}"))
-    })?;
+    let manifest = parse_export_manifest(&manifest_raw)?;
     if manifest.schema_version != SCHEMA_VERSION {
         return Err(DeliveryError::BadRequest(format!(
             "unsupported schema version {} (expected {SCHEMA_VERSION})",
@@ -235,16 +247,16 @@ pub fn import_mailbox(config: &DeliveryConfig, in_path: &Path, replace: bool) ->
         let insert = if replace {
             "INSERT OR REPLACE INTO pending_messages
              (sender_wire, message_id, recipient_wire, envelope_blob, size_bytes,
-              uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms)
+              uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms, read_at_ms)
              SELECT sender_wire, message_id, recipient_wire, envelope_blob, size_bytes,
-                    uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms
+                    uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms, read_at_ms
              FROM imported.pending_messages"
         } else {
-            "INSERT INTO pending_messages
+            "INSERT OR IGNORE INTO pending_messages
              (sender_wire, message_id, recipient_wire, envelope_blob, size_bytes,
-              uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms)
+              uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms, read_at_ms)
              SELECT sender_wire, message_id, recipient_wire, envelope_blob, size_bytes,
-                    uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms
+                    uploaded_at_ms, expires_at_ms, state, delivered_at_ms, expired_at_ms, read_at_ms
              FROM imported.pending_messages"
         };
         let tx = existing.transaction()?;
@@ -252,7 +264,9 @@ pub fn import_mailbox(config: &DeliveryConfig, in_path: &Path, replace: bool) ->
         tx.commit()?;
         existing.execute_batch("DETACH DATABASE imported;")?;
     } else {
-        std::fs::copy(&imported_db, &dest)?;
+        let staging = dest.with_extension("db.staging");
+        std::fs::copy(&imported_db, &staging)?;
+        std::fs::rename(&staging, &dest)?;
     }
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -382,5 +396,129 @@ mod tests {
         let stats = import_mailbox(&target_cfg, &out, false).unwrap();
         assert_eq!(stats.queued_count, 2);
         assert_eq!(stats.total_rows, 2);
+    }
+
+    #[test]
+    fn import_rejects_oversized_and_unknown_manifest_fields() {
+        let dir = TempDir::new().unwrap();
+        let cfg = test_config(dir.path());
+        let archive = dir.path().join("bad.tar.zst");
+        let tmp_dir = dir.path().join(".import_tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("mailbox.db"), b"").unwrap();
+
+        let huge = " ".repeat(MAX_MANIFEST_JSON_BYTES + 1);
+        std::fs::write(tmp_dir.join("manifest.json"), huge).unwrap();
+        let mut tar_buf = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut tar_buf);
+            archive.append_path_with_name(tmp_dir.join("mailbox.db"), "mailbox.db").unwrap();
+            archive
+                .append_path_with_name(tmp_dir.join("manifest.json"), "manifest.json")
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        let file = File::create(&archive).unwrap();
+        let mut enc = zstd::stream::write::Encoder::new(file, 3).unwrap();
+        enc.write_all(&tar_buf).unwrap();
+        enc.finish().unwrap();
+
+        let err = import_mailbox(&cfg, &archive, true).unwrap_err();
+        assert!(matches!(err, DeliveryError::BadRequest(_)));
+        assert!(err.to_string().contains("too large"));
+
+        let nested = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "exported_at_ms": 1,
+            "instance_id": "inst",
+            "stats": {
+                "schema_version": SCHEMA_VERSION,
+                "instance_id": "inst",
+                "queued_count": 0,
+                "queued_bytes": 0,
+                "delivered_count": 0,
+                "expired_count": 0,
+                "total_rows": 0,
+            },
+            "attacker": { "nested": { "a": [1, 2, 3] } }
+        });
+        std::fs::write(tmp_dir.join("manifest.json"), nested.to_string()).unwrap();
+        tar_buf.clear();
+        {
+            let mut archive = tar::Builder::new(&mut tar_buf);
+            archive.append_path_with_name(tmp_dir.join("mailbox.db"), "mailbox.db").unwrap();
+            archive
+                .append_path_with_name(tmp_dir.join("manifest.json"), "manifest.json")
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        let file = File::create(dir.path().join("unknown.tar.zst")).unwrap();
+        let mut enc = zstd::stream::write::Encoder::new(file, 3).unwrap();
+        enc.write_all(&tar_buf).unwrap();
+        enc.finish().unwrap();
+        let err = import_mailbox(&cfg, &dir.path().join("unknown.tar.zst"), true).unwrap_err();
+        assert!(matches!(err, DeliveryError::BadRequest(_)));
+    }
+
+    #[test]
+    fn import_merge_keeps_read_at_ms() {
+        let source_dir = TempDir::new().unwrap();
+        let source_cfg = test_config(source_dir.path());
+        let sender = "02".repeat(33);
+        let recipient = "03".repeat(33);
+        {
+            let conn = db::open_and_migrate(&mailbox_db_path(&source_cfg)).unwrap();
+            let store = MailboxStore::new(conn, &source_cfg);
+            let policy = PolicyLimits::from_config(&source_cfg);
+            store
+                .upload(
+                    ValidatedEnvelope {
+                        message_id: "read-me".into(),
+                        sender_wire: sender.clone(),
+                        recipient_wire: recipient.clone(),
+                        envelope_blob: "{}".into(),
+                        size_bytes: 2,
+                    },
+                    3600,
+                    &policy,
+                )
+                .unwrap();
+            store.ack_deliver(&recipient, "read-me", &sender).unwrap();
+            store.ack_read(&recipient, "read-me", &sender).unwrap();
+        }
+        let out = source_dir.path().join("export.tar.zst");
+        export_mailbox(&source_cfg, &out).unwrap();
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest_cfg = test_config(dest_dir.path());
+        {
+            let conn = db::open_and_migrate(&mailbox_db_path(&dest_cfg)).unwrap();
+            let store = MailboxStore::new(conn, &dest_cfg);
+            let policy = PolicyLimits::from_config(&dest_cfg);
+            store
+                .upload(
+                    ValidatedEnvelope {
+                        message_id: "other".into(),
+                        sender_wire: "04".repeat(33),
+                        recipient_wire: "05".repeat(33),
+                        envelope_blob: "{}".into(),
+                        size_bytes: 2,
+                    },
+                    3600,
+                    &policy,
+                )
+                .unwrap();
+        }
+        import_mailbox(&dest_cfg, &out, false).unwrap();
+        let conn = Connection::open(mailbox_db_path(&dest_cfg)).unwrap();
+        let (state, read_at): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT state, read_at_ms FROM pending_messages WHERE message_id = 'read-me'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "read");
+        assert!(read_at.unwrap_or(0) > 0);
     }
 }

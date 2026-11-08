@@ -148,7 +148,7 @@ Identity: **secp256k1** device key ([IDENTITY.md](IDENTITY.md)). Product WAN dis
 Binding rules — if another doc disagrees, update it to match this section.
 
 1. **Start on unlock, run until log out.** `host::start_network` starts connect + delivery workers. **Lock** leaves the node running. **Log out** stops it.
-2. **Watch the network continuously.** `notify_network_change` + `refresh_os_network_truth` on connect upkeep (~1s). See § **Network truth**.
+2. **Watch the network continuously.** `refresh_os_network_truth` on each connect upkeep tick (~1s). `notify_network_change` may wake upkeep early when a platform hook wires it; shipping desktop/Android rely on the ~1s upkeep probe today. See § **Network truth**.
 3. **Publish coord endpoints when they change.** Public routable **TCP** listen (from ephemeral port + public IP when available) → `POST /v1/register`. **Re-register** on endpoint change, failed register, handover, or stale presence — **throttle** when unchanged (`should_throttle_register`, heartbeat every ~25s). Details: [COORDINATION_SERVER.md](COORDINATION_SERVER.md).
 4. **CGNAT / mobile-only peers** often have **no** public TCP to register. They still **heartbeat** when registered empty/minimal; **WAN calls** use `/v1/bridge/*`; **text** uses delivery only.
 5. **LAN is per-peer and additive.** mDNS `Discovered` → dial that contact on LAN. mDNS `Expired` → drop LAN session; do not block delivery or bridge.
@@ -210,8 +210,8 @@ Device left LAN (mobile-data) → refresh_os_network_truth
      re-register — does **not** tear down a live local relay circuit listen)
   → mDNS state purged on LAN loss paths in network_transport / connect upkeep
 
-Wi‑Fi return → notify_network_change → fresh ephemeral listen + mDNS publish
-  → Discovered → LAN session again (calls)
+Wi‑Fi return → connect upkeep detects `os=` flip → coord invalidate + register when endpoints change
+  → mDNS browse on the existing ephemeral listen → `Discovered` → LAN session again (calls)
   → same OS-route invalidate path when `os=` flips wifi↔cell/ethernet
 ```
 
@@ -242,7 +242,7 @@ Wi‑Fi return → notify_network_change → fresh ephemeral listen + mDNS publi
 | File | Role |
 |------|------|
 | `p2p/network_transport.rs` | `OsNetworkSnapshot`, `merge_os_network_truth`, `refresh_os_network_truth` |
-| `android_network.rs` | JNI on connectivity notify |
+| `android_network.rs` | JNI `ConnectivityManager` probe on `refresh_os_network_truth` |
 | `linux_network.rs` | Default route + Wi‑Fi operstate |
 | `windows_network.rs` | Default-route adapter (no packet sent) classified by name: Wi‑Fi / Cellular / Ethernet |
 | `connect/worker.rs` | Upkeep calls `refresh_os_network_truth` |
@@ -318,13 +318,13 @@ Whenever policy waits on work with **unknown duration** (TCP connect, bridge WSS
 
 1. **Worker** — owns the operation until success/failure (dial task, bridge accept, delivery poll).
 2. **Policy** — reacts to events (session up → drain outbox; expired → clear LAN; HTTP ok → set registered).
-3. **Timers** — guardrails only: storm throttles, heartbeat/register dedupe, bridge accept backoff, in-flight dial observation.
+3. **Timers** — guardrails only: storm throttles, heartbeat/register dedupe (`should_throttle_register`: ~10s when registered, ~2s when not), delivery WSS reconnect backoff (1s doubling, cap 60s), bridge accept backoff, in-flight dial observation.
 
 | Area | Worker | Policy reacts to |
 |------|--------|------------------|
 | LAN connect | `dial_peer_tcp`, mDNS forwarder | `Discovered`, connect result, `Expired` |
 | WAN call | bridge request + WSS | pending poll, WSS open, mux ready |
-| text | delivery_runtime | mailbox events (not connect poll) |
+| text | delivery_runtime | mailbox push + upkeep; reconnect backoff on WSS drop (not connect poll) |
 | Register | `coord_register_tick` | endpoint diff, failure, stale presence |
 | Makepad | — | Poll **display only** |
 
@@ -353,11 +353,14 @@ Each URL is **HTTP(S) presence + bridge WSS on the same host**.
 
 | Data | Source |
 |------|--------|
-| Peer public TCP dial targets | `GET /v1/peers/{public_key}` |
+| Peer WAN mux dial targets (relay `/p2p-circuit`) | `GET /v1/peers/{public_key}` — filter live; no disk |
+| Peer public TCP on coord row | Same live lookup (public TCP dial before bridge on call path) |
 | LAN TCP port | mDNS events only |
 | Bridge tokens | Short-lived; from bridge API responses only |
 
 **In-memory OK:** storm throttles, bridge accept backoff, coord lookup backoff, mDNS candidate set for **expire/failover** — not timer re-dial.
+
+**Resource ceilings (DoS / dial storms):** `coord_dial` expands `GHALBOL_COORD_DIAL` + DNS to at most **16** TCP targets; bridge accept keeps at most **32** concurrent `accept_bridge_pending` tasks; video I420→RGBA conversion rejects pathological width×height before allocate.
 
 **No disk cache** for coord dial addrs or bridge tokens.
 
@@ -374,7 +377,7 @@ Each URL is **HTTP(S) presence + bridge WSS on the same host**.
 | `connect/lan_discovery.rs` | mDNS publish/browse |
 | `connect/bridge_*.rs` | WAN call bridge client |
 | `delivery_runtime.rs` | text |
-| `coord_runtime.rs` | Register, heartbeat, lookup JSON |
+| `coord_runtime/` | Register, heartbeat, lookup JSON (`register.rs`, `presence.rs`, `lookup.rs`) |
 | `p2p/network_transport.rs` | OS network truth |
 | `dm_transport/` | Dial-address parsing helpers |
 
@@ -403,7 +406,7 @@ The UI calls `ghalbol_core::host`. Do not rename without a version bump:
 | Guest scans host QR | `connect_invite_v1.rs` |
 | No full connect stop on contact upsert | `register_dm_peer` |
 | OS default route drives `profile=` | `network_transport.rs`, `android_network.rs`, `linux_network.rs`, `windows_network.rs` |
-| Register when publishable endpoints **change** | `coord_runtime.rs` |
+| Register when publishable endpoints **change** | `coord_runtime/register.rs` |
 | mDNS LAN dials from **events** only | `connect/worker.rs`, `lan_discovery.rs` |
 
 ---

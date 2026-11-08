@@ -38,10 +38,11 @@ pub fn contact_has_lan_connect_path(identity_wire: &str) -> bool {
 }
 
 pub fn connect_start(identity_wire: &str, contacts: &[String]) -> Result<(), String> {
-    if let Ok(g) = holder_mx().lock() {
-        if g.is_some() {
-            return Ok(());
-        }
+    let mut slot = holder_mx()
+        .lock()
+        .map_err(|_| "connect mutex poisoned".to_string())?;
+    if slot.is_some() {
+        return Ok(());
     }
     let stop = Arc::new(AtomicBool::new(false));
     let connected = Arc::new(Mutex::new(HashSet::new()));
@@ -72,14 +73,12 @@ pub fn connect_start(identity_wire: &str, contacts: &[String]) -> Result<(), Str
             ));
         })
         .map_err(|e| e.to_string())?;
-    if let Ok(mut g) = holder_mx().lock() {
-        *g = Some(ConnectHolder {
-            stop,
-            join,
-            cmd_tx,
-            connected,
-        });
-    }
+    *slot = Some(ConnectHolder {
+        stop,
+        join,
+        cmd_tx,
+        connected,
+    });
     native_log::info("connect", "native connect sidecar started");
     Ok(())
 }
@@ -164,4 +163,19 @@ async fn connect_sidecar(
         }
     }
     let _ = connected;
+}
+
+#[cfg(test)]
+mod connect_start_tests {
+    use super::*;
+
+    #[test]
+    fn connect_start_is_idempotent_under_mutex() {
+        connect_stop();
+        let peers = vec!["aa".repeat(32)];
+        let id = "id".repeat(32);
+        assert!(connect_start(&id, &peers).is_ok());
+        assert!(connect_start(&id, &peers).is_ok());
+        connect_stop();
+    }
 }

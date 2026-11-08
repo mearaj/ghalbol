@@ -3,18 +3,29 @@
 use ghalbol_core::host::{self, ChatLine, RosterEntry};
 use makepad_widgets::*;
 
+/// Pack RGBA → BGRA u32 words for Makepad textures. Short buffers become opaque black.
+pub(crate) fn pack_rgba_to_bgra_u32(w: u32, h: u32, rgba: &[u8]) -> Vec<u32> {
+    let pixels = (w as usize).saturating_mul(h as usize);
+    let need = pixels.saturating_mul(4);
+    let mut data = Vec::with_capacity(pixels);
+    if rgba.len() >= need {
+        for px in rgba[..need].chunks_exact(4) {
+            data.push(
+                ((px[3] as u32) << 24)
+                    | ((px[0] as u32) << 16)
+                    | ((px[1] as u32) << 8)
+                    | (px[2] as u32),
+            );
+        }
+    } else {
+        data.resize(pixels, 0xff00_0000);
+    }
+    data
+}
+
 /// Pack RGBA bytes into a Makepad `VecBGRAu8_32` texture (same path as QR preview).
 pub(crate) fn rgba_to_bgra_texture(cx: &mut Cx, w: u32, h: u32, rgba: &[u8]) -> Texture {
-    let pixels = (w as usize).saturating_mul(h as usize);
-    let mut data = Vec::with_capacity(pixels);
-    for px in rgba.chunks_exact(4).take(pixels) {
-        data.push(
-            ((px[3] as u32) << 24)
-                | ((px[0] as u32) << 16)
-                | ((px[1] as u32) << 8)
-                | (px[2] as u32),
-        );
-    }
+    let data = pack_rgba_to_bgra_u32(w, h, rgba);
     Texture::new_with_format(
         cx,
         TextureFormat::VecBGRAu8_32 {
@@ -53,6 +64,53 @@ pub(crate) fn roster_matches(row: &RosterEntry, search: &str) -> bool {
         || row.preview.to_lowercase().contains(&q)
 }
 
+/// Identity wires compare case-insensitively in roster + open-room state.
+pub(crate) fn peer_public_key_eq(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Match `contacts_v1` storage (trim + lowercase ASCII hex wires).
+pub(crate) fn canonical_peer_key(pk: &str) -> String {
+    let t = pk.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if t.is_ascii() {
+        return t.to_ascii_lowercase();
+    }
+    t.to_string()
+}
+
+pub(crate) fn roster_title_for_key(rows: &[(String, String)], pk: &str) -> Option<String> {
+    rows.iter()
+        .find(|(row_pk, _)| peer_public_key_eq(row_pk, pk))
+        .map(|(_, title)| title.clone())
+}
+
+/// Mirror `preferences_v1::sanitize_peer_display_alias` before save (UI feedback matches wire).
+pub(crate) fn normalize_availability_status(raw: &str) -> Option<String> {
+    let mut t = raw.trim().to_string();
+    if t.is_empty() {
+        return None;
+    }
+    for ch in ['\n', '\r', '\t'] {
+        t = t.replace(ch, " ");
+    }
+    const MAX: usize = 64;
+    if t.len() > MAX {
+        t.truncate(MAX);
+        while !t.is_empty() && t.ends_with(' ') {
+            t.pop();
+        }
+    }
+    let t = t.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
 pub(crate) struct Bubble {
     pub(crate) body: String,
     /// Secondary line under the body (size / Downloaded / Downloading…).
@@ -80,6 +138,59 @@ pub(crate) fn format_bytes(n: u64) -> String {
 pub(crate) fn format_mmss(ms: u32) -> String {
     let secs = ms / 1000;
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Cap user-visible status / error lines so poll and host errors cannot bloat Splash state.
+pub(crate) const MAX_UI_DISPLAY_CHARS: usize = 320;
+
+pub(crate) fn clamp_ui_display_line(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= MAX_UI_DISPLAY_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s
+        .chars()
+        .take(MAX_UI_DISPLAY_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
+}
+
+/// Same-room reload returned zero rows — keep the painted chat (DESIGN.md anti-pattern).
+pub(crate) fn keep_painted_transcript(
+    loaded_lines: usize,
+    room_changed: bool,
+    painted_lines: usize,
+) -> bool {
+    loaded_lines == 0 && !room_changed && painted_lines > 0
+}
+
+/// Transient `load_transcript` failure — do not wipe a painted room.
+pub(crate) fn preserve_transcript_on_load_error(painted_lines: usize) -> bool {
+    painted_lines > 0
+}
+
+/// Call ended in native but the Makepad call shell is still up (`call_open` cleared elsewhere).
+pub(crate) fn needs_call_shell_reconcile(in_call: bool, call_view_visible: bool) -> bool {
+    !in_call && call_view_visible
+}
+
+/// User-facing block before `host::send_text` (unit-tested).
+pub(crate) fn send_text_block_reason(
+    has_session: bool,
+    ui_locked: bool,
+    peer_empty: bool,
+) -> Option<&'static str> {
+    if !has_session {
+        return Some("Unlock to send messages.");
+    }
+    if ui_locked {
+        return Some("Unlock the app to send messages.");
+    }
+    if peer_empty {
+        return Some("Select a chat first");
+    }
+    None
 }
 
 pub(crate) fn bubble_of(line: &ChatLine, peer_title: &str) -> Bubble {
@@ -156,17 +267,20 @@ pub(crate) fn bubble_of(line: &ChatLine, peer_title: &str) -> Bubble {
 }
 
 pub(crate) fn save_status_line(status: &str) -> Result<String, String> {
-    host::set_availability_status(status).map(|()| {
-        if status.is_empty() {
-            "Status cleared".into()
-        } else {
-            format!("Status saved: {status}")
-        }
+    let normalized = normalize_availability_status(status);
+    let wire = normalized.as_deref().unwrap_or("");
+    host::set_availability_status(wire).map(|()| match &normalized {
+        None => "Status cleared".into(),
+        Some(s) => format!("Status saved: {s}"),
     })
 }
 
 pub(crate) fn qr_png(text: &str) -> Option<Vec<u8>> {
     use ::image::ImageEncoder;
+    // Match invite URI ceiling — oversized paste must not hang QR encode.
+    if text.len() > 8 * 1024 {
+        return None;
+    }
     let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
     let img = code
         .render::<::image::Luma<u8>>()
@@ -327,6 +441,148 @@ mod bubble_tests {
             message_id: String::new(),
             size_bytes: 0,
         }
+    }
+
+    #[test]
+    fn pack_rgba_short_buffer_fills_opaque_black() {
+        let data = super::pack_rgba_to_bgra_u32(2, 2, &[1, 2, 3, 4]);
+        assert_eq!(data.len(), 4);
+        assert!(data.iter().all(|p| *p == 0xff00_0000));
+    }
+
+    #[test]
+    fn pack_rgba_exact_buffer_preserves_channels() {
+        let rgba = [10u8, 20, 30, 40, 1, 2, 3, 255];
+        let data = super::pack_rgba_to_bgra_u32(1, 2, &rgba);
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0], (40u32 << 24) | (10 << 16) | (20 << 8) | 30);
+        assert_eq!(data[1], (255u32 << 24) | (1 << 16) | (2 << 8) | 3);
+    }
+
+    #[test]
+    fn qr_png_rejects_oversized_payload() {
+        let huge = "a".repeat(8 * 1024 + 1);
+        assert!(super::qr_png(&huge).is_none());
+    }
+
+    #[test]
+    fn failed_outbound_tick_is_bang() {
+        let failed = bubble_of(&line(true, "failed", "oops"), "Bob");
+        assert!(failed.failed);
+        assert_eq!(failed.tick, "!");
+    }
+
+    #[test]
+    fn keep_painted_transcript_on_empty_same_room_reload() {
+        assert!(super::keep_painted_transcript(0, false, 3));
+        assert!(!super::keep_painted_transcript(0, true, 3));
+        assert!(!super::keep_painted_transcript(2, false, 3));
+        assert!(!super::keep_painted_transcript(0, false, 0));
+    }
+
+    #[test]
+    fn preserve_transcript_when_load_errors_with_paint() {
+        assert!(super::preserve_transcript_on_load_error(4));
+        assert!(!super::preserve_transcript_on_load_error(0));
+    }
+
+    #[test]
+    fn call_shell_reconcile_when_view_up_but_not_in_call() {
+        assert!(super::needs_call_shell_reconcile(false, true));
+        assert!(!super::needs_call_shell_reconcile(true, true));
+        assert!(!super::needs_call_shell_reconcile(false, false));
+    }
+
+    #[test]
+    fn send_text_block_reason_order() {
+        assert_eq!(
+            super::send_text_block_reason(false, false, false),
+            Some("Unlock to send messages.")
+        );
+        assert_eq!(
+            super::send_text_block_reason(true, true, false),
+            Some("Unlock the app to send messages.")
+        );
+        assert_eq!(
+            super::send_text_block_reason(true, false, true),
+            Some("Select a chat first")
+        );
+        assert_eq!(super::send_text_block_reason(true, false, false), None);
+    }
+
+    #[test]
+    fn clamp_ui_display_line_truncates_with_ellipsis() {
+        let long = "x".repeat(super::MAX_UI_DISPLAY_CHARS + 40);
+        let out = super::clamp_ui_display_line(&long);
+        assert_eq!(out.chars().count(), super::MAX_UI_DISPLAY_CHARS);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn peer_key_eq_ignores_case_and_surrounding_space() {
+        let a = "  ABCDEF01 ";
+        let b = "abcdef01";
+        assert!(super::peer_public_key_eq(a, b));
+        assert!(!super::peer_public_key_eq(a, "abcdEF02"));
+    }
+
+    #[test]
+    fn canonical_peer_key_lowercases_ascii_wires() {
+        assert_eq!(super::canonical_peer_key("  AABB "), "aabb");
+        assert_eq!(super::canonical_peer_key(""), "");
+    }
+
+    #[test]
+    fn roster_title_lookup_is_case_insensitive() {
+        let rows = vec![("aa11".into(), "Alice".into())];
+        assert_eq!(
+            super::roster_title_for_key(&rows, "AA11").as_deref(),
+            Some("Alice")
+        );
+        assert!(super::roster_title_for_key(&rows, "zz").is_none());
+    }
+
+    #[test]
+    fn normalize_availability_collapses_whitespace_and_caps_bytes() {
+        assert_eq!(
+            super::normalize_availability_status("  Busy\nnow  ").as_deref(),
+            Some("Busy now")
+        );
+        let long = "x".repeat(80);
+        let out = super::normalize_availability_status(&long).unwrap();
+        assert!(out.len() <= 64);
+        assert_eq!(super::normalize_availability_status("   "), None);
+    }
+
+    #[test]
+    fn call_avatar_initial_skips_hex_short_keys() {
+        assert_eq!(super::call_avatar_initial("0279be66…1798"), "#");
+        assert_eq!(super::call_avatar_initial("Alice"), "A");
+    }
+
+    #[test]
+    fn roster_matches_title_preview_and_key() {
+        use ghalbol_core::host::RosterEntry;
+        let row = RosterEntry {
+            title: "Bob".into(),
+            public_key_hex: "aabbcc".into(),
+            preview: "See you".into(),
+            unread: 0,
+            availability: String::new(),
+            is_known: true,
+            is_blocked: false,
+        };
+        assert!(super::roster_matches(&row, "bob"));
+        assert!(super::roster_matches(&row, "AABB"));
+        assert!(super::roster_matches(&row, "see"));
+        assert!(!super::roster_matches(&row, "zzz"));
+    }
+
+    #[test]
+    fn format_bytes_uses_sensible_units() {
+        assert_eq!(super::format_bytes(500), "500 B");
+        assert!(super::format_bytes(1500).contains("KB"));
+        assert!(super::format_bytes(2_000_000).contains("MB"));
     }
 
     #[test]

@@ -18,6 +18,20 @@ use super::types::{GossipChatEvent, SessionPeer};
 use super::worker::{mark_peer_connected, mark_peer_disconnected};
 use crate::p2p::native_log;
 
+/// Wall-clock guard for half-open TCP before transport mode (peer may stall mid-handshake).
+const NOISE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cap parallel TCP dials so a coord addr list cannot pin unbounded `dial_inflight` entries.
+const MAX_DIAL_INFLIGHT: usize = 128;
+/// Cap live Noise/mux tasks (writers map mirrors this).
+const MAX_PEER_SESSIONS: usize = 512;
+
+fn end_outbound_dial(registry: &PeerSessionRegistry, expected: &SessionPeer, actual: &SessionPeer) {
+    registry.end_dial(expected);
+    if actual != expected {
+        registry.end_dial(actual);
+    }
+}
+
 pub(crate) type SessionWriters =
     Arc<RwLock<HashMap<SessionPeer, mpsc::UnboundedSender<SessionWireItem>>>>;
 
@@ -50,10 +64,7 @@ impl PeerSessionRegistry {
     }
 
     pub fn writer_open(&self, peer: &SessionPeer) -> bool {
-        self.writers
-            .read()
-            .ok()
-            .is_some_and(|g| g.contains_key(peer))
+        writer_open_for_peer(&self.writers, peer)
     }
 
     pub fn try_begin_dial(&self, peer: &SessionPeer) -> bool {
@@ -64,6 +75,9 @@ impl PeerSessionRegistry {
             return false;
         };
         if g.contains(peer) {
+            return false;
+        }
+        if g.len() >= MAX_DIAL_INFLIGHT {
             return false;
         }
         g.insert(peer.clone());
@@ -88,19 +102,61 @@ impl PeerSessionRegistry {
     }
 
     pub fn register_session(&self, peer: SessionPeer, is_outbound: bool, abort: Arc<AtomicBool>) {
-        if let Ok(mut g) = self.sessions.write() {
-            g.insert(peer, ActiveSession { is_outbound, abort });
+        let replaced = if let Ok(mut g) = self.sessions.write() {
+            match g.insert(
+                peer.clone(),
+                ActiveSession { is_outbound, abort },
+            ) {
+                Some(old) => {
+                    old.abort.store(true, Ordering::SeqCst);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            return;
+        };
+        if replaced {
+            // Drop the dying task's sender so outbound cannot race the replacement handshake.
+            if let Ok(mut w) = self.writers.write() {
+                w.remove(&peer);
+            }
         }
     }
 
     pub fn remove_session(&self, peer: &SessionPeer) {
         if let Ok(mut g) = self.sessions.write() {
-            g.remove(peer);
+            if let Some(active) = g.remove(peer) {
+                active.abort.store(true, Ordering::SeqCst);
+            }
         }
         if let Ok(mut w) = self.writers.write() {
             w.remove(peer);
         }
         self.end_dial(peer);
+    }
+
+    /// Session task teardown: drop registry state only if this task still owns the peer slot.
+    pub fn finish_session_task(&self, peer: &SessionPeer, abort: &Arc<AtomicBool>) -> bool {
+        let still_owner = {
+            let Ok(mut g) = self.sessions.write() else {
+                return false;
+            };
+            match g.get(peer) {
+                Some(active) if Arc::ptr_eq(&active.abort, abort) => {
+                    g.remove(peer);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if still_owner {
+            if let Ok(mut w) = self.writers.write() {
+                w.remove(peer);
+            }
+            self.end_dial(peer);
+        }
+        still_owner
     }
 
     pub fn abort_outbound_duplicate(&self, peer: &SessionPeer) {
@@ -113,6 +169,24 @@ impl PeerSessionRegistry {
                     s.abort.store(true, Ordering::SeqCst);
                 }
             }
+        }
+    }
+
+    /// Stop every live Noise/mux task (log out / worker shutdown).
+    pub fn abort_all_sessions(&self) {
+        if let Ok(g) = self.sessions.read() {
+            for active in g.values() {
+                active.abort.store(true, Ordering::SeqCst);
+            }
+        }
+        if let Ok(mut g) = self.sessions.write() {
+            g.clear();
+        }
+        if let Ok(mut w) = self.writers.write() {
+            w.clear();
+        }
+        if let Ok(mut d) = self.dial_inflight.write() {
+            d.clear();
         }
     }
 }
@@ -173,7 +247,7 @@ pub(crate) async fn dial_peer_tcp(
             native_log::warn("connect", format!("dial failed {peer_wire}: {e}"));
             let _ = events_tx.send(GossipChatEvent::DialFailed {
                 peer: Some(peer_wire),
-                error: e.to_string(),
+                error: super::types::truncate_event_error(e.to_string()),
             });
             return;
         }
@@ -185,7 +259,7 @@ pub(crate) async fn dial_peer_tcp(
             );
             let _ = events_tx.send(GossipChatEvent::DialFailed {
                 peer: Some(peer_wire),
-                error: "dial timed out".to_string(),
+                error: super::types::truncate_event_error("dial timed out"),
             });
             return;
         }
@@ -254,22 +328,38 @@ pub(crate) async fn start_session_io<R, W>(
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let transport_sk = transport_static_secret_for_identity(&identity);
-    let hs = if is_outbound {
-        ConnectNoiseSession::initiator(&identity, &transport_sk, read, write).await
-    } else {
-        ConnectNoiseSession::responder(&identity, &transport_sk, read, write).await
+    let hs_fut = async {
+        if is_outbound {
+            ConnectNoiseSession::initiator(&identity, &transport_sk, read, write).await
+        } else {
+            ConnectNoiseSession::responder(&identity, &transport_sk, read, write).await
+        }
     };
+    let hs = tokio::time::timeout(NOISE_HANDSHAKE_TIMEOUT, hs_fut).await;
     let (noise, remote_wire, read, write) = match hs {
-        Ok(v) => v,
-        Err(e) => {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             if is_outbound {
-                registry.end_dial(&expected_peer);
+                end_outbound_dial(&registry, &expected_peer, &expected_peer);
             }
             native_log::warn("connect", format!("noise handshake failed: {e}"));
             if is_outbound {
                 let _ = events_tx.send(GossipChatEvent::DialFailed {
                     peer: Some(expected_peer),
-                    error: e,
+                    error: super::types::truncate_event_error(e),
+                });
+            }
+            return;
+        }
+        Err(_) => {
+            if is_outbound {
+                end_outbound_dial(&registry, &expected_peer, &expected_peer);
+            }
+            native_log::warn("connect", "noise handshake timed out");
+            if is_outbound {
+                let _ = events_tx.send(GossipChatEvent::DialFailed {
+                    peer: Some(expected_peer),
+                    error: super::types::truncate_event_error("noise handshake timed out"),
                 });
             }
             return;
@@ -279,21 +369,27 @@ pub(crate) async fn start_session_io<R, W>(
         Ok(w) => w,
         Err(e) => {
             if is_outbound {
-                registry.end_dial(&expected_peer);
+                end_outbound_dial(&registry, &expected_peer, &expected_peer);
             }
             native_log::warn("connect", format!("remote identity invalid: {e}"));
             return;
         }
     };
     if is_outbound && !expected_peer.is_empty() && peer_wire != expected_peer {
+        end_outbound_dial(&registry, &expected_peer, &peer_wire);
         native_log::warn(
             "connect",
             format!("dial identity mismatch expected={expected_peer} got={peer_wire}"),
         );
+        let _ = events_tx.send(GossipChatEvent::DialFailed {
+            peer: Some(expected_peer),
+            error: super::types::truncate_event_error("dial identity mismatch"),
+        });
+        return;
     }
     session.register_dm_peer_key(&peer_wire);
     if is_outbound && registry.should_drop_new_outbound(&peer_wire) {
-        registry.end_dial(&peer_wire);
+        end_outbound_dial(&registry, &expected_peer, &peer_wire);
         native_log::info(
             "connect",
             format!("drop outbound duplicate to {peer_wire} (inbound wins)"),
@@ -302,15 +398,51 @@ pub(crate) async fn start_session_io<R, W>(
     }
     registry.abort_outbound_duplicate(&peer_wire);
 
+    if !registry.has_session(&peer_wire) {
+        let at_cap = registry
+            .sessions
+            .read()
+            .ok()
+            .is_some_and(|g| g.len() >= MAX_PEER_SESSIONS);
+        if at_cap {
+            if is_outbound {
+                end_outbound_dial(&registry, &expected_peer, &peer_wire);
+                let _ = events_tx.send(GossipChatEvent::DialFailed {
+                    peer: Some(expected_peer),
+                    error: super::types::truncate_event_error("too many peer sessions"),
+                });
+            }
+            native_log::warn(
+                "connect",
+                format!("reject session to {peer_wire}: at peer session cap"),
+            );
+            return;
+        }
+    }
+
     let (wire_tx, mut wire_rx) = mpsc::unbounded_channel::<SessionWireItem>();
     let abort_flag = Arc::new(AtomicBool::new(false));
-    registry.register_session(peer_wire.clone(), is_outbound, Arc::clone(&abort_flag));
-    if let Ok(mut g) = registry.writers.write() {
+      registry.register_session(peer_wire.clone(), is_outbound, Arc::clone(&abort_flag));
+    let writer_registered = if let Ok(mut g) = registry.writers.write() {
         g.insert(peer_wire.clone(), wire_tx);
+        true
+    } else {
+        false
+    };
+    if !writer_registered {
+        registry.remove_session(&peer_wire);
+        if is_outbound {
+            end_outbound_dial(&registry, &expected_peer, &peer_wire);
+            let _ = events_tx.send(GossipChatEvent::DialFailed {
+                peer: Some(expected_peer),
+                error: super::types::truncate_event_error("session registry lock failed"),
+            });
+        }
+        return;
     }
     session.set_peer_on_local_lan(&peer_wire, true);
     mark_peer_connected(session.as_ref(), &peer_wire, &events_tx);
-    registry.end_dial(&peer_wire);
+    end_outbound_dial(&registry, &expected_peer, &peer_wire);
 
     let reg_c = Arc::clone(&registry);
     let sess_c = Arc::clone(&session);
@@ -408,15 +540,23 @@ pub(crate) async fn start_session_io<R, W>(
         abort_r.store(true, Ordering::SeqCst);
     });
 
+    let abort_cleanup = Arc::clone(&abort_flag);
     tokio::spawn(async move {
         let _ = tokio::join!(write_task, read_task);
-        reg_c.remove_session(&peer_c);
-        sess_c.set_peer_on_local_lan(&peer_c, false);
-        mark_peer_disconnected(sess_c.as_ref(), &peer_c, &ev_c);
-        native_log::info(
-            "connect",
-            format!("session closed {peer_c} outbound={is_outbound}"),
-        );
+        let owner = reg_c.finish_session_task(&peer_c, &abort_cleanup);
+        if owner {
+            sess_c.set_peer_on_local_lan(&peer_c, false);
+            mark_peer_disconnected(sess_c.as_ref(), &peer_c, &ev_c);
+            native_log::info(
+                "connect",
+                format!("session closed {peer_c} outbound={is_outbound}"),
+            );
+        } else {
+            native_log::debug(
+                "connect",
+                format!("stale session task exited for {peer_c} (replaced)"),
+            );
+        }
     });
 
     on_session_ready(
@@ -434,6 +574,9 @@ async fn write_noise_mux<W: AsyncWrite + Unpin>(
     channel: u32,
     payload: &[u8],
 ) -> Result<(), String> {
+    if payload.len() > super::channel_mux::MAX_MUX_PAYLOAD {
+        return Err("mux payload too large".into());
+    }
     let mut buf = BytesMut::with_capacity(MUX_HEADER_LEN + payload.len());
     buf.put_u32(channel);
     buf.put_u32(payload.len() as u32);
@@ -445,6 +588,36 @@ async fn write_noise_mux<W: AsyncWrite + Unpin>(
     super::noise_session::write_sealed_frame(write, &sealed).await
 }
 
+fn parse_noise_mux_plaintext(plaintext: &[u8]) -> Result<(u32, Vec<u8>), String> {
+    if plaintext.len() < MUX_HEADER_LEN {
+        return Err("mux frame too short".into());
+    }
+    let channel = u32::from_be_bytes(
+        plaintext[0..4]
+            .try_into()
+            .map_err(|_| "mux channel bytes")?,
+    );
+    let len = u32::from_be_bytes(
+        plaintext[4..8]
+            .try_into()
+            .map_err(|_| "mux length bytes")?,
+    ) as usize;
+    if len > super::channel_mux::MAX_MUX_PAYLOAD {
+        return Err("mux payload too large".into());
+    }
+    if plaintext.len() < MUX_HEADER_LEN + len {
+        return Err("mux frame truncated".into());
+    }
+    if plaintext.len() > MUX_HEADER_LEN + len {
+        // Reject trailing junk so a peer cannot smuggle a second header.
+        return Err("mux frame has trailing bytes".into());
+    }
+    Ok((
+        channel,
+        plaintext[MUX_HEADER_LEN..MUX_HEADER_LEN + len].to_vec(),
+    ))
+}
+
 async fn read_noise_mux<R: AsyncRead + Unpin>(
     noise: &tokio::sync::Mutex<ConnectNoiseSession>,
     read: &mut R,
@@ -454,18 +627,7 @@ async fn read_noise_mux<R: AsyncRead + Unpin>(
         let mut g = noise.lock().await;
         g.open(&wire)?
     };
-    if plaintext.len() < MUX_HEADER_LEN {
-        return Err("mux frame too short".into());
-    }
-    let channel = u32::from_be_bytes(plaintext[0..4].try_into().unwrap());
-    let len = u32::from_be_bytes(plaintext[4..8].try_into().unwrap()) as usize;
-    if plaintext.len() < MUX_HEADER_LEN + len {
-        return Err("mux frame truncated".into());
-    }
-    Ok((
-        channel,
-        plaintext[MUX_HEADER_LEN..MUX_HEADER_LEN + len].to_vec(),
-    ))
+    parse_noise_mux_plaintext(&plaintext)
 }
 
 pub(crate) fn writer_open_for_peer(writers: &SessionWriters, peer: &SessionPeer) -> bool {
@@ -485,4 +647,172 @@ pub(crate) fn prune_closed_writers(writers: &SessionWriters) {
         return;
     };
     g.retain(|_, tx| !tx.is_closed());
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn abort_all_clears_inflight_dials() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "aa".repeat(32);
+        assert!(reg.try_begin_dial(&peer));
+        reg.abort_all_sessions();
+        assert!(reg.try_begin_dial(&peer));
+    }
+
+    #[test]
+    fn abort_all_clears_session_registry() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "ff".repeat(32);
+        let abort = Arc::new(AtomicBool::new(false));
+        reg.register_session(peer.clone(), true, Arc::clone(&abort));
+        assert!(reg.has_session(&peer));
+        reg.abort_all_sessions();
+        assert!(abort.load(Ordering::SeqCst));
+        assert!(!reg.has_session(&peer));
+    }
+
+    #[test]
+    fn register_session_replace_drops_stale_writer() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "gg".repeat(32);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        reg.register_session(peer.clone(), true, Arc::new(AtomicBool::new(false)));
+        {
+            let mut w = reg.writers.write().unwrap();
+            w.insert(peer.clone(), tx);
+        }
+        assert!(reg.writer_open(&peer));
+        reg.register_session(peer.clone(), false, Arc::new(AtomicBool::new(false)));
+        assert!(!reg.writer_open(&peer));
+    }
+
+    #[test]
+    fn register_session_aborts_replaced_peer() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "bb".repeat(32);
+        let abort_old = Arc::new(AtomicBool::new(false));
+        let abort_new = Arc::new(AtomicBool::new(false));
+        reg.register_session(peer.clone(), true, Arc::clone(&abort_old));
+        reg.register_session(peer, false, Arc::clone(&abort_new));
+        assert!(abort_old.load(Ordering::SeqCst));
+        assert!(!abort_new.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn remove_session_aborts_active() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "cc".repeat(32);
+        let abort = Arc::new(AtomicBool::new(false));
+        reg.register_session(peer.clone(), true, Arc::clone(&abort));
+        reg.remove_session(&peer);
+        assert!(abort.load(Ordering::SeqCst));
+        assert!(!reg.has_session(&peer));
+    }
+
+    #[test]
+    fn finish_session_task_skips_when_peer_replaced() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "dd".repeat(32);
+        let (tx_old, _rx_old) = mpsc::unbounded_channel();
+        let (tx_new, _rx_new) = mpsc::unbounded_channel();
+        let abort_old = Arc::new(AtomicBool::new(false));
+        let abort_new = Arc::new(AtomicBool::new(false));
+        reg.register_session(peer.clone(), true, Arc::clone(&abort_old));
+        {
+            let mut w = reg.writers.write().unwrap();
+            w.insert(peer.clone(), tx_old);
+        }
+        reg.register_session(peer.clone(), false, Arc::clone(&abort_new));
+        {
+            let mut w = reg.writers.write().unwrap();
+            w.insert(peer.clone(), tx_new);
+        }
+        reg.finish_session_task(&peer, &abort_old);
+        assert!(reg.has_session(&peer));
+        assert!(reg.writer_open(&peer));
+        reg.finish_session_task(&peer, &abort_new);
+        assert!(!reg.has_session(&peer));
+        assert!(!reg.writer_open(&peer));
+    }
+
+    #[test]
+    fn dial_inflight_capped_at_max_parallel() {
+        let reg = PeerSessionRegistry::new("local".into());
+        for i in 0..MAX_DIAL_INFLIGHT {
+            let peer = format!("{:064x}", i);
+            assert!(reg.try_begin_dial(&peer), "dial {i}");
+        }
+        let extra: SessionPeer = "zz".repeat(32);
+        assert!(!reg.try_begin_dial(&extra));
+        reg.end_dial(&format!("{:064x}", 0));
+        assert!(reg.try_begin_dial(&extra));
+    }
+
+    #[test]
+    fn end_dial_clears_both_expected_and_actual_inflight_keys() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let expected: SessionPeer = "11".repeat(32);
+        let actual: SessionPeer = "22".repeat(32);
+        assert!(reg.try_begin_dial(&expected));
+        end_outbound_dial(&reg, &expected, &actual);
+        assert!(reg.try_begin_dial(&expected));
+    }
+
+    #[test]
+    fn writer_open_false_when_sender_dropped() {
+        let reg = PeerSessionRegistry::new("local".into());
+        let peer: SessionPeer = "ee".repeat(32);
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        {
+            let mut w = reg.writers.write().unwrap();
+            w.insert(peer.clone(), tx);
+        }
+        assert!(!reg.writer_open(&peer));
+    }
+}
+
+#[cfg(test)]
+mod mux_parse_tests {
+    use super::*;
+    use super::super::channel_mux::{CHANNEL_MSG, MAX_MUX_PAYLOAD, MUX_HEADER_LEN};
+
+    #[test]
+    fn parse_mux_ok_and_rejects_junk() {
+        let mut good = vec![0u8; MUX_HEADER_LEN + 3];
+        good[0..4].copy_from_slice(&CHANNEL_MSG.to_be_bytes());
+        good[4..8].copy_from_slice(&3u32.to_be_bytes());
+        good[8..].copy_from_slice(b"abc");
+        let (ch, payload) = parse_noise_mux_plaintext(&good).unwrap();
+        assert_eq!(ch, CHANNEL_MSG);
+        assert_eq!(payload, b"abc");
+
+        let mut trailing = good.clone();
+        trailing.push(0xff);
+        assert!(parse_noise_mux_plaintext(&trailing).is_err());
+
+        let mut oversize_hdr = vec![0u8; MUX_HEADER_LEN];
+        oversize_hdr[4..8].copy_from_slice(&((MAX_MUX_PAYLOAD as u32) + 1).to_be_bytes());
+        assert!(parse_noise_mux_plaintext(&oversize_hdr).is_err());
+
+        let mut truncated = vec![0u8; MUX_HEADER_LEN + 1];
+        truncated[0..4].copy_from_slice(&CHANNEL_MSG.to_be_bytes());
+        truncated[4..8].copy_from_slice(&8u32.to_be_bytes());
+        assert!(parse_noise_mux_plaintext(&truncated).is_err());
+    }
+
+    #[test]
+    fn prune_closed_writers_drops_stale_senders() {
+        let writers: SessionWriters = Arc::new(RwLock::new(HashMap::new()));
+        let peer: SessionPeer = "hh".repeat(32);
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        writers.write().unwrap().insert(peer.clone(), tx);
+        assert!(!writer_open_for_peer(&writers, &peer));
+        prune_closed_writers(&writers);
+        assert!(writers.read().unwrap().is_empty());
+    }
 }

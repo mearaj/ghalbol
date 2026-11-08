@@ -15,6 +15,17 @@ pub fn session_peer_from_identity_wire(wire: &str) -> Result<SessionPeer, String
     crate::public_key_util::normalize_contact_identity_wire(wire)
 }
 
+/// Bound UI/poll error strings (OS/TLS messages can be multi-KiB).
+pub(crate) fn truncate_event_error(err: impl Into<String>) -> String {
+    const MAX: usize = 512;
+    let s = err.into();
+    if s.chars().count() <= MAX {
+        s
+    } else {
+        s.chars().take(MAX).collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DmPeer {
     pub identity_wire: SessionPeer,
@@ -41,10 +52,19 @@ pub struct ConnectConfig {
 
 pub type GossipChatConfig = ConnectConfig;
 
+/// Gossip topic hard cap (matches invite topic ceiling).
+const MAX_CONNECT_TOPIC_CHARS: usize = 128;
+/// Bound roster size handed to a single connect worker.
+const MAX_CONNECT_DM_PEERS: usize = 4_096;
+
 impl ConnectConfig {
     pub fn new(topic: impl Into<String>) -> Self {
+        let mut topic = topic.into();
+        if topic.chars().count() > MAX_CONNECT_TOPIC_CHARS {
+            topic = topic.chars().take(MAX_CONNECT_TOPIC_CHARS).collect();
+        }
         Self {
-            topic: topic.into(),
+            topic,
             dm_peers: Vec::new(),
             app_namespace: None,
         }
@@ -55,6 +75,13 @@ impl ConnectConfig {
         _id: &crate::DecryptedIdentity,
     ) -> Result<Self, String> {
         Ok(Self::new(topic))
+    }
+
+    /// Truncate an oversized contact list before the worker starts (DoS / memory).
+    pub fn cap_dm_peers(&mut self) {
+        if self.dm_peers.len() > MAX_CONNECT_DM_PEERS {
+            self.dm_peers.truncate(MAX_CONNECT_DM_PEERS);
+        }
     }
 }
 
@@ -300,4 +327,38 @@ pub fn identity_wire_for_session_peer(peer: &SessionPeer) -> Option<String> {
 #[derive(Clone, Debug)]
 pub enum ConnectOutboundCmd {
     Stop,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_config_truncates_topic_and_caps_peers() {
+        let long = "t".repeat(MAX_CONNECT_TOPIC_CHARS + 40);
+        let mut cfg = ConnectConfig::new(long);
+        assert!(cfg.topic.chars().count() <= MAX_CONNECT_TOPIC_CHARS);
+        cfg.dm_peers = (0..(MAX_CONNECT_DM_PEERS + 10))
+            .map(|i| DmPeer {
+                identity_wire: format!("{i:066x}"),
+            })
+            .collect();
+        cfg.cap_dm_peers();
+        assert_eq!(cfg.dm_peers.len(), MAX_CONNECT_DM_PEERS);
+    }
+
+    #[test]
+    fn truncate_event_error_caps_pathological_os_messages() {
+        let huge = "e".repeat(2_000);
+        assert_eq!(truncate_event_error(huge).chars().count(), 512);
+        assert_eq!(truncate_event_error("ok"), "ok");
+    }
+
+    #[test]
+    fn truncate_event_error_respects_char_boundary() {
+        let s = "é".repeat(520);
+        let out = truncate_event_error(s);
+        assert!(out.chars().count() <= 512);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
 }

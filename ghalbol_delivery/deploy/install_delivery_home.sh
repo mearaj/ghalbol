@@ -31,6 +31,7 @@ render_unit() {
 cd "${WORKSPACE_ROOT}"
 
 echo "== build ghalbol_delivery (release) =="
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 cargo build --release -p ghalbol_delivery --bin ghalbol_delivery
 
 if [[ ! -x "${BIN}" ]]; then

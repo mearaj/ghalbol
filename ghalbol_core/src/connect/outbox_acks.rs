@@ -256,9 +256,14 @@ async fn run_ack_upkeep_limited(
     include_read: bool,
 ) -> usize {
     let connected: HashSet<SessionPeer> = connected_peers.iter().cloned().collect();
+    let now_ms = chrono_now_ms();
     let mut done = 0usize;
-    for item in session.delivery_acks_due_for_upkeep(limit) {
+    for item in session.delivery_acks_due_for_upkeep(now_ms, limit) {
         if !connected.contains(&item.peer) {
+            continue;
+        }
+        if session.is_delivery_ack_sent(&item.inbound_id) {
+            session.dequeue_delivery_ack(&item.inbound_id);
             continue;
         }
         if send_ack_frame(
@@ -275,10 +280,12 @@ async fn run_ack_upkeep_limited(
             session.mark_delivery_ack_sent(&item.inbound_id);
             session.dequeue_delivery_ack(&item.inbound_id);
             done += 1;
+        } else {
+            session.note_delivery_ack_upkeep_attempt(&item.inbound_id, now_ms);
         }
     }
     if include_read {
-        for item in session.read_acks_due_for_upkeep(limit) {
+        for item in session.read_acks_due_for_upkeep(now_ms, limit) {
             if !connected.contains(&item.peer) {
                 continue;
             }
@@ -288,6 +295,9 @@ async fn run_ack_upkeep_limited(
                 continue;
             }
             if session.is_read_ack_confirmed(&item.inbound_id) {
+                continue;
+            }
+            if !session.try_claim_read_ack_wire_send(&item.peer, &item.inbound_id) {
                 continue;
             }
             if send_ack_frame(
@@ -303,6 +313,8 @@ async fn run_ack_upkeep_limited(
             {
                 session.mark_read_ack_wire_sent(&item.inbound_id);
                 done += 1;
+            } else {
+                session.release_read_ack_wire_claim(&item.inbound_id);
             }
         }
     }
@@ -412,6 +424,8 @@ pub(crate) async fn resync_outbox_burst_for_peer(
                     });
                 }
             }
+        } else {
+            session.mark_outbox_send_failed(&p.message_id, now);
         }
     }
 }
@@ -474,21 +488,6 @@ pub(crate) async fn handle_run_read_ack_catchup(
     dispatch_read_ack_pass(Arc::clone(&session), writers, peer, cutoff);
 }
 
-pub(crate) async fn run_ack_upkeep_limited_delivery(
-    session: Arc<SessionState>,
-    writers: SessionWriters,
-    connected_peers: &[SessionPeer],
-) {
-    run_ack_upkeep_limited(
-        session,
-        writers,
-        connected_peers,
-        READ_ACK_UPKEEP_MAX_OPS,
-        false,
-    )
-    .await;
-}
-
 pub(crate) async fn handle_send_ack_cmd(
     session: Arc<SessionState>,
     writers: SessionWriters,
@@ -499,14 +498,184 @@ pub(crate) async fn handle_send_ack_cmd(
     let Ok(peer) = super::types::session_peer_from_identity_wire(&recipient_public_key_hex) else {
         return;
     };
-    let _ = send_ack_frame(
-        &peer,
-        &recipient_public_key_hex,
-        &ref_id,
-        ack_kind,
-        session.as_ref(),
-        &writers,
-        None,
-    )
-    .await;
+    match ack_kind {
+        MsgKind::AckReceived => {
+            if session.is_delivery_ack_sent(&ref_id) {
+                return;
+            }
+            if send_ack_frame(
+                &peer,
+                &recipient_public_key_hex,
+                &ref_id,
+                ack_kind,
+                session.as_ref(),
+                &writers,
+                None,
+            )
+            .await
+            {
+                session.mark_delivery_ack_sent(&ref_id);
+                session.dequeue_delivery_ack(&ref_id);
+            }
+        }
+        MsgKind::AckRead => {
+            if session.is_read_ack_confirmed(&ref_id) {
+                return;
+            }
+            if !session.try_claim_read_ack_wire_send(&peer, &ref_id) {
+                return;
+            }
+            if send_ack_frame(
+                &peer,
+                &recipient_public_key_hex,
+                &ref_id,
+                ack_kind,
+                session.as_ref(),
+                &writers,
+                None,
+            )
+            .await
+            {
+                session.mark_read_ack_wire_sent(&ref_id);
+            } else {
+                session.release_read_ack_wire_claim(&ref_id);
+            }
+        }
+        _ => {
+            let _ = send_ack_frame(
+                &peer,
+                &recipient_public_key_hex,
+                &ref_id,
+                ack_kind,
+                session.as_ref(),
+                &writers,
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn row(on_wire: bool, last_send_ms: i64) -> PendingOutbound {
+        PendingOutbound {
+            message_id: "m1".into(),
+            peer: "aa".repeat(32),
+            recipient_public_key_hex: "aa".repeat(32),
+            text: "x".into(),
+            msg_kind: "text".into(),
+            attachment_offer: None,
+            voice_opus: None,
+            duration_ms: None,
+            created_at_ms: 0,
+            last_send_ms,
+            first_on_wire_ms: 0,
+            on_wire,
+        }
+    }
+
+    fn eligible(p: &PendingOutbound, now: i64) -> bool {
+        !p.on_wire || now.saturating_sub(p.last_send_ms) >= OUTBOX_RESEND_INTERVAL_MS
+    }
+
+    #[test]
+    fn delivery_upkeep_queue_entry_removed_when_already_sent() {
+        let id = crate::create_keystore_v1("ack-dedupe", None)
+            .expect("keystore")
+            .1;
+        let session = SessionState::new(id, &[], None).expect("session");
+        let peer = "ff".repeat(32);
+        session.enqueue_delivery_ack(&peer, "in-dup", &peer, 1);
+        session.mark_delivery_ack_sent("in-dup");
+        assert!(session.is_delivery_ack_sent("in-dup"));
+        let due = session.delivery_acks_due_for_upkeep(9_000, 8);
+        assert_eq!(due.len(), 1);
+        assert!(session.is_delivery_ack_sent(&due[0].inbound_id));
+    }
+
+    #[test]
+    fn outbox_resend_throttle_skips_fresh_on_wire_rows() {
+        let now = 10_000;
+        assert!(eligible(&row(false, now), now));
+        assert!(!eligible(&row(true, now), now));
+        assert!(!eligible(
+            &row(true, now - OUTBOX_RESEND_INTERVAL_MS + 1),
+            now
+        ));
+        assert!(eligible(
+            &row(true, now - OUTBOX_RESEND_INTERVAL_MS),
+            now
+        ));
+    }
+
+    #[test]
+    fn read_ack_confirm_arriving_while_in_flight_blocks_resend() {
+        let id = crate::create_keystore_v1("ack-confirm-race", None)
+            .expect("keystore")
+            .1;
+        let session = SessionState::new(id, &[], None).expect("session");
+        let peer = "ab".repeat(32);
+        let ref_id = "in-read-confirm-race";
+        assert!(session.try_claim_read_ack_wire_send(&peer, ref_id));
+        session.mark_read_ack_confirmed(ref_id);
+        assert!(session.is_read_ack_confirmed(ref_id));
+        assert!(!session.try_claim_read_ack_wire_send(&peer, ref_id));
+        assert!(
+            session.read_acks_due_for_upkeep(9_999_999, 32).is_empty(),
+            "confirmed ack must not appear in upkeep drain"
+        );
+    }
+
+    #[test]
+    fn concurrent_mark_outbox_sent_at_same_ms_throttles_one_burst_eligible() {
+        let id = crate::create_keystore_v1("outbox-concurrent", None)
+            .expect("keystore")
+            .1;
+        let session = Arc::new(SessionState::new(id, &[], None).expect("session"));
+        let peer = "ac".repeat(32);
+        let msg_id = "outbox-concurrent-m1";
+        session.track_outbound(PendingOutbound {
+            message_id: msg_id.into(),
+            peer: peer.clone(),
+            recipient_public_key_hex: peer.clone(),
+            text: "race".into(),
+            msg_kind: "text".into(),
+            attachment_offer: None,
+            voice_opus: None,
+            duration_ms: None,
+            created_at_ms: 0,
+            last_send_ms: 0,
+            first_on_wire_ms: 0,
+            on_wire: false,
+        });
+        let now = 88_000i64;
+        let first_hits: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..12 {
+                let sess = Arc::clone(&session);
+                let hits = &first_hits;
+                s.spawn(move || {
+                    if sess.mark_outbox_sent(msg_id, now) {
+                        *hits.lock().unwrap() += 1;
+                    }
+                });
+            }
+        });
+        assert_eq!(*first_hits.lock().unwrap(), 1);
+        assert!(session.outbox_due_for_resend(now).is_empty());
+        assert_eq!(session.outbox_due_for_resend(now + OUTBOX_RESEND_INTERVAL_MS).len(), 1);
+        let row = session
+            .pending_outbox_for_peer(&peer)
+            .into_iter()
+            .find(|r| r.message_id == msg_id)
+            .expect("row");
+        assert!(row.on_wire);
+        assert_eq!(row.last_send_ms, now);
+        assert_eq!(row.first_on_wire_ms, now);
+    }
 }

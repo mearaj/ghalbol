@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # Shared desktop install / data path helpers for GhalBol apps.
 # Requires GHALBOL_APP_ID and GHALBOL_APP_LABEL (from the app's env/*.env).
 # Per-app identity overrides: GHALBOL_INSTALL_SLUG, GHALBOL_BIN_NAME, GHALBOL_PROGRAMS_NAME.
@@ -64,12 +65,62 @@ desktop_install_dir_linux() {
   echo "$HOME/.local/lib/$(desktop_install_slug)"
 }
 
+# Refuse paths outside ~/.local/lib (or an explicit DESKTOP_INSTALL_DIR_LINUX under $HOME).
+desktop_assert_linux_install_dest() {
+  local dest="${1:?}"
+  if [[ -z "$dest" || "$dest" == "/" || "$dest" == "$HOME" ]]; then
+    echo "Refusing: unsafe install DEST='$dest'" >&2
+    return 1
+  fi
+  case "$dest" in
+    "$HOME"/*) ;;
+    *)
+      echo "Refusing: DEST must be under \$HOME (got '$dest')" >&2
+      return 1
+      ;;
+  esac
+  local lib_root="$HOME/.local/lib"
+  case "$dest" in
+    "$lib_root" | "$lib_root"/*) return 0 ;;
+  esac
+  if [[ -n "${DESKTOP_INSTALL_DIR_LINUX:-}" && "$dest" == "$DESKTOP_INSTALL_DIR_LINUX" ]]; then
+    return 0
+  fi
+  echo "Refusing: DEST must be under $lib_root (got '$dest')" >&2
+  return 1
+}
+
+desktop_assert_linux_data_dir() {
+  local data_dir="${1:?}"
+  local share_root="${XDG_DATA_HOME:-$HOME/.local/share}"
+  case "$data_dir" in
+    "$share_root" | "$share_root"/*) return 0 ;;
+  esac
+  echo "Refusing: data dir must be under $share_root (got '$data_dir')" >&2
+  return 1
+}
+
 desktop_bin_dir_linux() {
   echo "${XDG_BIN_HOME:-$HOME/.local/bin}"
 }
 
 desktop_applications_dir_linux() {
   echo "${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+}
+
+# Freedesktop Exec= quoting (must match ghalbol_core::linux_desktop_launch).
+desktop_exec_quoted() {
+  local s="${1:?}"
+  case "$s" in
+    *' '*|*$'\t'*|*'"'*|*'\'*|*'$'*|*'`'*)
+      s="${s//\\/\\\\}"
+      s="${s//\"/\\\"}"
+      printf '"%s"' "$s"
+      ;;
+    *)
+      printf '%s' "$s"
+      ;;
+  esac
 }
 
 # Write install manifest (re-runnable after partial delete).
@@ -91,14 +142,58 @@ EOF
 desktop_load_manifest() {
   local file="${1:?}"
   [[ -f "$file" ]] || return 1
+  unset GHALBOL_APP_ID GHALBOL_APP_LABEL GHALBOL_ENV INSTALL_SLUG BIN_NAME ENTRY_ID
+  local -A _ghalbol_manifest_from_file=()
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line#"${line%%[![:space:]]*}"}"
     [[ -z "$line" || "$line" == \#* ]] && continue
     [[ "$line" != *=* ]] && continue
     local key="${line%%=*}"
     local value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value#\"}"
+    value="${value%\"}"
+    value="${value#\'}"
+    value="${value%\'}"
     export "$key=$value"
+    _ghalbol_manifest_from_file["$key"]=1
   done <"$file"
+  for req in GHALBOL_APP_ID GHALBOL_APP_LABEL BIN_NAME ENTRY_ID; do
+    if [[ -z "${_ghalbol_manifest_from_file[$req]:-}" ]]; then
+      echo "Missing ${req} in $file" >&2
+      return 1
+    fi
+  done
+  # Manifest fields become paths, .desktop basenames, and registry keys.
+  desktop_assert_safe_id "GHALBOL_APP_ID" "${GHALBOL_APP_ID}" || return 1
+  desktop_assert_safe_id "ENTRY_ID" "${ENTRY_ID}" || return 1
+  desktop_assert_safe_id "BIN_NAME" "${BIN_NAME}" || return 1
+  if [[ -z "${GHALBOL_APP_LABEL}" || "${#GHALBOL_APP_LABEL}" -gt 200 ]]; then
+    echo "Unsafe GHALBOL_APP_LABEL in $file" >&2
+    return 1
+  fi
+  if [[ "${GHALBOL_APP_LABEL}" == *[\\/:\*\?\"\<\>\|]* ]]; then
+    echo "Unsafe GHALBOL_APP_LABEL in $file" >&2
+    return 1
+  fi
+}
+
+# Reverse-DNS / binary token — matches ghalbol_core::linux_desktop_launch::app_id_is_safe.
+desktop_assert_safe_id() {
+  local name="${1:?}"
+  local value="${2:?}"
+  if [[ -z "$value" || "${#value}" -gt 128 ]]; then
+    echo "Unsafe ${name} (empty or too long)" >&2
+    return 1
+  fi
+  if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Unsafe ${name}='${value}'" >&2
+    return 1
+  fi
+  return 0
 }
 
 desktop_prompt_remove_data() {

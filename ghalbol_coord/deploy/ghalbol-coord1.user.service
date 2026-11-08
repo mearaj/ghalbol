@@ -7,6 +7,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/home/REPLACE_COORD1_USER
 ExecStart=REPLACE_COORD1_BIN
 Environment=GHALBOL_COORD_LISTEN=REPLACE_GHALBOL_COORD_LISTEN
 Environment=GHALBOL_COORD_PUBLIC_URL=REPLACE_GHALBOL_COORD_PUBLIC_URL
@@ -15,6 +16,8 @@ Environment=RUST_LOG=info
 Environment=GHALBOL_DDNS_CREDENTIALS=REPLACE_GHALBOL_DDNS_CREDENTIALS
 Restart=on-failure
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
 
 [Install]
 WantedBy=default.target

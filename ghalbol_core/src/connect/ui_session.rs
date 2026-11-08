@@ -49,9 +49,33 @@ pub fn last_room_peer() -> Option<ContactPk> {
 }
 
 static FOREGROUND_PEER_CMD_GEN: AtomicU64 = AtomicU64::new(0);
+static FOREGROUND_PEER_APPLIED_GEN: AtomicU64 = AtomicU64::new(0);
 
 pub fn bump_foreground_peer_cmd_gen() -> u64 {
     FOREGROUND_PEER_CMD_GEN.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Drop stale in-flight `SetForegroundPeer` after the UI switched rooms.
+pub(crate) fn foreground_peer_cmd_apply(generation: u64) -> bool {
+    let applied = FOREGROUND_PEER_APPLIED_GEN.load(Ordering::SeqCst);
+    if generation <= applied {
+        return false;
+    }
+    FOREGROUND_PEER_APPLIED_GEN.store(generation, Ordering::SeqCst);
+    true
+}
+
+/// Clear read-gate + foreground snapshot after lock / node stop.
+pub fn reset_live_session_ui_after_stop() {
+    if let Ok(mut g) = live_foreground_peer_mx().write() {
+        *g = None;
+    }
+    app_ack_read_enabled_mx().store(false, Ordering::SeqCst);
+    app_ui_visible_mx().store(false, Ordering::SeqCst);
+    FOREGROUND_PEER_APPLIED_GEN.store(0, Ordering::SeqCst);
+    if let Ok(mut m) = read_catchup_throttle_mx().write() {
+        m.clear();
+    }
 }
 
 pub fn sync_foreground_peer_now(peer: Option<ContactPk>) {
@@ -180,6 +204,8 @@ fn read_catchup_throttle_mx() -> &'static RwLock<HashMap<String, i64>> {
     M.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+const MAX_READ_CATCHUP_THROTTLE_ENTRIES: usize = 4_096;
+
 pub(crate) fn read_ack_catchup_throttled(peer: &SessionPeer, now_ms: i64) -> bool {
     let Ok(mut m) = read_catchup_throttle_mx().write() else {
         return false;
@@ -189,9 +215,59 @@ pub(crate) fn read_ack_catchup_throttled(peer: &SessionPeer, now_ms: i64) -> boo
         return true;
     }
     m.insert(peer.clone(), now_ms);
+    if m.len() > MAX_READ_CATCHUP_THROTTLE_ENTRIES {
+        m.retain(|_, ts| now_ms.saturating_sub(*ts) < READ_ACK_CATCHUP_THROTTLE_MS * 8);
+    }
+    while m.len() > MAX_READ_CATCHUP_THROTTLE_ENTRIES {
+        let Some(oldest) = m.keys().next().cloned() else {
+            break;
+        };
+        m.remove(&oldest);
+    }
     false
 }
 
 pub(crate) fn app_ack_read_enabled() -> bool {
     app_ack_read_enabled_mx().load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod read_catchup_throttle_tests {
+    use super::*;
+    use crate::connect::session::chrono_now_ms;
+
+    #[test]
+    fn read_ack_catchup_throttle_map_stays_capped() {
+        let now = chrono_now_ms();
+        for i in 0..MAX_READ_CATCHUP_THROTTLE_ENTRIES + 64 {
+            let peer = format!("{:064x}", i);
+            let _ = read_ack_catchup_throttled(&peer, now + i as i64);
+        }
+        let guard = read_catchup_throttle_mx().read().unwrap();
+        assert!(guard.len() <= MAX_READ_CATCHUP_THROTTLE_ENTRIES);
+    }
+}
+
+#[cfg(test)]
+mod foreground_gen_tests {
+    use super::*;
+
+    const PEER_A: &str = "0305b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+    const PEER_B: &str = "0205b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21785";
+
+    #[test]
+    fn stale_foreground_peer_cmd_is_ignored() {
+        reset_live_session_ui_after_stop();
+        assert!(foreground_peer_cmd_apply(1));
+        sync_foreground_peer_now(Some(PEER_A.into()));
+        assert!(!foreground_peer_cmd_apply(1));
+        assert!(foreground_peer_cmd_apply(2));
+        sync_foreground_peer_now(Some(PEER_B.into()));
+        assert!(!foreground_peer_cmd_apply(1));
+        assert!(foreground_peer_cmd_apply(3));
+        reset_live_session_ui_after_stop();
+        assert!(live_foreground_peer().is_none());
+        assert!(!app_ack_read_enabled());
+        assert!(foreground_peer_cmd_apply(1));
+    }
 }

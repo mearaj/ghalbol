@@ -20,3 +20,22 @@ static LOCAL_RELAY_LISTENING: AtomicBool = AtomicBool::new(false);
 pub fn local_relay_circuit_listening() -> bool {
     LOCAL_RELAY_LISTENING.load(Ordering::Relaxed)
 }
+
+/// Swarm / relay worker sets this when `/p2p-circuit` listen is active (CGNAT WAN path).
+pub fn set_local_relay_circuit_listening(listening: bool) {
+    LOCAL_RELAY_LISTENING.store(listening, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_circuit_listening_flag_round_trips() {
+        set_local_relay_circuit_listening(false);
+        assert!(!local_relay_circuit_listening());
+        set_local_relay_circuit_listening(true);
+        assert!(local_relay_circuit_listening());
+        set_local_relay_circuit_listening(false);
+    }
+}

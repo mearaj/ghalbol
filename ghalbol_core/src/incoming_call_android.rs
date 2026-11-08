@@ -1,6 +1,27 @@
 //! Android notifications posted from this process. No extra Java class.
 
 #[cfg(target_os = "android")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Provider-reported `OpenableColumns.SIZE` larger than the picker limit.
+#[cfg(any(test, target_os = "android"))]
+fn content_uri_reported_size_too_big(reported_size: i64, max_bytes: usize) -> bool {
+    if reported_size < 0 {
+        return false;
+    }
+    reported_size as usize > max_bytes
+}
+
+/// SAF display names must survive `Path::push` under app staging.
+#[cfg(any(test, target_os = "android"))]
+fn finalize_content_pick_name(raw: &str) -> String {
+    crate::attach_v1::sanitize_file_name(raw)
+}
+
+#[cfg(target_os = "android")]
+static UNLOCK_PROMPT_POSTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "android")]
 mod imp {
     use jni::objects::{JObject, JValue};
     use jni::{JavaVM, jni_sig, jni_str};
@@ -328,6 +349,8 @@ mod imp {
                 max_bytes / (1024 * 1024)
             ));
         }
+        let name =
+            super::finalize_content_pick_name(if name.is_empty() { "file" } else { &name });
         Ok((name, data))
     }
 
@@ -402,8 +425,33 @@ mod imp {
                         std::mem::forget(value);
                     }
                 }
+                let size_col = env.new_string("_size")?;
+                let size_idx = env
+                    .call_method(
+                        &cursor,
+                        jni_str!("getColumnIndex"),
+                        jni_sig!("(Ljava/lang/String;)I"),
+                        &[JValue::Object(&size_col)],
+                    )?
+                    .i()?;
+                if size_idx >= 0 {
+                    let reported = env
+                        .call_method(
+                            &cursor,
+                            jni_str!("getLong"),
+                            jni_sig!("(I)J"),
+                            &[JValue::Int(size_idx)],
+                        )?
+                        .j()?;
+                    if super::content_uri_reported_size_too_big(reported, max_bytes) {
+                        *too_big = true;
+                    }
+                }
             }
             env.call_method(&cursor, jni_str!("close"), jni_sig!("()V"), &[])?;
+        }
+        if *too_big {
+            return Ok(());
         }
         let stream = env
             .call_method(
@@ -575,7 +623,7 @@ mod imp {
         display_name: &str,
         mime: &str,
     ) -> Result<String, String> {
-        let display_name = display_name.trim();
+        let display_name = crate::attach_v1::sanitize_file_name(display_name);
         if display_name.is_empty() {
             return Err("missing file name".into());
         }
@@ -624,7 +672,7 @@ mod imp {
                 )?;
                 Ok::<(), jni::errors::Error>(())
             };
-            put_str(env, &values, "_display_name", display_name)?;
+            put_str(env, &values, "_display_name", &display_name)?;
             put_str(env, &values, "mime_type", mime)?;
             put_str(env, &values, "relative_path", "Download/")?;
             put_int(env, &values, "is_pending", 1)?;
@@ -710,35 +758,89 @@ pub fn dismiss() {
     let _ = imp::cancel(imp::INCOMING_ID);
 }
 
-/// Notification id for one chat's message banner, clear of the call / unlock ids.
-#[cfg(target_os = "android")]
-fn message_notification_id(pk: &str) -> i32 {
-    // FNV-1a: stable across runs, so a newer message replaces the same banner.
-    let mut h: u32 = 0x811c_9dc5;
-    for b in pk.trim().to_ascii_lowercase().bytes() {
-        h ^= u32::from(b);
-        h = h.wrapping_mul(0x0100_0193);
+#[cfg(test)]
+mod notify_id_tests {
+    use crate::message_notify::android_message_notification_id;
+
+    #[test]
+    fn message_notification_ids_stay_out_of_call_unlock_slots() {
+        const INCOMING_ID: i32 = 71_001;
+        const UNLOCK_ID: i32 = 71_002;
+        assert!(
+            (72_000..82_000).contains(&android_message_notification_id(
+                "0305b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784"
+            ))
+        );
+        for h in 0..10_000 {
+            let id = 72_000 + h;
+            assert_ne!(id, INCOMING_ID);
+            assert_ne!(id, UNLOCK_ID);
+        }
     }
-    72_000 + (h % 10_000) as i32
+}
+
+#[cfg(test)]
+mod content_pick_tests {
+    use super::{content_uri_reported_size_too_big, finalize_content_pick_name};
+
+    #[test]
+    fn content_uri_size_unknown_is_not_too_big() {
+        assert!(!content_uri_reported_size_too_big(-1, 1024));
+    }
+
+    #[test]
+    fn content_uri_size_over_limit() {
+        assert!(content_uri_reported_size_too_big(1025, 1024));
+        assert!(!content_uri_reported_size_too_big(1024, 1024));
+    }
+
+    #[test]
+    fn content_pick_name_sanitized_for_staging() {
+        assert_eq!(finalize_content_pick_name("../evil"), ".._evil");
+        assert_eq!(finalize_content_pick_name("."), "file");
+    }
 }
 
 #[cfg(target_os = "android")]
 pub fn post_message(peer_public_key_hex: &str, title: &str, body: &str) -> Result<(), String> {
-    imp::post(message_notification_id(peer_public_key_hex), title, body)
+    let id = crate::message_notify::android_message_notification_id(peer_public_key_hex);
+    imp::post(id, title, body)
 }
 
 #[cfg(target_os = "android")]
 pub fn cancel_message(peer_public_key_hex: &str) {
-    let _ = imp::cancel(message_notification_id(peer_public_key_hex));
+    let id = crate::message_notify::android_message_notification_id(peer_public_key_hex);
+    let _ = imp::cancel(id);
 }
 
 #[cfg(target_os = "android")]
 pub fn notify_unlock_needed() {
-    let _ = imp::post(
+    if crate::session_runtime::session_unlocked() {
+        UNLOCK_PROMPT_POSTED.store(false, Ordering::Release);
+        return;
+    }
+    if UNLOCK_PROMPT_POSTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if crate::session_runtime::session_unlocked() {
+        UNLOCK_PROMPT_POSTED.store(false, Ordering::Release);
+        return;
+    }
+    if imp::post(
         imp::UNLOCK_ID,
         "Ghal Bol",
         "Enter your password to receive messages",
-    );
+    )
+    .is_err()
+    {
+        UNLOCK_PROMPT_POSTED.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn dismiss_unlock_prompt() {
+    UNLOCK_PROMPT_POSTED.store(false, Ordering::Release);
+    let _ = imp::cancel(imp::UNLOCK_ID);
 }
 
 #[cfg(target_os = "android")]
@@ -803,11 +905,12 @@ pub fn save_file_to_downloads(path: &str, display_name: &str) -> Result<String, 
 #[cfg(target_os = "android")]
 fn short_display_name(pk: &str) -> String {
     let p = pk.trim();
-    if p.len() >= 16 {
+    if p.is_empty() {
+        return "Contact".into();
+    }
+    if p.len() >= 16 && p.is_ascii() {
         format!("{}…", &p[..8])
-    } else if p.is_empty() {
-        "Contact".into()
     } else {
-        p.to_string()
+        p.chars().take(16).collect()
     }
 }

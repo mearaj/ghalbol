@@ -34,10 +34,60 @@ pub(crate) fn take_connect_upkeep_notify() -> bool {
 
 pub fn notify_dm_presence_wake() {
     let now = chrono_now_ms();
-    let last = LAST_PRESENCE_WAKE_NOTIFY_MS.load(Ordering::Relaxed);
-    if last > 0 && now.saturating_sub(last) < 5_000 {
-        return;
+    loop {
+        let last = LAST_PRESENCE_WAKE_NOTIFY_MS.load(Ordering::Relaxed);
+        if last > 0 && now.saturating_sub(last) < 5_000 {
+            return;
+        }
+        if LAST_PRESENCE_WAKE_NOTIFY_MS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            DM_PRESENCE_WAKE_NOTIFY.store(true, Ordering::SeqCst);
+            return;
+        }
     }
-    LAST_PRESENCE_WAKE_NOTIFY_MS.store(now, Ordering::Relaxed);
-    DM_PRESENCE_WAKE_NOTIFY.store(true, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    static DROP_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[test]
+    fn presence_wake_throttle_coalesces_burst() {
+        DM_PRESENCE_WAKE_NOTIFY.store(false, Ordering::SeqCst);
+        LAST_PRESENCE_WAKE_NOTIFY_MS.store(0, Ordering::Relaxed);
+        notify_dm_presence_wake();
+        assert!(DM_PRESENCE_WAKE_NOTIFY.load(Ordering::SeqCst));
+        DM_PRESENCE_WAKE_NOTIFY.store(false, Ordering::SeqCst);
+        notify_dm_presence_wake();
+        assert!(!DM_PRESENCE_WAKE_NOTIFY.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn take_connect_upkeep_merges_notify_flags() {
+        NETWORK_CHANGE_NOTIFY.store(true, Ordering::SeqCst);
+        RELAY_REFRESH_NOTIFY.store(false, Ordering::SeqCst);
+        DM_PRESENCE_WAKE_NOTIFY.store(true, Ordering::SeqCst);
+        assert!(take_connect_upkeep_notify());
+        assert!(!NETWORK_CHANGE_NOTIFY.load(Ordering::SeqCst));
+        assert!(!DM_PRESENCE_WAKE_NOTIFY.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn drop_pending_call_invite_invokes_hook() {
+        DROP_SEEN.store(0, Ordering::Relaxed);
+        if DROP_PENDING_CALL_INVITE.get().is_none() {
+            set_drop_pending_call_invite_hook(|_| {
+                DROP_SEEN.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let before = DROP_SEEN.load(Ordering::Relaxed);
+        drop_pending_call_invite("call-1");
+        drop_pending_call_invite("call-2");
+        assert_eq!(DROP_SEEN.load(Ordering::Relaxed), before + 2);
+    }
 }

@@ -17,6 +17,15 @@ pub const VOICE_MAX_DURATION_MS: u32 = 120_000;
 /// Hard stop before seal — leave headroom under DM 4 MB frame limit.
 pub const VOICE_MAX_SEALED_INNER_BYTES: usize = 3 * 1024 * 1024;
 
+/// Max decoded Opus payload bytes (`audio_b64` budget inside sealed inner JSON).
+const VOICE_MAX_OPUS_BLOB_BYTES: usize = VOICE_MAX_SEALED_INNER_BYTES * 3 / 4;
+
+/// Opus length-prefixed packets per voice note (reassembly / decode DoS).
+const VOICE_MAX_OPUS_PACKETS: usize = 6_000;
+
+/// 20 ms frame at 48 kHz (matches native Opus engine).
+const OPUS_FRAME_SAMPLES: usize = 960;
+
 pub const VOICE_MSG_VERSION: u32 = 1;
 pub const VOICE_CODEC: &str = "opus";
 pub const VOICE_CHANNELS: u8 = 1;
@@ -64,12 +73,22 @@ impl VoiceInner {
         if self.audio_b64.trim().is_empty() {
             return Err("voice audio_b64 empty".to_string());
         }
+        if self.audio_b64.trim().len() > VOICE_MAX_OPUS_BLOB_BYTES * 2 {
+            return Err("voice audio_b64 too large".to_string());
+        }
         Ok(())
     }
 
     pub fn opus_bytes(&self) -> Result<Vec<u8>, String> {
-        B64.decode(self.audio_b64.trim())
-            .map_err(|e| format!("audio_b64: {e}"))
+        let b64 = self.audio_b64.trim();
+        if b64.len() > VOICE_MAX_OPUS_BLOB_BYTES * 2 {
+            return Err("voice audio_b64 too large".to_string());
+        }
+        let decoded = B64.decode(b64).map_err(|e| format!("audio_b64: {e}"))?;
+        if decoded.len() > VOICE_MAX_OPUS_BLOB_BYTES {
+            return Err("voice audio payload too large".to_string());
+        }
+        Ok(decoded)
     }
 
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, String> {
@@ -90,6 +109,13 @@ impl VoiceInner {
         let inner: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("voice inner json: {e}"))?;
         inner.validate()?;
+        let opus_len = inner.opus_bytes().map_err(|_| "voice audio payload too large")?.len();
+        let max_samples =
+            (VOICE_MAX_DURATION_MS as usize / 1000) * SAMPLE_RATE_HZ as usize + OPUS_FRAME_SAMPLES;
+        let max_opus = max_samples * 4;
+        if opus_len > max_opus.min(VOICE_MAX_OPUS_BLOB_BYTES) {
+            return Err("voice audio payload too large".to_string());
+        }
         Ok(inner)
     }
 }
@@ -127,19 +153,35 @@ pub fn encode_pcm_to_opus_blob(pcm: &[i16]) -> Result<Vec<u8>, String> {
 /// Decode length-prefixed Opus blob back to PCM i16 mono 48 kHz.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn decode_opus_blob_to_pcm(blob: &[u8]) -> Result<Vec<i16>, String> {
+    if blob.len() > VOICE_MAX_OPUS_BLOB_BYTES {
+        return Err("opus blob too large".to_string());
+    }
+    let max_pcm =
+        (VOICE_MAX_DURATION_MS as usize / 1000) * SAMPLE_RATE_HZ as usize + FRAME_SAMPLES;
     let mut dec = OpusDecoderCodec::new()?;
     let mut out = Vec::new();
     let mut frame = Vec::new();
     let mut i = 0usize;
+    let mut packets = 0usize;
     while i + 2 <= blob.len() {
         let len = u16::from_le_bytes([blob[i], blob[i + 1]]) as usize;
         i += 2;
+        if len == 0 {
+            return Err("empty opus packet".to_string());
+        }
         if i + len > blob.len() {
             return Err("truncated opus blob".to_string());
+        }
+        packets += 1;
+        if packets > VOICE_MAX_OPUS_PACKETS {
+            return Err("opus blob too many packets".to_string());
         }
         let pkt = &blob[i..i + len];
         i += len;
         dec.decode(Some(pkt), &mut frame)?;
+        if out.len().saturating_add(frame.len()) > max_pcm {
+            return Err("opus decode exceeds max duration".to_string());
+        }
         out.extend_from_slice(&frame);
     }
     if out.is_empty() {
@@ -159,6 +201,9 @@ pub fn build_voice_inner(duration_ms: u32, opus_blob: &[u8]) -> Result<VoiceInne
     }
     if opus_blob.is_empty() {
         return Err("opus blob empty".to_string());
+    }
+    if opus_blob.len() > VOICE_MAX_OPUS_BLOB_BYTES {
+        return Err("opus blob too large".to_string());
     }
     let inner = VoiceInner {
         voice_msg_version: VOICE_MSG_VERSION,
@@ -267,5 +312,37 @@ mod tests {
         let parsed = VoiceInner::from_json_bytes(&bytes).unwrap();
         assert_eq!(parsed.duration_ms, 20);
         assert_eq!(parsed.opus_bytes().unwrap(), blob);
+    }
+
+    #[test]
+    fn from_json_rejects_oversized_audio_b64() {
+        let inner = VoiceInner {
+            voice_msg_version: VOICE_MSG_VERSION,
+            codec: VOICE_CODEC.to_string(),
+            duration_ms: 1000,
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            channels: VOICE_CHANNELS,
+            audio_b64: "A".repeat(VOICE_MAX_OPUS_BLOB_BYTES * 2 + 1),
+        };
+        let bytes = serde_json::to_vec(&inner).unwrap();
+        assert!(VoiceInner::from_json_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_huge_fake_opus_blob() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&30000u16.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 30000]);
+        assert!(decode_opus_blob_to_pcm(&blob).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_too_many_packets() {
+        let mut blob = Vec::new();
+        for _ in 0..=VOICE_MAX_OPUS_PACKETS {
+            blob.extend_from_slice(&1u16.to_le_bytes());
+            blob.push(0);
+        }
+        assert!(decode_opus_blob_to_pcm(&blob).is_err());
     }
 }

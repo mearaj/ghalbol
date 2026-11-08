@@ -38,7 +38,8 @@ pub use types::{
 pub use ui_session::{
     bump_foreground_peer_cmd_gen, last_room_peer, live_foreground_peer_for_catchup,
     live_foreground_peer_pk, may_send_read_ack_for_contact_pk, queue_read_ack_catchup,
-    set_app_ack_read_enabled, set_app_ui_visible, sync_foreground_peer_now,
+    app_ui_visible, reset_live_session_ui_after_stop, set_app_ack_read_enabled, set_app_ui_visible,
+    sync_foreground_peer_now,
 };
 pub use worker::run_connect_node_with_std_io;
 

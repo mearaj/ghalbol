@@ -13,6 +13,8 @@ pub enum ServerError {
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
+    RateLimited(String),
+    #[error("{0}")]
     Internal(String),
 }
 
@@ -22,6 +24,7 @@ impl ServerError {
             ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::NotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             ServerError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

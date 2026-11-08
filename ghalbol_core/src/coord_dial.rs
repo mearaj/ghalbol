@@ -6,8 +6,15 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
 /// `(host, port)` from `https://host:port` / `http://host:port`.
+const MAX_COORD_AUTHORITY_CHARS: usize = 512;
+/// Bound DNS / override expansion — a pathological resolver must not create a dial storm.
+const MAX_COORD_DIAL_TARGETS: usize = 16;
+
 pub fn parse_coord_authority(base_url: &str) -> Result<(String, u16), String> {
     let t = base_url.trim().trim_end_matches('/');
+    if t.len() > 2_048 {
+        return Err("coord url too long".into());
+    }
     let rest = t
         .strip_prefix("https://")
         .or_else(|| t.strip_prefix("http://"))
@@ -16,9 +23,32 @@ pub fn parse_coord_authority(base_url: &str) -> Result<(String, u16), String> {
     if authority.is_empty() {
         return Err("coord url missing host".into());
     }
+    if authority.contains('@') {
+        return Err("coord url must not include userinfo".into());
+    }
+    if authority.len() > MAX_COORD_AUTHORITY_CHARS {
+        return Err("coord authority too long".into());
+    }
     let tls = t.starts_with("https://");
-    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
-        let host = h.trim().trim_start_matches('[').trim_end_matches(']');
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority
+            .find(']')
+            .ok_or_else(|| format!("invalid IPv6 authority in {authority}"))?;
+        let host = authority[1..end].trim();
+        if host.is_empty() {
+            return Err("coord url missing host".into());
+        }
+        let port = if let Some(p) = authority[end + 1..].strip_prefix(':') {
+            p.parse()
+                .map_err(|_| format!("invalid coord port in {authority}"))?
+        } else if tls {
+            443
+        } else {
+            80
+        };
+        (host.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        let host = h.trim();
         let port: u16 = p
             .parse()
             .map_err(|_| format!("invalid coord port in {authority}"))?;
@@ -33,6 +63,9 @@ pub fn parse_coord_authority(base_url: &str) -> Result<(String, u16), String> {
 }
 
 fn push_unique(out: &mut Vec<SocketAddr>, addr: SocketAddr) {
+    if out.len() >= MAX_COORD_DIAL_TARGETS {
+        return;
+    }
     if !out.contains(&addr) {
         out.push(addr);
     }
@@ -79,9 +112,10 @@ pub fn coord_dial_tcp_targets(host: &str, port: u16) -> Vec<String> {
     } else {
         format!("{host}:{port}")
     };
-    if !out.iter().any(|c| c == &named) {
+    if out.len() < MAX_COORD_DIAL_TARGETS && !out.iter().any(|c| c == &named) {
         out.push(named);
     }
+    out.truncate(MAX_COORD_DIAL_TARGETS);
     out
 }
 
@@ -100,5 +134,41 @@ mod tests {
     fn dial_targets_include_named_host() {
         let t = coord_dial_tcp_targets("coord1.ghalbol.com", 8443);
         assert!(t.iter().any(|c| c == "coord1.ghalbol.com:8443"));
+    }
+
+    #[test]
+    fn parse_rejects_userinfo_in_authority() {
+        assert!(parse_coord_authority("https://user:pass@coord.example.com:8443").is_err());
+    }
+
+    #[test]
+    fn parse_ipv6_bracket_authority() {
+        let (h, p) = parse_coord_authority("https://[2001:db8::1]:8443").unwrap();
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 8443);
+        let (h2, p2) = parse_coord_authority("http://[::1]").unwrap();
+        assert_eq!(h2, "::1");
+        assert_eq!(p2, 80);
+    }
+
+    #[test]
+    fn parse_rejects_oversized_authority() {
+        let huge = format!("https://{}.example", "a".repeat(MAX_COORD_AUTHORITY_CHARS));
+        assert!(parse_coord_authority(&huge).is_err());
+        assert!(parse_coord_authority(&format!("https://x/{}", "p".repeat(3000))).is_err());
+    }
+
+    #[test]
+    fn dial_target_list_is_hard_capped() {
+        let mut out = Vec::new();
+        for i in 0..(MAX_COORD_DIAL_TARGETS + 20) {
+            let addr: SocketAddr = format!("198.51.100.{i}:443")
+                .parse()
+                .unwrap_or_else(|_| "198.51.100.1:443".parse().unwrap());
+            push_unique(&mut out, addr);
+        }
+        assert_eq!(out.len(), MAX_COORD_DIAL_TARGETS);
+        let targets = coord_dial_tcp_targets("example.test", 443);
+        assert!(targets.len() <= MAX_COORD_DIAL_TARGETS);
     }
 }

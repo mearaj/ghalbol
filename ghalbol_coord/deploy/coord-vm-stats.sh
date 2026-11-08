@@ -3,7 +3,7 @@
 # Run manually or via coord-vm-monitor.timer (hourly).
 set -euo pipefail
 
-DATA_ROOT="${HOME}/.local/share/com.ghalbol.coord/ghalbol_coord"
+DATA_ROOT="${HOME}/.local/share/com.ghalbol.coord/ghalbol_server"
 OPS_DIR="${DATA_ROOT}/ops"
 STATS_LOG="${OPS_DIR}/stats.log"
 NET_STATE="${OPS_DIR}/net.state"
@@ -19,13 +19,14 @@ data_du="$(du -sh "${DATA_ROOT}" 2>/dev/null | awk '{print $1}' || echo "?")"
 peers="?"
 health="?"
 tmp_peers="$(mktemp)"
+trap 'rm -f "${tmp_peers:-}"' EXIT
 if curl -fsS --max-time 3 "${COORD_HTTP}/health" >/dev/null 2>&1; then
   health="ok"
   if curl -fsS --max-time 3 "${COORD_HTTP}/v1/peers" -o "${tmp_peers}" 2>/dev/null; then
     if command -v jq >/dev/null 2>&1; then
       peers="$(jq '.peers | length' "${tmp_peers}")"
     elif command -v python3 >/dev/null 2>&1; then
-      peers="$(python3 -c "import json; print(len(json.load(open('${tmp_peers}')).get('peers',[])))")"
+      peers="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("peers",[])))' "${tmp_peers}")"
     fi
   fi
 else

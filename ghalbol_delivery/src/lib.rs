@@ -17,7 +17,7 @@ mod ws;
 
 pub use config::{DeliveryConfig, DELIVERY_DATA_DIR, DATA_NAMESPACE, default_data_dir};
 pub use error::{DeliveryError, Result};
-pub use envelope::{ValidatedEnvelope, validate_envelope};
+pub use envelope::{parse_wire_message_id, ValidatedEnvelope, validate_envelope};
 pub use instance::instance_id;
 pub use mailbox_ops::{export_mailbox, import_mailbox, mailbox_stats, MailboxStats};
 pub use policy::PolicyLimits;
@@ -26,10 +26,41 @@ pub use store::MailboxStore;
 
 use axum::Router;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
-use auth::ChallengeStore;
 use ws::SessionRegistry;
+
+/// Process-lifetime counters exposed on `GET /health`.
+#[derive(Debug, Default)]
+pub struct OpsCounters {
+    pub rejected_frames: AtomicU64,
+    pub auth_failures: AtomicU64,
+    pub uploads_total: AtomicU64,
+    pub messages_expired: AtomicU64,
+    pub rejected_connections: AtomicU64,
+}
+
+/// Notifies sockets and the TTL sweeper to stop. `signal` sticks for late subscribers.
+pub struct ShutdownHandle {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    fn new() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        Self { tx }
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.tx.subscribe()
+    }
+
+    pub fn signal(&self) {
+        // Sticky: late subscribers must observe shutdown already requested.
+        let _ = self.tx.send_replace(true);
+    }
+}
 
 /// Shared application state.
 pub struct AppState {
@@ -37,7 +68,8 @@ pub struct AppState {
     pub store: Arc<MailboxStore>,
     pub policy: PolicyLimits,
     pub registry: SessionRegistry,
-    pub challenges: Arc<Mutex<ChallengeStore>>,
+    pub shutdown: ShutdownHandle,
+    pub ops: Arc<OpsCounters>,
 }
 
 impl AppState {
@@ -45,33 +77,31 @@ impl AppState {
         std::fs::create_dir_all(&config.data_dir)?;
         let db_path = config.data_dir.join("mailbox.db");
         let conn = db::open_and_migrate(&db_path)?;
-        let store = MailboxStore::shared(conn, &config);
-        let policy = PolicyLimits::from_config(&config);
-        Ok(Arc::new(Self {
-            config,
-            store,
-            policy,
-            registry: SessionRegistry::default(),
-            challenges: Arc::new(Mutex::new(ChallengeStore::default())),
-        }))
+        assemble(config, conn)
     }
 
     pub fn new_in_memory(config: DeliveryConfig) -> Result<Arc<Self>> {
-        let conn = db::open_memory()?;
-        let store = MailboxStore::shared(conn, &config);
-        let policy = PolicyLimits::from_config(&config);
-        Ok(Arc::new(Self {
-            config,
-            store,
-            policy,
-            registry: SessionRegistry::default(),
-            challenges: Arc::new(Mutex::new(ChallengeStore::default())),
-        }))
+        assemble(config, db::open_memory()?)
     }
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.config.data_dir
     }
+}
+
+fn assemble(mut config: DeliveryConfig, conn: rusqlite::Connection) -> Result<Arc<AppState>> {
+    config.normalize();
+    let store = MailboxStore::shared(conn, &config);
+    let policy = PolicyLimits::from_config(&config);
+    let registry = SessionRegistry::with_limit(config.max_connections);
+    Ok(Arc::new(AppState {
+        config,
+        store,
+        policy,
+        registry,
+        shutdown: ShutdownHandle::new(),
+        ops: Arc::new(OpsCounters::default()),
+    }))
 }
 
 pub fn app(state: Arc<AppState>) -> Router {

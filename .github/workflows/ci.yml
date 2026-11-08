@@ -114,6 +114,15 @@ jobs:
             bash -n "$f"
           done
 
+      - name: Env load regression
+        run: ./scripts/check_load_ghalbol_env.sh
+
+      - name: Desktop ids regression
+        run: ./scripts/check_desktop_ids.sh
+
+      - name: Desktop package staging regression
+        run: ./scripts/check_stage_desktop_package.sh
+
       - name: PowerShell syntax (Windows installer)
         shell: pwsh
         run: |

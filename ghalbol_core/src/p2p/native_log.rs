@@ -120,6 +120,8 @@ pub fn error(tag: &str, message: impl Display) {
 }
 
 const LOG_CAP: usize = 400;
+/// Per-line ceiling so a single pathological message cannot balloon the ring.
+const LOG_LINE_MAX_CHARS: usize = 2_048;
 
 fn log_ring() -> &'static Mutex<VecDeque<String>> {
     static RING: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
@@ -130,8 +132,13 @@ fn remember_line(level: &str, tag: &str, message: &str) {
     if level == "debug" && !verbose_enabled() {
         return;
     }
+    let mut line = format!("[{level}] {tag}: {message}");
+    if line.chars().count() > LOG_LINE_MAX_CHARS {
+        line = line.chars().take(LOG_LINE_MAX_CHARS).collect();
+        line.push('…');
+    }
     if let Ok(mut ring) = log_ring().lock() {
-        ring.push_back(format!("[{level}] {tag}: {message}"));
+        ring.push_back(line);
         while ring.len() > LOG_CAP {
             ring.pop_front();
         }
@@ -144,4 +151,22 @@ pub fn recent_lines() -> Vec<String> {
         .lock()
         .map(|ring| ring.iter().rev().cloned().collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remember_line_truncates_pathological_messages() {
+        let huge = "x".repeat(LOG_LINE_MAX_CHARS + 500);
+        remember_line("info", "test", &huge);
+        let lines = recent_lines();
+        let hit = lines
+            .iter()
+            .find(|l| l.contains("[info] test:"))
+            .expect("line stored");
+        assert!(hit.chars().count() <= LOG_LINE_MAX_CHARS + 1);
+        assert!(hit.ends_with('…'));
+    }
 }

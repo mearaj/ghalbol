@@ -21,12 +21,26 @@ use crate::storage::KeystoreStorageError;
 static IO_CHAIN: OnceLock<Mutex<()>> = OnceLock::new();
 static REVISIONS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
+/// In-memory revision counters only — bound growth across many rooms / namespaces.
+const MAX_REVISION_ENTRIES: usize = 4_096;
+
 fn io_chain() -> &'static Mutex<()> {
     IO_CHAIN.get_or_init(|| Mutex::new(()))
 }
 
 fn revision_map() -> &'static Mutex<HashMap<String, u64>> {
     REVISIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prune_revision_map(m: &mut HashMap<String, u64>) {
+    while m.len() > MAX_REVISION_ENTRIES {
+        // Drop an arbitrary entry; revisions are advisory for UI reload, not durable.
+        if let Some(k) = m.keys().next().cloned() {
+            m.remove(&k);
+        } else {
+            break;
+        }
+    }
 }
 
 fn revision_storage_key(app_namespace: &str, view_key: &str) -> String {
@@ -70,6 +84,7 @@ fn bump_transcript_revision(app_namespace: &str, conversation_key: &str) {
     if let Ok(mut m) = revision_map().lock() {
         let e = m.entry(key).or_insert(0);
         *e = e.saturating_add(1);
+        prune_revision_map(&mut m);
     }
 }
 
@@ -123,9 +138,14 @@ pub fn thread_view_limited(
     let all = load_merged(app_namespace, conversation_keys, match_inbound_from_peer_id)?;
     let revision = thread_revision_for_keys(app_namespace, conversation_keys);
     let (lines, has_more) = match limit {
-        Some(n) if n < all.len() => {
-            let start = all.len() - n;
-            (all[start..].to_vec(), true)
+        Some(n) => {
+            let n = n.clamp(1, 500);
+            if n < all.len() {
+                let start = all.len() - n;
+                (all[start..].to_vec(), true)
+            } else {
+                (all, false)
+            }
         }
         _ => (all, false),
     };
@@ -358,33 +378,118 @@ fn decode_root_lenient(raw: &str) -> Option<Value> {
         return Some(serde_json::json!({}));
     }
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Some(v);
+        return v.is_object().then_some(v);
     }
     if !trimmed.starts_with('{') {
         return None;
     }
-    let mut lo = 2usize;
-    let mut hi = trimmed.len();
-    let mut best: Option<Value> = None;
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        match serde_json::from_str::<Value>(&trimmed[..mid]) {
-            Ok(v) if v.is_object() => {
-                best = Some(v);
-                lo = mid + 1;
+    // Prefix validity is not monotonic in length (a longer cut can be invalid while a
+    // shorter one parses), so scan closing braces from the right — interrupted writes and
+    // suffix garbage after a complete object both recover the last full object.
+    let mut attempts = 0u32;
+    for (idx, b) in trimmed.as_bytes().iter().enumerate().rev() {
+        if *b != b'}' {
+            continue;
+        }
+        attempts += 1;
+        if attempts > 64 {
+            break;
+        }
+        let end = idx + 1;
+        if end < 2 {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&trimmed[..end]) {
+            if v.is_object() {
+                return Some(v);
             }
-            _ => hi = mid.saturating_sub(1),
         }
     }
-    best
+    None
+}
+
+/// Soft ceiling so a runaway / hostile transcript file cannot force a multi‑hundred‑MiB map.
+const MAX_TRANSCRIPT_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_root_bytes_capped(path: &Path) -> Result<Option<String>, TranscriptStoreError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    if fs::metadata(path)?.len() > MAX_TRANSCRIPT_JSON_BYTES {
+        return Err(TranscriptStoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "chat_transcript_v1.json exceeds size limit",
+        )));
+    }
+    let bytes = fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(Some(s)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn file_modified(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn root_has_thread_data(root: &Value) -> bool {
+    root.as_object().is_some_and(|ns_map| {
+        ns_map.values().any(|ns| {
+            ns.as_object().is_some_and(|threads| {
+                threads.values().any(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+            })
+        })
+    })
+}
+
+/// After a crash between tmp `sync_all` and `rename`, the durable bytes may only exist in `.json.tmp`.
+fn adopt_durable_tmp(path: &Path, tmp_path: &Path) -> Result<(), TranscriptStoreError> {
+    if fs::rename(tmp_path, path).is_err() && tmp_path.exists() {
+        let _ = fs::remove_file(tmp_path);
+    }
+    Ok(())
 }
 
 pub(crate) fn read_root_unlocked(path: &Path) -> Result<Value, TranscriptStoreError> {
-    if !path.exists() {
-        return Ok(serde_json::json!({}));
+    let tmp_path = path.with_extension("json.tmp");
+    let main_raw = read_root_bytes_capped(path)?;
+    let tmp_raw = read_root_bytes_capped(&tmp_path)?;
+    let main_decoded = main_raw.as_deref().and_then(decode_root_lenient);
+    let tmp_decoded = tmp_raw.as_deref().and_then(decode_root_lenient);
+
+    let prefer_tmp = match (&main_decoded, &tmp_decoded) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(main), Some(tmp)) => {
+            if !root_has_thread_data(main) && root_has_thread_data(tmp) {
+                true
+            } else {
+                matches!(
+                    (file_modified(path), file_modified(&tmp_path)),
+                    (Some(m), Some(t)) if t >= m
+                )
+            }
+        }
+    };
+
+    if prefer_tmp {
+        if let Some(v) = tmp_decoded {
+            adopt_durable_tmp(path, &tmp_path)?;
+            return Ok(v);
+        }
     }
-    let raw = fs::read_to_string(path)?;
-    Ok(decode_root_lenient(&raw).unwrap_or_else(|| serde_json::json!({})))
+
+    if let Some(v) = main_decoded {
+        if tmp_path.exists() && tmp_decoded.is_none() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        return Ok(v);
+    }
+    if let Some(v) = tmp_decoded {
+        adopt_durable_tmp(path, &tmp_path)?;
+        return Ok(v);
+    }
+    Ok(serde_json::json!({}))
 }
 
 fn write_root_unlocked(path: &Path, root: &Value) -> Result<(), TranscriptStoreError> {
@@ -671,6 +776,35 @@ fn load_merged_unlocked(
     ))
 }
 
+/// Same merge buckets [`load_merged_unlocked`] dedupes — block re-append under an alternate key.
+fn message_id_in_merged_threads(
+    app_namespace: &str,
+    conversation_key: &str,
+    ns_obj: &serde_json::Map<String, Value>,
+    message_id: &str,
+) -> bool {
+    let keys: HashSet<String> = expand_conversation_keys(app_namespace, &[conversation_key.to_string()])
+        .into_iter()
+        .collect();
+    for (thread_key, thread) in ns_obj {
+        if !keys.contains(thread_key) {
+            continue;
+        }
+        let Some(arr) = thread.as_array() else {
+            continue;
+        };
+        for item in arr {
+            let Some(parsed) = StoredChatLine::from_json(item) else {
+                continue;
+            };
+            if parsed.message_id.as_deref().unwrap_or("").trim() == message_id {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn load_merged(
     app_namespace: &str,
     conversation_keys: &[String],
@@ -713,6 +847,16 @@ pub fn append_if_new(
         bump_transcript_revision(app_namespace, conversation_key);
         return Ok(());
     };
+    let mid = line.message_id.as_deref().unwrap_or("").trim().to_string();
+    if !mid.is_empty()
+        && message_id_in_merged_threads(app_namespace, conversation_key, ns_obj, &mid)
+    {
+        flow_log::info(
+            "Transcript",
+            format!("append skipped duplicate message_id={mid} conv={conversation_key}"),
+        );
+        return Ok(());
+    }
     let mut existing: Vec<StoredChatLine> = ns_obj
         .get(conversation_key)
         .and_then(|v| v.as_array())
@@ -722,16 +866,6 @@ pub fn append_if_new(
                 .collect()
         })
         .unwrap_or_default();
-    let mid = line.message_id.as_deref().unwrap_or("").trim().to_string();
-    for e in &existing {
-        if !mid.is_empty() && e.message_id.as_deref().unwrap_or("").trim() == mid.as_str() {
-            flow_log::info(
-                "Transcript",
-                format!("append skipped duplicate message_id={mid} conv={conversation_key}"),
-            );
-            return Ok(());
-        }
-    }
     let outgoing = line.outgoing;
     let text_len = line.text.len();
     insert_line_in_thread_order(&mut existing, line);
@@ -1205,5 +1339,612 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "older");
         assert_eq!(rows[1].text, "newer");
+    }
+
+    #[test]
+    fn read_root_empty_or_non_json_yields_empty_merged_load() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.corrupt";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = resolve_transcript_path(ns).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, "").unwrap();
+        assert!(read_root_unlocked(&path).unwrap().as_object().unwrap().is_empty());
+        assert!(load_merged(ns, &["peerpk".to_string()], None)
+            .unwrap()
+            .is_empty());
+
+        fs::write(&path, "<<<<not-json>>>>").unwrap();
+        assert!(read_root_unlocked(&path).unwrap().as_object().unwrap().is_empty());
+
+        fs::write(&path, "[]").unwrap();
+        assert!(read_root_unlocked(&path).unwrap().as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_root_recovers_from_truncated_write_and_suffix_garbage() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use serde_json::json;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.interrupted";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = resolve_transcript_path(ns).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let root = json!({
+            ns: {
+                "peerpk": [{
+                    "local_id": "a",
+                    "text": "kept",
+                    "outgoing": false,
+                    "delivery": "pending",
+                    "created_at_ms": 1
+                }]
+            }
+        });
+        let good = serde_json::to_string(&root).unwrap();
+        fs::write(&path, format!("{good}<<<<suffix>>>>")).unwrap();
+        let rows = load_merged(ns, &["peerpk".to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "kept");
+
+        let good_pretty = serde_json::to_string_pretty(&root).unwrap();
+        fs::write(&path, format!("{good_pretty}\n,\"unfinished\":")).unwrap();
+        let rows2 = load_merged(ns, &["peerpk".to_string()], None).unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0].text, "kept");
+    }
+
+    #[test]
+    fn append_after_truncated_root_preserves_recovered_lines() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.crash";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = resolve_transcript_path(ns).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        append_if_new(
+            ns,
+            "peerpk",
+            StoredChatLine {
+                local_id: "a".into(),
+                text: "survives".into(),
+                outgoing: false,
+                from: None,
+                message_id: Some("mid-old".into()),
+                delivery: "pending".into(),
+                created_at_ms: Some(1),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let good = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{good}<<<<corrupt>>>>")).unwrap();
+        append_if_new(
+            ns,
+            "peerpk",
+            StoredChatLine {
+                local_id: "b".into(),
+                text: "after-crash".into(),
+                outgoing: true,
+                from: None,
+                message_id: Some("mid-new".into()),
+                delivery: "pending".into(),
+                created_at_ms: Some(2),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let rows = load_merged(ns, &["peerpk".to_string()], None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "survives");
+        assert_eq!(rows[1].text, "after-crash");
+    }
+
+    #[test]
+    fn load_merged_skips_malformed_lines_and_dedupes_message_id() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use serde_json::json;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.badlines";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = resolve_transcript_path(ns).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let root = json!({
+            ns: {
+                "peerpk": [
+                    { "oops": "no local_id" },
+                    {
+                        "local_id": "g1",
+                        "text": "first",
+                        "outgoing": true,
+                        "message_id": "mid-dup",
+                        "delivery": "delivered",
+                        "created_at_ms": 1
+                    },
+                    {
+                        "local_id": "g2",
+                        "text": "second",
+                        "outgoing": true,
+                        "message_id": "mid-dup",
+                        "delivery": "read",
+                        "created_at_ms": 2
+                    }
+                ]
+            }
+        });
+        fs::write(&path, root.to_string()).unwrap();
+        let rows = load_merged(ns, &["peerpk".to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].delivery, "read");
+        assert_eq!(rows[0].text, "second");
+    }
+
+    #[test]
+    fn concurrent_delivery_and_read_patches_both_stick() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::thread;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.concurrent";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let pk = "peerpk-concurrent-patch";
+        append_if_new(
+            ns,
+            pk,
+            StoredChatLine {
+                local_id: "out".into(),
+                text: "out".into(),
+                outgoing: true,
+                from: None,
+                message_id: Some("mid-out".into()),
+                delivery: "pending".into(),
+                created_at_ms: Some(10),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        append_if_new(
+            ns,
+            pk,
+            StoredChatLine {
+                local_id: "in".into(),
+                text: "in".into(),
+                outgoing: false,
+                from: Some(pk.into()),
+                message_id: Some("mid-in".into()),
+                delivery: "pending".into(),
+                created_at_ms: Some(20),
+                received_at_ms: Some(20),
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let ns_u = ns.to_string();
+        let pk_u = pk.to_string();
+        let t1 = thread::spawn({
+            let ns = ns_u.clone();
+            let pk = pk_u.clone();
+            move || {
+                for _ in 0..32 {
+                    let _ = patch_outgoing_delivery(&ns, &pk, "mid-out", "delivered");
+                }
+            }
+        });
+        let t2 = thread::spawn({
+            let ns = ns_u.clone();
+            move || {
+                for _ in 0..32 {
+                    let _ = patch_inbound_read_ack_sent_global(&ns, "mid-in");
+                }
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let rows = load_merged(ns, &[pk_u.clone()], None).unwrap();
+        let out = rows.iter().find(|r| r.message_id.as_deref() == Some("mid-out")).unwrap();
+        let inbound = rows
+            .iter()
+            .find(|r| r.message_id.as_deref() == Some("mid-in"))
+            .unwrap();
+        assert_eq!(out.delivery, "delivered");
+        assert!(inbound.read_ack_sent);
+    }
+
+    #[test]
+    fn append_if_new_ignores_duplicate_message_id() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.dupmid";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let base = StoredChatLine {
+            local_id: "l1".into(),
+            text: "one".into(),
+            outgoing: true,
+            from: None,
+            message_id: Some("same-mid".into()),
+            delivery: "pending".into(),
+            created_at_ms: Some(10),
+            received_at_ms: None,
+            read_ack_sent: false,
+            msg_kind: "text".into(),
+            duration_ms: None,
+            audio_path: None,
+            file_name: None,
+            mime_type: None,
+            size_bytes: None,
+            local_path: None,
+        };
+        append_if_new(ns, "peerpk", base.clone()).unwrap();
+        let mut dupe = base;
+        dupe.text = "two".into();
+        dupe.local_id = "l2".into();
+        append_if_new(ns, "peerpk", dupe).unwrap();
+        let rows = load_merged(ns, &["peerpk".to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "one");
+    }
+
+    #[test]
+    fn read_root_recovers_tmp_when_main_is_invalid_utf8() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.utf8";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = resolve_transcript_path(ns).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        append_if_new(
+            ns,
+            "peerpk",
+            StoredChatLine {
+                local_id: "a".into(),
+                text: "from-tmp".into(),
+                outgoing: true,
+                from: None,
+                message_id: Some("mid-utf8".into()),
+                delivery: "pending".into(),
+                created_at_ms: Some(1),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let good = fs::read(&path).unwrap();
+        fs::write(&path, &[0xff, 0xfe, 0x80]).unwrap();
+        fs::write(&tmp, &good).unwrap();
+        let rows = load_merged(ns, &["peerpk".to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "from-tmp");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn read_root_promotes_synced_tmp_after_interrupted_rename() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::{fs, thread, time::Duration};
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.tmp_rename";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let pk = "peerpk-tmp";
+        let path = resolve_transcript_path(ns).unwrap();
+        let tmp = path.with_extension("json.tmp");
+        let line = |local_id: &str, text: &str, mid: &str| StoredChatLine {
+            local_id: local_id.into(),
+            text: text.into(),
+            outgoing: true,
+            from: None,
+            message_id: Some(mid.into()),
+            delivery: "pending".into(),
+            created_at_ms: Some(1),
+            received_at_ms: None,
+            read_ack_sent: false,
+            msg_kind: "text".into(),
+            duration_ms: None,
+            audio_path: None,
+            file_name: None,
+            mime_type: None,
+            size_bytes: None,
+            local_path: None,
+        };
+        append_if_new(ns, pk, line("a", "stale-only", "mid-a")).unwrap();
+        let stale_main = fs::read_to_string(&path).unwrap();
+        append_if_new(ns, pk, line("b", "from-tmp", "mid-b")).unwrap();
+        let durable_tmp = fs::read_to_string(&path).unwrap();
+        fs::write(&path, stale_main).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&tmp, durable_tmp).unwrap();
+
+        let rows = load_merged(ns, &[pk.to_string()], None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "stale-only");
+        assert_eq!(rows[1].text, "from-tmp");
+        assert!(!tmp.exists());
+        let promoted = fs::read_to_string(&path).unwrap();
+        assert!(promoted.contains("from-tmp"));
+    }
+
+    #[test]
+    fn read_root_rejects_oversized_transcript_file() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::fs::{self, OpenOptions};
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.oversize";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = resolve_transcript_path(ns).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"{")
+            .unwrap();
+        f.set_len(super::MAX_TRANSCRIPT_JSON_BYTES + 1)
+            .unwrap();
+
+        let err = load_merged(ns, &["peerpk".to_string()], None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds size limit"),
+            "unexpected err: {msg}"
+        );
+    }
+
+    #[test]
+    fn append_if_new_skips_duplicate_message_id_on_alternate_thread_key() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::public_key_util::legacy_libp2p_peer_id_str_from_public_key_hex;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use serde_json::json;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.dup_alt_key";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let pk = "03a342b298a3500eaef16434e31a0376aea9c3a0403ab1592a62b2326b1dfa410b";
+        let legacy_peer = legacy_libp2p_peer_id_str_from_public_key_hex(pk).expect("legacy pid");
+        let path = resolve_transcript_path(ns).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let root = json!({
+            ns: {
+                legacy_peer: [{
+                    "local_id": "x",
+                    "text": "kept",
+                    "outgoing": true,
+                    "message_id": "shared-mid",
+                    "delivery": "pending",
+                    "created_at_ms": 1
+                }]
+            }
+        });
+        fs::write(&path, root.to_string()).unwrap();
+        append_if_new(
+            ns,
+            pk,
+            StoredChatLine {
+                local_id: "y".into(),
+                text: "rejected".into(),
+                outgoing: true,
+                from: None,
+                message_id: Some("shared-mid".into()),
+                delivery: "pending".into(),
+                created_at_ms: Some(2),
+                received_at_ms: None,
+                read_ack_sent: false,
+                msg_kind: "text".into(),
+                duration_ms: None,
+                audio_path: None,
+                file_name: None,
+                mime_type: None,
+                size_bytes: None,
+                local_path: None,
+            },
+        )
+        .unwrap();
+        let rows = load_merged(ns, &[pk.to_string()], None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "kept");
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("rejected"));
+    }
+
+    #[test]
+    fn concurrent_appends_keep_every_line() {
+        use crate::app_paths::configure_android_data_directory;
+        use crate::storage::{StorageConfig, create_or_unlock_identity_v1};
+        use std::thread;
+        use tempfile::TempDir;
+
+        let _guard = crate::app_paths::test_storage_isolation_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let td = TempDir::new().unwrap();
+        configure_android_data_directory(td.path().to_str().unwrap());
+        let ns = "dev.transcript.concurrent_append";
+        let cfg = StorageConfig::new(ns).with_override_data_dir(td.path());
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let pk = "peerpk-append";
+        let ns_u = ns.to_string();
+        let pk_u = pk.to_string();
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let ns = ns_u.clone();
+                let pk = pk_u.clone();
+                thread::spawn(move || {
+                    append_if_new(
+                        &ns,
+                        &pk,
+                        StoredChatLine {
+                            local_id: format!("loc{i}"),
+                            text: format!("m{i}"),
+                            outgoing: true,
+                            from: None,
+                            message_id: Some(format!("mid{i}")),
+                            delivery: "pending".into(),
+                            created_at_ms: Some(i as i64),
+                            received_at_ms: None,
+                            read_ack_sent: false,
+                            msg_kind: "text".into(),
+                            duration_ms: None,
+                            audio_path: None,
+                            file_name: None,
+                            mime_type: None,
+                            size_bytes: None,
+                            local_path: None,
+                        },
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rows = load_merged(ns, &[pk_u], None).unwrap();
+        assert_eq!(rows.len(), 16);
+    }
+
+    #[test]
+    fn revision_map_evicts_when_capped() {
+        let mut m = HashMap::new();
+        for i in 0..(MAX_REVISION_ENTRIES + 32) {
+            m.insert(format!("ns|view-{i}"), i as u64);
+        }
+        prune_revision_map(&mut m);
+        assert!(m.len() <= MAX_REVISION_ENTRIES);
     }
 }

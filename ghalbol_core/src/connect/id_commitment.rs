@@ -27,4 +27,24 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
     }
+
+    #[test]
+    fn commitment_matches_bare_and_prefixed_secp256k1() {
+        let bare = "0220899663decabbb1b9f19c2e7baa610e123badd98cfe6e43484f941c45a36d0c";
+        let prefixed = format!("secp256k1:{bare}");
+        assert_eq!(
+            identity_commitment_hex(bare).unwrap(),
+            identity_commitment_hex(&prefixed).unwrap()
+        );
+    }
+
+    #[test]
+    fn commitment_insensitive_to_wire_casing() {
+        let wire = "0220899663decabbb1b9f19c2e7baa610e123badd98cfe6e43484f941c45a36d0c";
+        let upper = wire.to_uppercase();
+        assert_eq!(
+            identity_commitment_hex(wire).unwrap(),
+            identity_commitment_hex(&upper).unwrap()
+        );
+    }
 }

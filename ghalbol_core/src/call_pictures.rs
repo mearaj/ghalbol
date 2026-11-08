@@ -56,8 +56,20 @@ pub fn clear_call_pictures() {
     }
 }
 
+/// Match call_video I420 convert ceilings — refuse pathological tiles before allocate.
+const MAX_PICTURE_DIM: u32 = 4_096;
+const MAX_PICTURE_PIXELS: u64 = 8 * 1024 * 1024;
+
 fn downscale(src: &[u8], width: u32, height: u32, max_w: u32) -> (Vec<u8>, u32, u32) {
-    if width <= max_w || width == 0 || height == 0 {
+    if width == 0
+        || height == 0
+        || width > MAX_PICTURE_DIM
+        || height > MAX_PICTURE_DIM
+        || (u64::from(width) * u64::from(height)) > MAX_PICTURE_PIXELS
+    {
+        return (Vec::new(), 0, 0);
+    }
+    if width <= max_w {
         return (src.to_vec(), width, height);
     }
     let dst_w = max_w;
@@ -75,4 +87,27 @@ fn downscale(src: &[u8], width: u32, height: u32, max_w: u32) -> (Vec<u8>, u32, 
         }
     }
     (dst, dst_w, dst_h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downscale_rejects_pathological_dimensions() {
+        let (rgba, w, h) = downscale(&[0u8; 4], MAX_PICTURE_DIM + 1, 64, 320);
+        assert!(rgba.is_empty());
+        assert_eq!((w, h), (0, 0));
+        let (rgba2, w2, h2) = downscale(&[0u8; 4], 4096, 4096, 320);
+        assert!(rgba2.is_empty());
+        assert_eq!((w2, h2), (0, 0));
+    }
+
+    #[test]
+    fn downscale_passthrough_small_tile() {
+        let src = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let (rgba, w, h) = downscale(&src, 2, 1, 320);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(rgba, src);
+    }
 }

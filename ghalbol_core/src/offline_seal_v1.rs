@@ -18,6 +18,7 @@ use rand_core::{OsRng, RngCore};
 use secp256k1::{PublicKey as SecpPublicKey, Secp256k1, SecretKey as SecpSecretKey};
 use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
+use zeroize::Zeroize;
 
 use crate::identity::IdentityAlgorithm;
 use crate::keystore_v1::DecryptedIdentity;
@@ -29,6 +30,10 @@ pub const OFFLINE_CIPHER_ECDSA_P256_V1: u8 = 0x12;
 const AES_GCM_NONCE_LEN: usize = 12;
 const HKDF_INFO_ED25519: &[u8] = b"ghalbol_offline_seal_ed25519_v1";
 const HKDF_INFO_P256: &[u8] = b"ghalbol_offline_seal_p256_v1";
+/// Hard cap on sealed mailbox blobs (ciphertext + AEAD overhead + ephemeral pub).
+const MAX_SEALED_BLOB_BYTES: usize = 8 * 1024 * 1024;
+/// Plaintext budget so sealed wire stays under [`MAX_SEALED_BLOB_BYTES`].
+const MAX_OFFLINE_PLAINTEXT_BYTES: usize = MAX_SEALED_BLOB_BYTES.saturating_sub(512);
 
 fn random_secp_secret_key() -> Result<SecpSecretKey, String> {
     let mut bytes = [0u8; 32];
@@ -63,6 +68,9 @@ fn pack_sealed(prefix: u8, ephemeral_pub: &[u8], nonce: &[u8; AES_GCM_NONCE_LEN]
 }
 
 fn unpack_sealed(sealed: &[u8]) -> Result<(u8, &[u8], &[u8], &[u8]), String> {
+    if sealed.len() > MAX_SEALED_BLOB_BYTES {
+        return Err("offline seal: sealed blob too large".to_string());
+    }
     let prefix = *sealed
         .first()
         .ok_or_else(|| "offline seal: empty blob".to_string())?;
@@ -117,6 +125,7 @@ pub fn seal_to_secp256k1_public(recipient_pk: &[u8], plaintext: &[u8]) -> Result
     let mut shared_arr = [0u8; 32];
     shared_arr.copy_from_slice(&shared.secret_bytes());
     let key = aes_key_sha256(&shared_arr);
+    shared_arr.zeroize();
     let (nonce, ct) = encrypt_with_key(&key, plaintext)?;
     Ok(pack_sealed(
         OFFLINE_CIPHER_SECP256K1_V1,
@@ -137,7 +146,9 @@ pub fn open_sealed_secp256k1(recipient_sk: &SecpSecretKey, sealed: &[u8]) -> Res
     let shared = secp256k1::ecdh::SharedSecret::new(&ephemeral_pub, recipient_sk);
     let mut shared_arr = [0u8; 32];
     shared_arr.copy_from_slice(&shared.secret_bytes());
-    decrypt_with_key(&aes_key_sha256(&shared_arr), nonce, ct)
+    let key = aes_key_sha256(&shared_arr);
+    shared_arr.zeroize();
+    decrypt_with_key(&key, nonce, ct)
 }
 
 /// Convert an Ed25519 verifying key to a Montgomery (X25519) public key.
@@ -164,6 +175,7 @@ fn seal_to_ed25519_public(recipient_pk: &[u8], plaintext: &[u8]) -> Result<Vec<u
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
     let ephemeral = StaticSecret::from(seed);
+    seed.zeroize();
     let ephemeral_pub = X25519Public::from(&ephemeral);
     let shared = ephemeral.diffie_hellman(&X25519Public::from(recipient_x));
     let key = aes_key_from_shared(shared.as_bytes(), HKDF_INFO_ED25519)?;
@@ -197,6 +209,7 @@ fn seal_to_p256_public(recipient_pk: &[u8], plaintext: &[u8]) -> Result<Vec<u8>,
     let ephemeral = loop {
         OsRng.fill_bytes(&mut seed);
         if let Ok(sk) = p256::SecretKey::from_slice(&seed) {
+            seed.zeroize();
             break sk;
         }
     };
@@ -232,10 +245,21 @@ pub fn seal_to_identity_public(
     recipient_pk: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, String> {
+    if plaintext.len() > MAX_OFFLINE_PLAINTEXT_BYTES {
+        return Err("offline seal: plaintext too large".to_string());
+    }
     match algorithm {
         IdentityAlgorithm::Secp256k1 => seal_to_secp256k1_public(recipient_pk, plaintext),
         IdentityAlgorithm::Ed25519 => seal_to_ed25519_public(recipient_pk, plaintext),
         IdentityAlgorithm::EcdsaP256 => seal_to_p256_public(recipient_pk, plaintext),
+    }
+}
+
+fn offline_cipher_prefix_for(algorithm: IdentityAlgorithm) -> u8 {
+    match algorithm {
+        IdentityAlgorithm::Secp256k1 => OFFLINE_CIPHER_SECP256K1_V1,
+        IdentityAlgorithm::Ed25519 => OFFLINE_CIPHER_ED25519_V1,
+        IdentityAlgorithm::EcdsaP256 => OFFLINE_CIPHER_ECDSA_P256_V1,
     }
 }
 
@@ -244,6 +268,16 @@ pub fn open_sealed_for_identity(
     ident: &DecryptedIdentity,
     sealed: &[u8],
 ) -> Result<Vec<u8>, String> {
+    if sealed.len() > MAX_SEALED_BLOB_BYTES {
+        return Err("offline seal: sealed blob too large".to_string());
+    }
+    let expected = offline_cipher_prefix_for(ident.algorithm());
+    let prefix = *sealed
+        .first()
+        .ok_or_else(|| "offline seal: empty blob".to_string())?;
+    if prefix != expected {
+        return Err("offline seal: cipher prefix does not match identity algorithm".to_string());
+    }
     match ident.algorithm() {
         IdentityAlgorithm::Secp256k1 => {
             let sk = ident.try_secp256k1_secret()?;
@@ -362,5 +396,122 @@ mod tests {
         let pk = public_key_from_secret(IdentityAlgorithm::Ed25519, &secret).unwrap();
         let sealed = seal_to_identity_public(IdentityAlgorithm::Ed25519, &pk, b"x").unwrap();
         assert_eq!(sealed.first(), Some(&OFFLINE_CIPHER_ED25519_V1));
+    }
+
+    #[test]
+    fn open_rejects_cipher_prefix_algorithm_mismatch() {
+        let (_ks, id) =
+            create_keystore_v1_with_algorithm("pw", IdentityAlgorithm::Ed25519, None).unwrap();
+        let (_ks2, id2) = crate::create_keystore_v1("pw2", None).unwrap();
+        let secp_sealed = seal_to_identity_public(
+            IdentityAlgorithm::Secp256k1,
+            id2.public_key_bytes(),
+            b"wrong algo",
+        )
+        .unwrap();
+        assert!(open_sealed_for_identity(&id, &secp_sealed).is_err());
+    }
+
+    #[test]
+    fn open_rejects_oversized_sealed_blob() {
+        let (_ks, id) =
+            create_keystore_v1_with_algorithm("pw", IdentityAlgorithm::Secp256k1, None).unwrap();
+        let huge = vec![OFFLINE_CIPHER_SECP256K1_V1; MAX_SEALED_BLOB_BYTES + 1];
+        assert!(open_sealed_for_identity(&id, &huge)
+            .unwrap_err()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn open_rejects_truncated_and_empty_sealed_blobs() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let sealed = seal_to_secp256k1_public(&pk, b"truncate-me").unwrap();
+        assert!(open_sealed_secp256k1(&sk, &[]).is_err());
+        let trunc = &sealed[..sealed.len().saturating_sub(8)];
+        assert!(open_sealed_secp256k1(&sk, trunc).is_err());
+    }
+
+    #[test]
+    fn open_rejects_garbage_ciphertext() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let sealed = seal_to_secp256k1_public(&pk, b"ok").unwrap();
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        assert!(open_sealed_secp256k1(&sk, &tampered).is_err());
+    }
+
+    #[test]
+    fn seal_rejects_oversized_plaintext() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let huge = vec![0u8; MAX_OFFLINE_PLAINTEXT_BYTES + 1];
+        assert!(seal_to_identity_public(IdentityAlgorithm::Secp256k1, &pk, &huge)
+            .unwrap_err()
+            .contains("plaintext too large"));
+    }
+
+    #[test]
+    fn open_secp_rejects_oversized_blob_before_unpack() {
+        let sk = random_secp_secret_key().unwrap();
+        let huge = vec![OFFLINE_CIPHER_SECP256K1_V1; MAX_SEALED_BLOB_BYTES + 1];
+        assert!(open_sealed_secp256k1(&sk, &huge)
+            .unwrap_err()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn open_rejects_corrupt_ephemeral_pub_valid_wire_length() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let mut sealed = seal_to_secp256k1_public(&pk, b"pub-integrity").unwrap();
+        let wire_len = sealed.len();
+        // Prefix(1) + u32le(4) + ephemeral compressed pubkey — flip first byte of pubkey.
+        let ep_start = 1 + 4;
+        sealed[ep_start] ^= 0x7f;
+        assert_eq!(sealed.len(), wire_len);
+        assert!(open_sealed_secp256k1(&sk, &sealed).is_err());
+    }
+
+    #[test]
+    fn unpack_rejects_declared_pub_len_longer_than_blob() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let sealed = seal_to_secp256k1_public(&pk, b"len-check").unwrap();
+        let mut lying = sealed.clone();
+        lying[1..5].copy_from_slice(&128u32.to_le_bytes());
+        let err = open_sealed_secp256k1(&sk, &lying).unwrap_err();
+        assert!(
+            err.contains("invalid ephemeral pubkey length") || err.contains("too short"),
+            "err={err}"
+        );
+    }
+
+    /// Soft latency guard — catches accidental regressions on the mailbox offline seal path.
+    /// Bound is deliberately loose for slow CI hosts (ECDH + AEAD per iteration).
+    #[test]
+    fn secp_seal_open_1kib_stays_under_soft_latency_budget() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let plain = vec![0xC3u8; 1024];
+        let start = std::time::Instant::now();
+        for _ in 0..80 {
+            let sealed = seal_to_secp256k1_public(&pk, &plain).unwrap();
+            let out = open_sealed_secp256k1(&sk, &sealed).unwrap();
+            assert_eq!(out, plain);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "80× 1KiB secp seal/open took {elapsed:?} (budget 5s)"
+        );
     }
 }

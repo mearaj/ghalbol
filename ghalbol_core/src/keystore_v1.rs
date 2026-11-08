@@ -15,6 +15,30 @@ const KEYSTORE_V1_AAD_PREFIX: &[u8] = b"ghalbol.keystore.v1";
 /// existing keystores and exported backups keep working; new writes use the current prefix.
 const LEGACY_KEYSTORE_V1_AAD_PREFIX: &[u8] = b"ghal_bol.keystore.v1";
 
+/// Reject untrusted keystores that crank Argon2 past our create-time defaults (DoS on unlock).
+const MAX_KDF_M_COST_KIB: u32 = 256 * 1024;
+const MAX_KDF_T_COST: u32 = 8;
+const MAX_KDF_P_COST: u32 = 4;
+const MAX_KDF_SALT_LEN: usize = 64;
+/// Identity secret ciphertext is a single AEAD blob (32-byte key + 16-byte tag at most).
+const MAX_IDENTITY_CIPHERTEXT_LEN: usize = 128;
+const MAX_IDENTITY_PUBLIC_KEY_LEN: usize = 128;
+/// Defense-in-depth for `from_json_str` (import picker uses the same ceiling in `storage`).
+const MAX_KEYSTORE_JSON_BYTES: usize = 1024 * 1024;
+/// Import path hex cap (ecdsa-p256 secrets are at most 66 bytes → 132 hex digits).
+const MAX_SECRET_IMPORT_HEX_CHARS: usize = 140;
+
+fn bytes_equal_ct(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 #[derive(Debug, Error)]
 pub enum KeystoreError {
     #[error("keystore json: {0}")]
@@ -148,13 +172,27 @@ impl DecryptedIdentity {
     }
 }
 
+fn validate_kdf_params(kdf: &KeystoreV1KdfParams) -> Result<(), KeystoreError> {
+    if kdf.salt.len() < 16 || kdf.salt.len() > MAX_KDF_SALT_LEN {
+        return Err(KeystoreError::Invalid("salt length out of range"));
+    }
+    if kdf.m_cost_kib == 0 || kdf.m_cost_kib > MAX_KDF_M_COST_KIB {
+        return Err(KeystoreError::Invalid("kdf m_cost out of range"));
+    }
+    if kdf.t_cost == 0 || kdf.t_cost > MAX_KDF_T_COST {
+        return Err(KeystoreError::Invalid("kdf t_cost out of range"));
+    }
+    if kdf.p_cost == 0 || kdf.p_cost > MAX_KDF_P_COST {
+        return Err(KeystoreError::Invalid("kdf p_cost out of range"));
+    }
+    Ok(())
+}
+
 fn derive_master_key(
     password: &[u8],
     kdf: &KeystoreV1KdfParams,
 ) -> Result<[u8; 32], KeystoreError> {
-    if kdf.salt.len() < 16 {
-        return Err(KeystoreError::Invalid("salt too short"));
-    }
+    validate_kdf_params(kdf)?;
     let params = Params::new(kdf.m_cost_kib, kdf.t_cost, kdf.p_cost, Some(32))
         .map_err(|_| KeystoreError::KdfParams)?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -193,6 +231,13 @@ fn aad(prefix: &[u8], purpose: &[u8]) -> Vec<u8> {
 fn keystore_algorithm(ks: &KeystoreV1) -> Result<IdentityAlgorithm, KeystoreError> {
     IdentityAlgorithm::from_keystore_field(ks.identity_algorithm.as_deref())
         .map_err(|e| KeystoreError::InvalidMsg(e))
+}
+
+fn validate_public_key_for_keystore(
+    algorithm: IdentityAlgorithm,
+    public_key: &[u8],
+) -> Result<(), KeystoreError> {
+    identity::validate_public_key(algorithm, public_key).map_err(|e| KeystoreError::InvalidMsg(e))
 }
 
 fn is_legacy_secp256k1_keystore(ks: &KeystoreV1) -> bool {
@@ -281,8 +326,9 @@ fn encrypt_identity_secret_with_aad_prefix(
         }
     };
 
-    let master = derive_master_key(password.as_bytes(), &kdf)?;
+    let mut master = derive_master_key(password.as_bytes(), &kdf)?;
     let mut identity_key = derive_aead_key(&master, b"identity");
+    master.zeroize();
     let aead = ChaCha20Poly1305::new(Key::from_slice(&identity_key));
     let mut nonce = [0u8; 12];
     rng.fill_bytes(&mut nonce);
@@ -326,6 +372,9 @@ pub fn parse_secret_bytes_for_algorithm(
     secret_hex: &str,
 ) -> Result<Vec<u8>, KeystoreError> {
     let s = secret_hex.trim();
+    if s.len() > MAX_SECRET_IMPORT_HEX_CHARS {
+        return Err(KeystoreError::Invalid("secret key hex too long"));
+    }
     if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(KeystoreError::Invalid("invalid secret key hex"));
     }
@@ -413,20 +462,17 @@ pub fn unlock_keystore_v1(
     password: &str,
     keystore: &KeystoreV1,
 ) -> Result<DecryptedIdentity, KeystoreError> {
-    if keystore.format != "keystore_v1" {
-        return Err(KeystoreError::Invalid("unknown format"));
-    }
-    if keystore.identity_nonce.len() != 12 {
-        return Err(KeystoreError::Invalid("bad nonce length"));
-    }
+    keystore.validate_fields()?;
 
     let algorithm = keystore_algorithm(keystore)?;
+    validate_public_key_for_keystore(algorithm, &keystore.identity_public_key)?;
 
-    let master = derive_master_key(password.as_bytes(), &keystore.kdf)?;
+    let mut master = derive_master_key(password.as_bytes(), &keystore.kdf)?;
     let mut identity_key = derive_aead_key(&master, b"identity");
+    master.zeroize();
     let aead = ChaCha20Poly1305::new(Key::from_slice(&identity_key));
     identity_key.zeroize();
-    let sk_plain = [KEYSTORE_V1_AAD_PREFIX, LEGACY_KEYSTORE_V1_AAD_PREFIX]
+    let mut sk_plain = [KEYSTORE_V1_AAD_PREFIX, LEGACY_KEYSTORE_V1_AAD_PREFIX]
         .iter()
         .find_map(|prefix| {
             aead.decrypt(
@@ -441,7 +487,8 @@ pub fn unlock_keystore_v1(
         .ok_or(KeystoreError::Decrypt)?;
 
     let id = decrypted_from_secret(algorithm, &sk_plain)?;
-    if id.public_key.as_slice() != keystore.identity_public_key.as_slice() {
+    sk_plain.zeroize();
+    if !bytes_equal_ct(id.public_key.as_slice(), keystore.identity_public_key.as_slice()) {
         return Err(KeystoreError::Invalid("identity public key mismatch"));
     }
 
@@ -456,12 +503,40 @@ pub fn unlock_keystore_v1(
 }
 
 impl KeystoreV1 {
+    /// Structural bounds checked before Argon2 / AEAD (import, load, unlock).
+    pub fn validate_fields(&self) -> Result<(), KeystoreError> {
+        if self.format != "keystore_v1" {
+            return Err(KeystoreError::Invalid("unknown format"));
+        }
+        validate_kdf_params(&self.kdf)?;
+        if self.identity_nonce.len() != 12 {
+            return Err(KeystoreError::Invalid("bad nonce length"));
+        }
+        if self.identity_ciphertext.is_empty()
+            || self.identity_ciphertext.len() > MAX_IDENTITY_CIPHERTEXT_LEN
+        {
+            return Err(KeystoreError::Invalid("identity ciphertext length out of range"));
+        }
+        if self.identity_public_key.is_empty()
+            || self.identity_public_key.len() > MAX_IDENTITY_PUBLIC_KEY_LEN
+        {
+            return Err(KeystoreError::Invalid("identity public key length out of range"));
+        }
+        let _ = keystore_algorithm(self)?;
+        Ok(())
+    }
+
     pub fn to_json_string(&self) -> Result<String, KeystoreError> {
         Ok(serde_json::to_string(self)?)
     }
 
     pub fn from_json_str(s: &str) -> Result<Self, KeystoreError> {
-        Ok(serde_json::from_str(s)?)
+        if s.len() > MAX_KEYSTORE_JSON_BYTES {
+            return Err(KeystoreError::Invalid("keystore JSON exceeds size limit"));
+        }
+        let ks: KeystoreV1 = serde_json::from_str(s)?;
+        ks.validate_fields()?;
+        Ok(ks)
     }
 
     pub fn identity_algorithm_resolved(&self) -> Result<IdentityAlgorithm, KeystoreError> {
@@ -542,9 +617,86 @@ mod tests {
     }
 
     #[test]
+    fn parse_secret_hex_rejects_oversized_input() {
+        let huge = "ab".repeat(MAX_SECRET_IMPORT_HEX_CHARS);
+        assert!(matches!(
+            parse_secret_key_hex(&huge),
+            Err(KeystoreError::Invalid("secret key hex too long"))
+        ));
+    }
+
+    #[test]
+    fn from_json_str_rejects_truncated_json() {
+        let (ks, _) = create_keystore_v1("pw", None).unwrap();
+        let mut json = ks.to_json_string().unwrap();
+        json.truncate(json.len() / 2);
+        assert!(KeystoreV1::from_json_str(&json).is_err());
+    }
+
+    #[test]
+    fn from_json_str_rejects_oversized_blob() {
+        let huge = "x".repeat(MAX_KEYSTORE_JSON_BYTES + 1);
+        assert!(matches!(
+            KeystoreV1::from_json_str(&huge),
+            Err(KeystoreError::Invalid("keystore JSON exceeds size limit"))
+        ));
+    }
+
+    #[test]
     fn public_key_hex_is_canonical_identity() {
         let (_ks, id) = create_keystore_v1("pw", None).unwrap();
         let pk = id.public_key_hex();
         assert!(crate::public_key_util::same_contact_pk(&pk, &pk));
+    }
+
+    #[test]
+    fn unlock_rejects_extreme_kdf_before_argon2() {
+        let (mut ks, _) = create_keystore_v1("pw", None).unwrap();
+        ks.kdf.m_cost_kib = u32::MAX;
+        assert!(matches!(
+            unlock_keystore_v1("pw", &ks),
+            Err(KeystoreError::Invalid("kdf m_cost out of range"))
+        ));
+    }
+
+    #[test]
+    fn unlock_rejects_oversized_identity_ciphertext() {
+        let (mut ks, _) = create_keystore_v1("pw", None).unwrap();
+        ks.identity_ciphertext = vec![0u8; MAX_IDENTITY_CIPHERTEXT_LEN + 1];
+        assert!(matches!(
+            unlock_keystore_v1("pw", &ks),
+            Err(KeystoreError::Invalid("identity ciphertext length out of range"))
+        ));
+    }
+
+    #[test]
+    fn unlock_rejects_invalid_stored_public_key() {
+        let (mut ks, _) = create_keystore_v1("pw", None).unwrap();
+        ks.identity_public_key = vec![0x04; 20];
+        assert!(matches!(
+            unlock_keystore_v1("pw", &ks),
+            Err(KeystoreError::InvalidMsg(_))
+        ));
+    }
+
+    #[test]
+    fn from_json_str_rejects_oversized_kdf_salt_before_kdf() {
+        let (mut ks, _) = create_keystore_v1("pw", None).unwrap();
+        ks.kdf.salt = vec![0u8; MAX_KDF_SALT_LEN + 1];
+        let json = serde_json::to_string(&ks).unwrap();
+        assert!(matches!(
+            KeystoreV1::from_json_str(&json),
+            Err(KeystoreError::Invalid("salt length out of range"))
+        ));
+    }
+
+    #[test]
+    fn validate_fields_rejects_bad_format() {
+        let (mut ks, _) = create_keystore_v1("pw", None).unwrap();
+        ks.format = "keystore_v99".to_string();
+        assert!(matches!(
+            ks.validate_fields(),
+            Err(KeystoreError::Invalid("unknown format"))
+        ));
     }
 }

@@ -32,10 +32,23 @@ pub(crate) fn p2p_mx() -> &'static Mutex<Option<P2pHolder>> {
     P.get_or_init(|| Mutex::new(None))
 }
 
+/// Soft ceiling — UI poll must not let an idle app accumulate unbounded gossip.
+pub(crate) const MAX_PENDING_P2P_EVENTS: usize = 2_048;
+
 pub(crate) fn pending_p2p_events_mx() -> &'static Mutex<VecDeque<GossipChatEvent>> {
     static P: OnceLock<Mutex<VecDeque<GossipChatEvent>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(VecDeque::new()))
 }
+
+pub(crate) fn push_pending_p2p_event(q: &mut VecDeque<GossipChatEvent>, ev: GossipChatEvent) {
+    while q.len() >= MAX_PENDING_P2P_EVENTS {
+        q.pop_front();
+    }
+    q.push_back(ev);
+}
+
+/// Bound register-dm-peer throttle keys (one per contact is enough).
+const MAX_REGISTER_DM_PEER_THROTTLE: usize = 4_096;
 
 pub(crate) fn register_dm_peer_throttle_mx() -> &'static RwLock<std::collections::HashMap<String, i64>> {
     static S: OnceLock<RwLock<std::collections::HashMap<String, i64>>> = OnceLock::new();
@@ -53,7 +66,7 @@ pub(crate) fn drain_holder_events_into_pending(h: &P2pHolder) {
         return;
     };
     while let Ok(ev) = h.events_rx.try_recv() {
-        q.push_back(ev);
+        push_pending_p2p_event(&mut q, ev);
     }
 }
 
@@ -79,14 +92,70 @@ pub(crate) fn clear_p2p_holder() {
     }
 }
 
-pub fn p2p_holder_alive() -> bool {
-    let Ok(g) = p2p_mx().lock() else {
-        return false;
-    };
+fn reconcile_stale_p2p_holder(g: &mut Option<P2pHolder>) -> bool {
     let Some(h) = g.as_ref() else {
         return false;
     };
-    !h.join.is_finished()
+    if !h.join.is_finished() {
+        return true;
+    }
+    let finished = g.take().expect("holder");
+    drain_holder_events_into_pending(&finished);
+    false
+}
+
+pub fn p2p_holder_alive() -> bool {
+    let Ok(mut g) = p2p_mx().lock() else {
+        return false;
+    };
+    reconcile_stale_p2p_holder(&mut g)
+}
+
+fn dm_peers_roster_fingerprint(dm_peers: &[crate::p2p::DmPeer], app_namespace: Option<&str>) -> String {
+    let mut keys: Vec<&str> = dm_peers
+        .iter()
+        .map(|p| p.identity_wire.as_str())
+        .filter(|s| !s.is_empty())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    format!("{}|{}", app_namespace.unwrap_or(""), keys.join(","))
+}
+
+fn register_dm_peers_throttled(dm_peers: &[crate::p2p::DmPeer], app_namespace: Option<&str>) {
+    static LAST: OnceLock<Mutex<(String, i64)>> = OnceLock::new();
+    let fingerprint = dm_peers_roster_fingerprint(dm_peers, app_namespace);
+    let now = now_ms();
+    let skip = LAST
+        .get_or_init(|| Mutex::new((String::new(), 0)))
+        .lock()
+        .ok()
+        .is_some_and(|mut g| {
+            if g.0 == fingerprint && now.saturating_sub(g.1) < 30_000 {
+                true
+            } else {
+                g.0 = fingerprint;
+                g.1 = now;
+                false
+            }
+        });
+    if skip {
+        native_log::debug(
+            "session",
+            format!(
+                "p2p_start roster sync unchanged ({} peers) — skip register burst",
+                dm_peers.len()
+            ),
+        );
+        return;
+    }
+    for dm in dm_peers {
+        let pk = dm.identity_wire.trim();
+        if !crate::contacts_v1::is_valid_public_key_hex(pk) {
+            continue;
+        }
+        let _ = p2p_register_dm_peer(pk);
+    }
 }
 
 pub(crate) fn stop_p2p_node(wait: Duration) {
@@ -185,6 +254,7 @@ pub fn p2p_start(config: &Value) -> Value {
         Err(e) => return json_err(e),
     };
     gossip_cfg.dm_peers = dm_peers;
+    gossip_cfg.cap_dm_peers();
     gossip_cfg.app_namespace = config
         .get("app_namespace")
         .and_then(|x| x.as_str())
@@ -204,13 +274,10 @@ pub fn p2p_start(config: &Value) -> Value {
             set_p2p_handler_context(ns);
             crate::incoming_call_notify::set_desktop_app_id(ns);
         }
-        for dm in &gossip_cfg.dm_peers {
-            let pk = dm.identity_wire.trim();
-            if !crate::contacts_v1::is_valid_public_key_hex(pk) {
-                continue;
-            }
-            let _ = p2p_register_dm_peer(pk);
-        }
+        register_dm_peers_throttled(
+            &gossip_cfg.dm_peers,
+            gossip_cfg.app_namespace.as_deref(),
+        );
         if crate::coord_runtime::coord_is_configured() {
             crate::p2p::notify_relay_refresh();
         }
@@ -350,8 +417,12 @@ pub fn p2p_stop() {
     crate::connect::connect_stop();
     crate::delivery_runtime::delivery_stop();
     clear_ui_session_snapshot();
+    crate::connect::reset_live_session_ui_after_stop();
     crate::coord_runtime::stop_coord_presence();
     crate::p2p::set_app_ack_read_enabled(false);
+    if let Ok(mut m) = register_dm_peer_throttle_mx().write() {
+        m.clear();
+    }
     stop_p2p_node(Duration::from_secs(3));
     call_state::clear_all_calls();
     crate::incoming_call_notify::dismiss_incoming_call();
@@ -382,14 +453,21 @@ pub fn p2p_register_dm_peer(public_key_hex: &str) -> Value {
                     return json_ok(serde_json::json!({ "ok": true, "throttled": true }));
                 }
             }
+            if !m.contains_key(pk_trim) && m.len() >= MAX_REGISTER_DM_PEER_THROTTLE {
+                // Drop stale entries first, then an arbitrary key if still full.
+                m.retain(|_, ts| now.saturating_sub(*ts) < 60_000);
+                while m.len() >= MAX_REGISTER_DM_PEER_THROTTLE {
+                    if let Some(k) = m.keys().next().cloned() {
+                        m.remove(&k);
+                    } else {
+                        break;
+                    }
+                }
+            }
             m.insert(pk_trim.to_string(), now);
         }
     }
-    let pk_short = if pk_trim.len() >= 16 {
-        format!("{}…{}", &pk_trim[..8], &pk_trim[pk_trim.len() - 8..])
-    } else {
-        pk_trim.to_string()
-    };
+    let pk_short = crate::flow_log::short_hex(pk_trim);
     native_log::info("session", format!("register_dm_peer pk={pk_short}"));
     if out_tx
         .send(OutboundCmd::RegisterDmPeer {
@@ -401,5 +479,55 @@ pub fn p2p_register_dm_peer(public_key_hex: &str) -> Value {
         return json_err("p2p register failed (node stopped?)");
     }
     json_ok(serde_json::json!({ "ok": true }))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::p2p::DmPeer;
+
+    #[test]
+    fn roster_fingerprint_stable_across_order() {
+        let a = DmPeer {
+            identity_wire: "bb".repeat(32),
+        };
+        let b = DmPeer {
+            identity_wire: "aa".repeat(32),
+        };
+        let f1 = dm_peers_roster_fingerprint(&[a.clone(), b.clone()], Some("ns"));
+        let f2 = dm_peers_roster_fingerprint(&[b, a], Some("ns"));
+        assert_eq!(f1, f2);
+        let f3 = dm_peers_roster_fingerprint(
+            &[DmPeer {
+                identity_wire: "cc".repeat(32),
+            }],
+            Some("ns"),
+        );
+        assert_ne!(f1, f3);
+    }
+
+    #[test]
+    fn pending_p2p_event_queue_drops_oldest_when_full() {
+        clear_pending_p2p_events();
+        let mut q = VecDeque::new();
+        for i in 0..MAX_PENDING_P2P_EVENTS {
+            push_pending_p2p_event(
+                &mut q,
+                GossipChatEvent::Listening(format!("addr-{i}")),
+            );
+        }
+        assert_eq!(q.len(), MAX_PENDING_P2P_EVENTS);
+        push_pending_p2p_event(&mut q, GossipChatEvent::Listening("newest".into()));
+        assert_eq!(q.len(), MAX_PENDING_P2P_EVENTS);
+        assert!(matches!(
+            q.front(),
+            Some(GossipChatEvent::Listening(s)) if s == "addr-1"
+        ));
+        assert!(matches!(
+            q.back(),
+            Some(GossipChatEvent::Listening(s)) if s == "newest"
+        ));
+        clear_pending_p2p_events();
+    }
 }
 

@@ -19,18 +19,35 @@ $src = $PSScriptRoot
 $manifest = Read-Manifest (Join-Path $src 'install-manifest.env')
 $label = $manifest['GHALBOL_APP_LABEL']
 $appId = $manifest['GHALBOL_APP_ID']
-$exeName = 'ghalbol-app.exe'
+$binBase = $manifest['BIN_NAME']
+if ([string]::IsNullOrWhiteSpace($binBase)) { $binBase = 'ghalbol-app' }
+# Manifest fields become registry keys / paths — refuse traversal and control chars.
+function Assert-SafeManifestValue([string]$Name, [string]$Value, [string]$Pattern) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { throw "install-manifest.env missing $Name" }
+    if ($Value.Length -gt 200) { throw "install-manifest.env $Name is too long" }
+    if ($Value -match '[\r\n\x00]') { throw "install-manifest.env $Name contains control characters" }
+    if ($Value -notmatch $Pattern) { throw "install-manifest.env $Name has unsafe characters" }
+}
+Assert-SafeManifestValue 'GHALBOL_APP_ID' $appId '^[A-Za-z0-9._-]+$'
+Assert-SafeManifestValue 'BIN_NAME' $binBase '^[A-Za-z0-9._-]+$'
+# Display label may include spaces but must not escape the Programs folder.
+Assert-SafeManifestValue 'GHALBOL_APP_LABEL' $label '^[^\\/:\*\?"<>\|]+$'
+$exeName = "${binBase}.exe"
+$procName = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
 $installDir = Join-Path $env:LOCALAPPDATA "Programs\$label"
 $exe = Join-Path $installDir $exeName
 
 # Close a running copy of this install so its files can be replaced.
-Get-Process -Name 'ghalbol-app' -ErrorAction SilentlyContinue |
+Get-Process -Name $procName -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $exe } |
     Stop-Process -Force
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 foreach ($item in @($exeName, 'ghalbol_app', 'makepad_widgets', 'install-manifest.env', 'uninstall.ps1', 'Uninstall.bat')) {
     $from = Join-Path $src $item
+    if (-not (Test-Path -LiteralPath $from)) {
+        throw "Package is incomplete: missing $item"
+    }
     $to = Join-Path $installDir $item
     if (Test-Path -LiteralPath $to -PathType Container) { Remove-Item -LiteralPath $to -Recurse -Force }
     Copy-Item -LiteralPath $from -Destination $to -Recurse -Force

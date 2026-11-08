@@ -6,34 +6,35 @@ use crate::multiaddr_local::Multiaddr;
 use super::config::{
     coord_base_urls, coord_lookup_err_means_http_reachable, note_coord_transport_ok,
 };
+use super::register::filter_coord_record_tcp_for_dial;
 use super::state::*;
+
+const MAX_COORD_LOOKUP_RELAY_ENDPOINTS: usize = 8;
 
 pub(super) fn coord_endpoints_to_dial_multiaddrs(endpoints: &[CoordEndpoint]) -> Vec<Multiaddr> {
     let mut out = Vec::new();
     // Relay circuits first (WAN/NAT); then direct TCP (LAN or UPnP).
+    let mut relay_n = 0usize;
     for ep in endpoints {
         if ep.scheme != "libp2p" {
+            continue;
+        }
+        if ep.host.len() > 512 || ep.scheme.len() > 16 {
             continue;
         }
         if let Ok(ma) = ep.host.trim().parse::<Multiaddr>() {
             if crate::p2p::network_transport::is_coord_relay_tcp_circuit_multiaddr(&ma) {
                 out.push(ma);
+                relay_n += 1;
+                if relay_n >= MAX_COORD_LOOKUP_RELAY_ENDPOINTS {
+                    break;
+                }
             }
         }
     }
-    for ep in endpoints {
-        let scheme = ep.scheme.as_str();
+    for ep in filter_coord_record_tcp_for_dial(endpoints) {
         #[cfg(target_os = "android")]
-        if scheme == "quic" {
-            continue;
-        }
-        if scheme != "tcp" && scheme != "quic" {
-            continue;
-        }
-        if ep.port == 0 || ep.host.trim().is_empty() {
-            continue;
-        }
-        if ep.port == 4001 {
+        if ep.scheme == "quic" {
             continue;
         }
         let dm = DmDialAddr::new(ep.host.clone(), ep.port);
@@ -82,10 +83,15 @@ pub fn lookup_bootstrap_multiaddrs(public_key_hex: &str) -> Result<Vec<String>, 
 }
 
 pub fn coord_lookup_peer_json(public_key_hex: &str) -> serde_json::Value {
-    let pk = public_key_hex.trim();
+    let pk = match crate::public_key_util::normalize_contact_identity_wire(public_key_hex) {
+        Ok(pk) => pk,
+        Err(e) => {
+            return serde_json::json!({ "ok": false, "error": e });
+        }
+    };
     let now = unix_ms_now();
     if let Ok(m) = lookup_backoff_map().lock() {
-        if let Some(b) = m.get(pk) {
+        if let Some(b) = m.get(&pk) {
             if now < b.next_allowed_ms {
                 return serde_json::json!({
                     "ok": false,
@@ -95,10 +101,10 @@ pub fn coord_lookup_peer_json(public_key_hex: &str) -> serde_json::Value {
             }
         }
     }
-    match lookup_bootstrap_multiaddrs(pk) {
+    match lookup_bootstrap_multiaddrs(&pk) {
         Ok(addrs) => {
             if let Ok(mut m) = lookup_backoff_map().lock() {
-                m.remove(pk);
+                m.remove(&pk);
             }
             serde_json::json!({
                 "ok": true,
@@ -108,19 +114,23 @@ pub fn coord_lookup_peer_json(public_key_hex: &str) -> serde_json::Value {
         Err(e) => {
             // Exponential backoff on 404/not-found; shorter backoff on transient reachability errors.
             let es = e.to_string();
-            let mut step = if es.contains("404") || es.contains("peer_not_on_server") {
-                800u64
-            } else {
-                5_000u64
-            };
+            let not_found = es.contains("404") || es.contains("peer_not_on_server");
+            let base = if not_found { 800u64 } else { 5_000u64 };
+            let mut step = base;
             let mut next = now.saturating_add(step);
             if let Ok(mut m) = lookup_backoff_map().lock() {
-                if let Some(prev) = m.get(pk).copied() {
-                    step = (prev.step_ms.saturating_mul(2)).min(5_000);
+                if let Some(prev) = m.get(&pk).copied() {
+                    let prev_not_found = prev.step_ms < 5_000;
+                    if not_found == prev_not_found {
+                        step = (prev.step_ms.saturating_mul(2)).min(5_000);
+                    } else {
+                        step = base;
+                    }
                     next = now.saturating_add(step);
                 }
-                m.insert(
-                    pk.to_string(),
+                insert_lookup_backoff(
+                    &mut m,
+                    pk,
                     CoordLookupBackoff {
                         next_allowed_ms: next,
                         step_ms: step,
@@ -143,7 +153,8 @@ pub fn lookup_dial_addrs_for_public_key(public_key_hex: &str) -> Result<Vec<DmDi
         };
         match client.lookup(public_key_hex) {
             Ok(record) => {
-                let addrs = coord_endpoints_to_dial_addrs(&record.endpoints);
+                let filtered = filter_coord_record_tcp_for_dial(&record.endpoints);
+                let addrs = coord_endpoints_to_dial_addrs(&filtered);
                 if !addrs.is_empty() {
                     return Ok(addrs);
                 }

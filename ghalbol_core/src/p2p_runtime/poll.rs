@@ -76,7 +76,7 @@ pub fn purge_stale_pending_call_invites(now_ms: i64) {
 /// Delivery-server path writes stores directly; enqueue here so `p2p_poll` can emit `stores_updated`.
 pub fn enqueue_delivery_gossip_event(ev: GossipChatEvent) {
     if let Ok(mut q) = pending_p2p_events_mx().lock() {
-        q.push_back(ev);
+        super::lifecycle::push_pending_p2p_event(&mut q, ev);
     }
 }
 
@@ -89,6 +89,8 @@ pub fn p2p_transcript_load_merged(config: &Value) -> Value {
     let Some(ns) = ns else {
         return json_err("app_namespace required");
     };
+    // Peer id + public key (+ a few aliases) is enough; ignore pathological arrays.
+    const MAX_CONVERSATION_KEYS: usize = 16;
     let keys: Vec<String> = config
         .get("conversation_keys")
         .and_then(|v| v.as_array())
@@ -97,6 +99,7 @@ pub fn p2p_transcript_load_merged(config: &Value) -> Value {
                 .filter_map(|x| x.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .take(MAX_CONVERSATION_KEYS)
                 .map(str::to_string)
                 .collect()
         })
@@ -113,7 +116,7 @@ pub fn p2p_transcript_load_merged(config: &Value) -> Value {
         .get("limit")
         .and_then(|v| v.as_u64())
         .filter(|n| *n > 0)
-        .map(|n| n as usize);
+        .map(|n| (n as usize).min(500));
 
     // Read-only: return lines to the RPC caller. Do **not** enqueue poll events here —
     // that caused a load → stores_updated → reload feedback loop that pinned chat scroll.

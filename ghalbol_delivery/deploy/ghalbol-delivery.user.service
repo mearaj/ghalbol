@@ -7,6 +7,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/home/REPLACE_DELIVERY_USER
 ExecStart=REPLACE_DELIVERY_BIN
 Environment=GHALBOL_DELIVERY_LISTEN=REPLACE_GHALBOL_DELIVERY_LISTEN
 Environment=GHALBOL_DELIVERY_DATA_DIR=/home/REPLACE_DELIVERY_USER/.local/share/com.ghalbol.delivery/ghalbol_delivery
@@ -14,6 +15,8 @@ Environment=RUST_LOG=info
 Environment=GHALBOL_DDNS_CREDENTIALS=REPLACE_GHALBOL_DDNS_CREDENTIALS
 Restart=on-failure
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
 
 [Install]
 WantedBy=default.target

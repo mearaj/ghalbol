@@ -70,4 +70,24 @@ mod tests {
             derive_call_media_keys_from_transport(&sk_a, &pk_a, &wire_a, &wire_a, "x").is_err()
         );
     }
+
+    #[test]
+    fn rejects_oversized_call_id() {
+        let (_ks_a, alice) = crate::create_keystore_v1("pw", None).unwrap();
+        let (_ks_b, bob) = crate::create_keystore_v1("pw2", None).unwrap();
+        let (sk_a, _) = generate_transport_keypair();
+        let (_, pk_b) = generate_transport_keypair();
+        let huge = "c".repeat(129);
+        assert!(
+            derive_call_media_keys_from_transport(
+                &sk_a,
+                &pk_b,
+                &alice.identity_wire(),
+                &bob.identity_wire(),
+                &huge
+            )
+            .unwrap_err()
+            .contains("too long")
+        );
+    }
 }

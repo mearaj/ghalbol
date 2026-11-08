@@ -106,6 +106,7 @@ impl App {
         self.ui.widget(cx, ids!(hub_view)).set_visible(cx, screen == "hub");
         self.ui.widget(cx, ids!(sheet_view)).set_visible(cx, screen == "sheet");
         self.ui.widget(cx, ids!(call_view)).set_visible(cx, screen == "call");
+        self.call_view_visible = screen == "call";
         if screen == "hub" {
             self.set_hub_tab(cx, self.hub_tab);
         }
@@ -175,17 +176,13 @@ impl App {
 
     pub(crate) fn apply_hub_history(&mut self, cx: &mut Cx, entry: HubHistoryEntry) {
         self.history_suppress = true;
-        self.open_peer = entry.conversation_key.clone();
+        self.open_peer = canonical_peer_key(&entry.conversation_key);
         let pk = self.open_peer.clone();
         let title = if pk.is_empty() {
             "Select a chat".to_string()
         } else {
             // Roster display name when known (Flutter showed the alias, not the key).
-            self.roster_rows
-                .iter()
-                .find(|(row_pk, _)| *row_pk == pk)
-                .map(|(_, t)| t.clone())
-                .unwrap_or_else(|| short_key(&pk))
+            roster_title_for_key(&self.roster_rows, &pk).unwrap_or_else(|| short_key(&pk))
         };
         let pk_script = pk.clone();
         let title_script = title.clone();
@@ -337,6 +334,7 @@ impl App {
         self.configure_secret_field(cx, ids!(password_input), ids!(password_eye), true);
         self.set_screen(cx, "hub");
         self.refresh_roster(cx);
+        self.reopen_read_gate_if_needed();
     }
 
     pub(crate) fn apply_shell_layout(&mut self, cx: &mut Cx) {
@@ -408,6 +406,9 @@ impl App {
         self.ui.widget(cx, ids!(bottom_nav)).set_visible(cx, show_bottom);
         self.ui.widget(cx, ids!(roster_col)).set_visible(cx, show_roster);
         self.ui.widget(cx, ids!(chat_col)).set_visible(cx, show_chat);
+        if !show_chat {
+            self.release_composer_key_focus(cx);
+        }
         self.ui.widget(cx, ids!(chat_back_button)).set_visible(cx, show_chat && !split);
         // Flutter puts Lock in the list AppBar on narrow; the side rail owns it on wide.
         self.ui
@@ -525,6 +526,7 @@ impl App {
                     self.show_hub(cx, &pk, "");
                 }
                 Err(e) => {
+                    let e = crate::chat_helpers::clamp_ui_display_line(&e);
                     script_eval!(cx, {
                         mod.state.status = #(e)
                         ui.identity_copy.render()
@@ -568,6 +570,7 @@ impl App {
                 self.show_hub(cx, &pk, &status);
             }
             Err(e) => {
+                let e = crate::chat_helpers::clamp_ui_display_line(&e);
                 script_eval!(cx, {
                     mod.state.status = #(e)
                     ui.identity_copy.render()
@@ -576,29 +579,67 @@ impl App {
         }
     }
 
-    pub(crate) fn take_pending_invite(&mut self) -> String {
+    /// Deep-link / argv invite waiting since before unlock. `None` = nothing pending.
+    pub(crate) fn take_pending_invite(&mut self) -> Option<(String, Result<String, String>)> {
         let raw = std::mem::take(&mut self.pending_invite);
         let raw = raw.trim();
         if raw.is_empty() {
-            return String::new();
+            return None;
         }
-        match host::accept_invite(&self.namespace, raw) {
-            Ok(pk) => format!("Joined {}", short_key(&pk)),
-            Err(e) => e,
+        let invite = raw.to_string();
+        Some((invite.clone(), host::accept_invite(&self.namespace, &invite)))
+    }
+
+    /// Join failures while the chat column is hidden → Join sheet; otherwise chat strip.
+    pub(crate) fn surface_invite_join_error(
+        &mut self,
+        cx: &mut Cx,
+        err: String,
+        invite: Option<&str>,
+    ) {
+        if invite_join_error_targets_chat(&self.open_peer, &self.page, self.ui_locked) {
+            self.show_chat_error(cx, err);
+            return;
         }
+        let lang = self.lang.clone();
+        let body = crate::chat_helpers::clamp_ui_display_line(&err);
+        if let Some(text) = invite {
+            self.paste = text.to_string();
+        }
+        self.show_sheet(
+            cx,
+            "join",
+            &i18n::phrase(&lang, "paste"),
+            body.clone(),
+            &i18n::phrase(&lang, "join_go"),
+        );
+        if let Some(text) = invite {
+            self.ui
+                .text_input(cx, ids!(paste_input))
+                .set_text(cx, text);
+        }
+        self.sync_sheet_body_text(cx, &body);
+    }
+
+    fn reopen_read_gate_if_needed(&mut self) {
+        if self.ui_locked
+            || self.open_peer.is_empty()
+            || !self.page.is_empty()
+            || self.hub_tab != 0
+        {
+            return;
+        }
+        host::set_open_room(Some(&self.open_peer));
     }
 
     pub(crate) fn show_hub(&mut self, cx: &mut Cx, public_key_hex: &str, status: &str) {
-        let joined = self.take_pending_invite();
-        let status = if joined.is_empty() {
-            status.to_string()
-        } else if status.is_empty() {
-            joined
-        } else {
-            format!("{status}\n{joined}")
-        };
+        let pending_invite = self.take_pending_invite();
+        let status = crate::chat_helpers::clamp_ui_display_line(status);
         let self_line = format!("You  {}", short_key(public_key_hex));
-        let roster = host::list_roster(&self.namespace).unwrap_or_default();
+        let roster = host::list_roster(&self.namespace).unwrap_or_else(|_| {
+            // First hub paint after unlock — keep empty until poll can list contacts.
+            Vec::new()
+        });
         script_eval!(cx, {
             mod.state.screen = "hub"
             mod.state.status = #(status)
@@ -625,11 +666,26 @@ impl App {
         self.set_screen(cx, "hub");
         self.paint_nav_tabs(cx);
         self.apply_shell_layout(cx);
+        match pending_invite {
+            Some((_raw, Ok(pk))) => {
+                self.roster_ver = u64::MAX;
+                self.open_joined_peer_chat(cx, &pk);
+                self.show_call_line(
+                    cx,
+                    crate::app_chat::join_accept_status_line(&pk),
+                );
+            }
+            Some((raw, Err(e))) => self.surface_invite_join_error(cx, e, Some(&raw)),
+            None => {}
+        }
+        self.reopen_read_gate_if_needed();
     }
 
     pub(crate) fn submit_lock(&mut self, cx: &mut Cx) {
         self.ui_locked = true;
         self.password.clear();
+        self.release_composer_key_focus(cx);
+        host::set_open_room(None);
         script_eval!(cx, {
             mod.state.status = "Enter your password to show chats. The network stays connected."
             ui.hub_view.set_visible(false)
@@ -642,12 +698,27 @@ impl App {
     }
 
     pub(crate) fn submit_logout(&mut self, cx: &mut Cx) {
+        let _ = host::end_call();
+        self.call_open = false;
+        self.painted_call_strip.clear();
+        self.painted_call_strip_error = false;
+        if self.page == "scan" {
+            self.end_qr_scan_ui();
+        }
+        self.page.clear();
         host::lock();
         self.session = None;
         self.ui_locked = false;
         self.open_peer.clear();
         self.composer.clear();
         self.password.clear();
+        self.delivery_hint.clear();
+        self.clear_chat_notice();
+        self.chat_rev = 0;
+        self.chat_lines_peer.clear();
+        self.chat_lines_len = 0;
+        self.roster_ver = u64::MAX;
+        self.pending_invite.clear();
         script_eval!(cx, {
             mod.state.screen = "identity"
             mod.state.status = ""
@@ -673,7 +744,8 @@ impl App {
     }
 
     pub(crate) fn sync_sheet_body_text(&mut self, cx: &mut Cx, body: &str) {
-        self.ui.text_input(cx, ids!(sheet_body)).set_text(cx, body);
+        let body = crate::chat_helpers::clamp_ui_display_line(body);
+        self.ui.text_input(cx, ids!(sheet_body)).set_text(cx, &body);
         self.ui.widget(cx, ids!(sheet_body)).redraw(cx);
         self.ui.widget(cx, ids!(sheet_copy)).redraw(cx);
         self.ui.widget(cx, ids!(sheet_scroll)).redraw(cx);
@@ -851,6 +923,15 @@ impl App {
                         .image(cx, ids!(scan_preview))
                         .load_png_from_data(cx, &png);
                 }
+                let msg = match host::start_qr_scan() {
+                    Ok(()) => "Point the camera at an invitation QR…".to_string(),
+                    Err(e) => e,
+                };
+                script_eval!(cx, {
+                    mod.state.sheet_body = #(msg.clone())
+                    ui.sheet_copy.render()
+                });
+                self.sync_sheet_body_text(cx, &msg);
             }
             "add" => self.show_sheet(
                 cx,
@@ -1020,6 +1101,13 @@ impl App {
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return Err(i18n::phrase(&lang, "choose_file"));
         };
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if meta.len() > host::MAX_PICKED_BACKUP_BYTES as u64 {
+            return Err(format!(
+                "Backup file is larger than {} MB",
+                host::MAX_PICKED_BACKUP_BYTES / (1024 * 1024)
+            ));
+        }
         let json = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         host::import_keystore(&self.namespace, &self.password, &json)
     }
@@ -1033,23 +1121,81 @@ impl App {
         if json.is_empty() {
             return Err("Paste the keystore JSON backup.".into());
         }
+        if json.len() > host::MAX_PICKED_BACKUP_BYTES {
+            return Err(format!(
+                "Backup paste is larger than {} MB",
+                host::MAX_PICKED_BACKUP_BYTES / (1024 * 1024)
+            ));
+        }
         if !(json.starts_with('{') && json.contains("identity_ciphertext")) {
             return Err("That does not look like a Ghal Bol keystore backup JSON.".into());
         }
         host::import_keystore(&self.namespace, &self.password, json)
     }
 
+    pub(crate) fn clear_chat_notice(&mut self) {
+        self.chat_notice.clear();
+        self.chat_notice_error = false;
+        self.painted_call_strip.clear();
+        self.painted_call_strip_error = false;
+    }
+
+    pub(crate) fn set_chat_notice(&mut self, msg: String, is_error: bool) {
+        self.chat_notice = crate::chat_helpers::clamp_ui_display_line(&msg);
+        self.chat_notice_error = is_error;
+    }
+
+    pub(crate) fn release_composer_key_focus(&mut self, cx: &mut Cx) {
+        let composer = self.ui.text_input(cx, ids!(composer));
+        if cx.has_key_focus(composer.area()) {
+            cx.set_key_focus(Area::Empty);
+        }
+    }
+
+    /// Status line above the transcript / call chrome.
+    /// Error notices beat the call banner so mute/dial failures stay visible on poll.
+    pub(crate) fn chat_status_text(&self, call: &str) -> (String, bool) {
+        resolve_chat_status_line(
+            call,
+            &self.chat_notice,
+            self.chat_notice_error,
+            &self.delivery_hint,
+        )
+    }
+
+    pub(crate) fn paint_chat_status_line(&mut self, cx: &mut Cx, call: &str) {
+        let (line, is_error) = self.chat_status_text(call);
+        if line == self.painted_call_strip && is_error == self.painted_call_strip_error {
+            return;
+        }
+        self.painted_call_strip = line.clone();
+        self.painted_call_strip_error = is_error;
+        let err_flag = if is_error { "1" } else { "0" };
+        script_eval!(cx, {
+            mod.state.call_line = #(line)
+            mod.state.call_line_is_error = #(err_flag)
+            ui.chat_log.render()
+            ui.call_copy.render()
+        });
+    }
+
     /// Status line above the transcript (attach / QR picture / join results).
     pub(crate) fn show_call_line(&mut self, cx: &mut Cx, msg: String) {
-        script_eval!(cx, {
-            mod.state.call_line = #(msg)
-            ui.chat_log.render()
-        });
+        self.set_chat_notice(msg, false);
+        self.paint_chat_status_line(cx, &host::call_banner());
+    }
+
+    pub(crate) fn show_chat_error(&mut self, cx: &mut Cx, msg: String) {
+        self.set_chat_notice(msg, true);
+        self.paint_chat_status_line(cx, &host::call_banner());
     }
 
     pub(crate) fn show_attach_result(&mut self, cx: &mut Cx, sent: Result<(), String>) {
         let queued = sent.is_ok();
-        self.show_call_line(cx, sent.map(|()| "File queued".to_string()).unwrap_or_else(|e| e));
+        match sent {
+            Ok(()) => self.show_call_line(cx, "File queued".to_string()),
+            Err(e) => self.show_chat_error(cx, e),
+        }
         if queued {
             self.refresh_transcript(cx);
         }
@@ -1059,12 +1205,28 @@ impl App {
     pub(crate) fn join_from_qr_picture(&mut self, cx: &mut Cx, picked: &str) {
         let ns = self.namespace.clone();
         let joined = host::decode_qr_file(picked).and_then(|text| host::accept_invite(&ns, &text));
-        let msg = match joined {
-            Ok(pk) => format!("Joined {pk}"),
-            Err(e) => e,
-        };
-        self.show_call_line(cx, msg);
-        self.refresh_roster(cx);
+        match joined {
+            Ok(pk) => {
+                let msg = crate::app_chat::join_accept_status_line(&pk);
+                if self.page == "scan" {
+                    self.end_qr_scan_ui();
+                    self.close_sheet(cx);
+                }
+                self.open_joined_peer_chat(cx, &pk);
+                self.show_call_line(cx, msg);
+            }
+            Err(e) => {
+                if self.page == "scan" {
+                    script_eval!(cx, {
+                        mod.state.sheet_body = #(e.clone())
+                        ui.sheet_copy.render()
+                    });
+                    self.sync_sheet_body_text(cx, &e);
+                } else {
+                    self.show_chat_error(cx, e);
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "android")]
@@ -1089,6 +1251,7 @@ impl App {
                 match imported {
                     Ok(session) => self.finish_import_backup(cx, session),
                     Err(e) => {
+                        let e = crate::chat_helpers::clamp_ui_display_line(&e);
                         script_eval!(cx, {
                             mod.state.status = #(e)
                             ui.identity_copy.render()
@@ -1103,7 +1266,87 @@ impl App {
             Answer::Cancelled(id) if id == android_pick::BACKUP => {
                 self.open_import_backup_sheet(cx);
             }
+            Answer::Cancelled(id) if id == android_pick::ATTACHMENT => {
+                let _ = android_pick::take_attach_peer();
+            }
             _ => {}
         }
+    }
+}
+
+/// True when a join error should use the chat status strip (room visible).
+pub(crate) fn invite_join_error_targets_chat(
+    open_peer: &str,
+    page: &str,
+    ui_locked: bool,
+) -> bool {
+    !open_peer.is_empty() && page.is_empty() && !ui_locked
+}
+
+/// Pure priority for the chat/call status strip (unit-tested).
+pub(crate) fn resolve_chat_status_line(
+    call: &str,
+    notice: &str,
+    notice_error: bool,
+    delivery_hint: &str,
+) -> (String, bool) {
+    if notice_error && !notice.is_empty() {
+        return (notice.to_string(), true);
+    }
+    if !call.is_empty() {
+        return (call.to_string(), false);
+    }
+    if !notice.is_empty() {
+        return (notice.to_string(), false);
+    }
+    if !delivery_hint.is_empty() {
+        return (delivery_hint.to_string(), false);
+    }
+    (String::new(), false)
+}
+
+#[cfg(test)]
+mod chat_status_tests {
+    use super::{invite_join_error_targets_chat, resolve_chat_status_line};
+
+    #[test]
+    fn join_error_uses_chat_strip_only_with_open_room() {
+        assert!(invite_join_error_targets_chat("aa", "", false));
+        assert!(!invite_join_error_targets_chat("", "", false));
+        assert!(!invite_join_error_targets_chat("aa", "join", false));
+        assert!(!invite_join_error_targets_chat("aa", "", true));
+    }
+
+    #[test]
+    fn error_notice_beats_call_banner() {
+        let (line, err) = resolve_chat_status_line(
+            "Connected",
+            "Microphone unavailable",
+            true,
+            "",
+        );
+        assert!(err);
+        assert_eq!(line, "Microphone unavailable");
+    }
+
+    #[test]
+    fn call_banner_beats_success_notice_and_hint() {
+        let (line, err) = resolve_chat_status_line("Calling…", "File queued", false, "Offline");
+        assert!(!err);
+        assert_eq!(line, "Calling…");
+    }
+
+    #[test]
+    fn notice_beats_delivery_hint_without_call() {
+        let (line, err) = resolve_chat_status_line("", "Added", false, "Mailbox down");
+        assert!(!err);
+        assert_eq!(line, "Added");
+    }
+
+    #[test]
+    fn delivery_hint_when_nothing_else() {
+        let (line, err) = resolve_chat_status_line("", "", false, "Queued until online");
+        assert!(!err);
+        assert_eq!(line, "Queued until online");
     }
 }

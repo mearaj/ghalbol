@@ -74,7 +74,8 @@ impl App {
     }
 
     pub(crate) fn save_availability(&mut self, status: &str) -> Result<String, String> {
-        self.add_alias = status.to_string();
+        let normalized = normalize_availability_status(status).unwrap_or_default();
+        self.add_alias = normalized.clone();
         save_status_line(status)
     }
 
@@ -111,8 +112,22 @@ impl App {
         let page = self.page.clone();
         let ns = self.namespace.clone();
         let result = match page.as_str() {
-            "join" => host::accept_invite(&ns, &self.paste).map(|pk| format!("Added {}", short_key(&pk))),
-            "add" => host::add_contact(&ns, &self.add_pk, Some(self.add_alias.trim())).map(|()| "Contact added".into()),
+            "join" => match host::accept_invite(&ns, self.paste.trim()) {
+                Ok(pk) => {
+                    let msg = join_accept_status_line(&pk);
+                    self.close_sheet(cx);
+                    self.open_joined_peer_chat(cx, &pk);
+                    self.show_call_line(cx, msg);
+                    return;
+                }
+                Err(e) => Err(e),
+            },
+            "add" => host::add_contact(
+                &ns,
+                self.add_pk.trim(),
+                Some(self.add_alias.trim()),
+            )
+            .map(|()| "Contact added".into()),
             "contacts" => {
                 let pk = self.open_peer.trim().to_string();
                 if pk.is_empty() {
@@ -168,7 +183,7 @@ impl App {
                     Err(e) => Err(e),
                 }
             }
-            "key" => host::reveal_secret(&ns, &self.paste),
+            "key" => host::reveal_secret(&ns, self.paste.trim()),
             "backup" => self.save_backup(),
             "import_backup" => {
                 self.pull_password(cx);
@@ -237,6 +252,7 @@ impl App {
     pub(crate) fn toggle_voice_note(&mut self, cx: &mut Cx) {
         let peer = self.open_peer.clone();
         if peer.is_empty() {
+            self.show_chat_error(cx, "Select a chat first".into());
             return;
         }
         let msg = match host::voice_note_toggle() {
@@ -262,10 +278,11 @@ impl App {
         };
         let sent = msg == "Voice note sent";
         if !msg.is_empty() {
-            script_eval!(cx, {
-                mod.state.call_line = #(msg)
-                ui.chat_log.render()
-            });
+            if sent {
+                self.show_call_line(cx, msg);
+            } else {
+                self.show_chat_error(cx, msg);
+            }
         }
         if sent {
             self.refresh_transcript(cx);
@@ -275,10 +292,7 @@ impl App {
     pub(crate) fn cancel_voice_note(&mut self, cx: &mut Cx) {
         let _ = host::voice_note_cancel();
         self.sync_recording_bar(cx);
-        script_eval!(cx, {
-            mod.state.call_line = "Recording discarded"
-            ui.chat_log.render()
-        });
+        self.show_call_line(cx, "Recording discarded".into());
     }
 
     /// Show/hide the Flutter-style recording bar and refresh the elapsed timer.
@@ -398,10 +412,11 @@ impl App {
             self.refresh_transcript(cx);
         }
         if !note.is_empty() {
-            script_eval!(cx, {
-                mod.state.call_line = #(note)
-                ui.chat_log.render()
-            });
+            if msg.is_err() {
+                self.show_chat_error(cx, note);
+            } else {
+                self.show_call_line(cx, note);
+            }
         }
     }
 
@@ -587,11 +602,16 @@ impl App {
         }
         self.seen_open_gen = open_gen;
         let peer_changed = pk != self.open_peer;
+        if peer_changed {
+            self.clear_chat_notice();
+        }
+        let pk = canonical_peer_key(&pk);
         self.open_peer = pk.clone();
         if pk.is_empty() {
             host::set_open_room(None);
             self.narrow_show_room = false;
             self.sync_trust_banner(cx, &[]);
+            self.release_composer_key_focus(cx);
             self.apply_shell_layout(cx);
             if peer_changed {
                 self.roster_ver = u64::MAX;
@@ -619,7 +639,16 @@ impl App {
             script_eval!(cx, { ui.chat_title_label.set_text(#(title)) });
         }
         self.apply_shell_layout(cx);
-        self.refresh_transcript(cx);
+        let rev = host::transcript_revision(&self.namespace, &pk);
+        if should_refresh_transcript_on_open(
+            peer_changed,
+            rev,
+            self.chat_rev,
+            &self.chat_lines_peer,
+            &pk,
+        ) {
+            self.refresh_transcript(cx);
+        }
         if opened_room {
             self.record_hub_nav();
         }
@@ -633,7 +662,9 @@ impl App {
         self.narrow_show_room = false;
         self.chat_lines_peer.clear();
         self.chat_lines_len = 0;
+        self.clear_chat_notice();
         self.set_chat_menu_open(cx, false);
+        self.release_composer_key_focus(cx);
         if self.recording_ui {
             let _ = host::voice_note_cancel();
             self.sync_recording_bar(cx);
@@ -658,7 +689,7 @@ impl App {
         let unknown = !self.open_peer.is_empty()
             && roster
                 .iter()
-                .find(|r| r.public_key_hex == self.open_peer)
+                .find(|r| peer_public_key_eq(&r.public_key_hex, &self.open_peer))
                 .map(|r| !r.is_known && !r.is_blocked)
                 .unwrap_or(false);
         let banner = self.ui.view(cx, ids!(trust_banner));
@@ -724,7 +755,12 @@ impl App {
         let page = match host::load_transcript(&session.app_namespace, &self.open_peer, self.transcript_limit()) {
             Ok(page) => page,
             Err(e) => {
-                let err = format!("Could not load chat: {e}");
+                let err = clamp_ui_display_line(&format!("Could not load chat: {e}"));
+                if preserve_transcript_on_load_error(self.chat_lines_len) {
+                    self.show_chat_error(cx, err);
+                    return;
+                }
+                self.chat_lines_len = 0;
                 script_eval!(cx, {
                     mod.state.transcript = #(err)
                     mod.state.lines = []
@@ -733,6 +769,15 @@ impl App {
                 return;
             }
         };
+        // Stick-to-bottom (Flutter): a freshly opened room always lands on the
+        // newest line; a grown transcript follows only if the user was already
+        // near the end — never yank someone reading older history.
+        let room_changed = self.chat_lines_peer != self.open_peer;
+        // Same-room refresh with 0 rows: keep the painted chat (DESIGN.md / AGENTS
+        // anti-pattern — empty merge must not clear an open room mid-session).
+        if keep_painted_transcript(page.lines.len(), room_changed, self.chat_lines_len) {
+            return;
+        }
         let empty = if page.lines.is_empty() {
             "No messages yet".to_string()
         } else {
@@ -742,20 +787,13 @@ impl App {
         self.ui
             .widget(cx, ids!(older_button))
             .set_visible(cx, self.has_more);
-        // Stick-to-bottom (Flutter): a freshly opened room always lands on the
-        // newest line; a grown transcript follows only if the user was already
-        // near the end — never yank someone reading older history.
-        let room_changed = self.chat_lines_peer != self.open_peer;
         let grew = page.lines.len() > self.chat_lines_len;
         let follow = room_changed || (grew && self.chat_log_near_bottom(cx));
         self.chat_lines_peer = self.open_peer.clone();
         self.chat_lines_len = page.lines.len();
-        let peer_title = self
-            .roster_rows
-            .iter()
-            .find(|(pk, _)| pk == &self.open_peer)
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| short_key(&self.open_peer));
+        let peer_title =
+            roster_title_for_key(&self.roster_rows, &self.open_peer)
+                .unwrap_or_else(|| short_key(&self.open_peer));
         script_eval!(cx, {
             mod.state.transcript = #(empty)
             mod.state.lines = []
@@ -853,10 +891,13 @@ impl App {
         if ver == self.roster_ver && self.roster_query == self.search {
             return;
         }
+        let Ok(roster) = host::list_roster(&self.namespace) else {
+            // Transient native error — keep the painted roster and retry on the next bump.
+            return;
+        };
         self.roster_ver = ver;
         self.roster_query = self.search.clone();
         let self_line = format!("You  {}", short_key(&session.public_key_hex));
-        let roster = host::list_roster(&self.namespace).unwrap_or_default();
         script_eval!(cx, {
             mod.state.self_line = #(self_line)
             mod.state.roster = []
@@ -953,21 +994,33 @@ impl App {
             self.composer = typed;
         }
         let peer = self.open_peer.clone();
-        if peer.is_empty() {
-            script_eval!(cx, {
-                mod.state.transcript = "Select a chat first"
-                ui.chat_log.render()
-            });
+        if let Some(msg) = send_text_block_reason(
+            self.session.is_some(),
+            self.ui_locked,
+            peer.is_empty(),
+        ) {
+            self.show_chat_error(cx, msg.into());
             return;
         }
         let text = self.composer.trim().to_string();
         if text.is_empty() {
             return;
         }
+        if text.len() > host::MAX_TEXT_DM_BYTES {
+            self.show_chat_error(
+                cx,
+                format!(
+                    "Message is too long (max {} KB).",
+                    host::MAX_TEXT_DM_BYTES / 1024
+                ),
+            );
+            return;
+        }
         match host::send_text(&peer, &text) {
             Ok(()) => {
                 self.composer.clear();
                 script_eval!(cx, { ui.composer.set_text("") });
+                self.clear_chat_notice();
                 self.delivery_hint = host::delivery_offline_hint().unwrap_or_default();
                 self.refresh_transcript(cx);
                 self.refresh_call_line(cx);
@@ -975,10 +1028,7 @@ impl App {
                 self.pin_chat_bottom(cx);
             }
             Err(e) => {
-                script_eval!(cx, {
-                    mod.state.transcript = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             }
         }
     }
@@ -1007,11 +1057,15 @@ impl App {
         if self.session.is_none() {
             return;
         }
-        if wake_call {
+        if wake_call || dirty {
             self.refresh_call_line(cx);
         }
-        if dirty {
-            self.refresh_call_line(cx);
+        if self.ui_locked {
+            if self.page == "scan" {
+                self.refresh_qr_preview(cx);
+                self.take_qr(cx);
+            }
+            return;
         }
         if self.page.is_empty() {
             // Roster only when contacts_version moved (refresh_roster no-ops otherwise).
@@ -1129,29 +1183,30 @@ impl App {
         // Live path: raw BGRA texture, no PNG, no mipmaps. `load_png_from_data` on
         // Linux builds a mip chain per frame and skips redraw outside draw events —
         // that is why the camera log showed ~30fps while the UI looked frozen.
-        let pixels = (w as usize).saturating_mul(h as usize);
-        let mut data = Vec::with_capacity(pixels);
-        for px in rgba.chunks_exact(4).take(pixels) {
-            data.push(
-                ((px[3] as u32) << 24)
-                    | ((px[0] as u32) << 16)
-                    | ((px[1] as u32) << 8)
-                    | (px[2] as u32),
-            );
-        }
-        let texture = Texture::new_with_format(
-            cx,
-            TextureFormat::VecBGRAu8_32 {
-                width: w as usize,
-                height: h as usize,
-                data: Some(data),
-                updated: TextureUpdated::Full,
-            },
-        );
+        let texture = rgba_to_bgra_texture(cx, w, h, &rgba);
         let image = self.ui.image(cx, ids!(scan_preview));
         image.set_texture(cx, Some(texture));
         // set_texture only auto-redraws inside a draw event; Signal polls need this.
         self.ui.widget(cx, ids!(scan_preview)).redraw(cx);
+    }
+
+    /// After a successful invite accept, land on Chats with the new room open.
+    pub(crate) fn open_joined_peer_chat(&mut self, cx: &mut Cx, pk: &str) {
+        self.set_hub_tab(cx, 0);
+        let pk = canonical_peer_key(pk);
+        self.open_peer = pk.clone();
+        self.refresh_roster(cx);
+        let title = roster_title_for_key(&self.roster_rows, &pk)
+            .unwrap_or_else(|| short_key(&pk));
+        let pk_script = pk.to_string();
+        let title_script = title.clone();
+        script_eval!(cx, {
+            mod.state.selected_pk = #(pk_script)
+            mod.state.selected_title = #(title_script)
+            mod.state.open_gen = mod.state.open_gen + 1
+            ui.chat_title_label.set_text(#(title))
+        });
+        self.sync_open_chat(cx);
     }
 
     pub(crate) fn take_qr(&mut self, cx: &mut Cx) {
@@ -1162,31 +1217,11 @@ impl App {
         match result.and_then(|text| host::accept_invite(&ns, &text)) {
             Ok(pk) => {
                 host::set_qr_scan_ui_active(false);
-                let line = format!("Joined {}", short_key(&pk));
-                script_eval!(cx, {
-                    mod.state.sheet_body = #(line)
-                    ui.sheet_copy.render()
-                });
-                self.open_peer = pk.clone();
-                self.refresh_roster(cx);
-                let title = self
-                    .session
-                    .as_ref()
-                    .and_then(|_| host::list_roster(&ns).ok())
-                    .and_then(|rows| {
-                        rows.into_iter()
-                            .find(|r| r.public_key_hex.eq_ignore_ascii_case(&pk))
-                            .map(|r| r.title)
-                    })
-                    .unwrap_or_else(|| short_key(&pk));
-                // Leave the scan sheet and open the new chat.
+                let line = join_accept_status_line(&pk);
+                // Leave the scan sheet and open the new chat on the Chats tab.
                 self.close_sheet(cx);
-                script_eval!(cx, {
-                    mod.state.selected_pk = #(pk)
-                    mod.state.selected_title = #(title)
-                    mod.state.open_gen = mod.state.open_gen + 1
-                    ui.chat_log.render()
-                });
+                self.open_joined_peer_chat(cx, &pk);
+                self.show_call_line(cx, line);
             }
             Err(e) if e == "Scan stopped" => {
                 // Back / leaving the sheet — not an error for the user.
@@ -1200,10 +1235,7 @@ impl App {
                     });
                     self.sync_sheet_body_text(cx, &e);
                 } else {
-                    script_eval!(cx, {
-                        mod.state.call_line = #(e)
-                        ui.chat_log.render()
-                    });
+                    self.show_chat_error(cx, e);
                 }
             }
         }
@@ -1219,32 +1251,31 @@ impl App {
         if let Some(qw) = host::take_delivery_quota_warning() {
             self.delivery_hint = qw;
         }
-        let line = if !call.is_empty() {
-            call
-        } else {
-            self.delivery_hint.clone()
-        };
         // Accept is callee-only. Showing it on an outbound dial made the caller
         // think the app was asking them to accept their own call.
         let incoming = host::call_is_incoming_ringing();
         self.ui
             .widget(cx, ids!(accept_call_button))
             .set_visible(cx, calling && incoming);
-        let end_label = if incoming { "Decline" } else { "End call" };
+        let end_label = if incoming {
+            i18n::phrase(&self.lang, "decline")
+        } else {
+            i18n::text(&self.lang, i18n::Key::EndCall).to_string()
+        };
         let peer_label = host::call_peer_label();
         let initial = call_avatar_initial(&peer_label);
+        self.paint_chat_status_line(cx, &call);
         script_eval!(cx, {
-            mod.state.call_line = #(line)
             ui.end_call_button.set_text(#(end_label))
             ui.call_peer_name.set_text(#(peer_label))
             ui.call_initial.set_text(#(initial))
             ui.call_copy.render()
-            ui.chat_log.render()
         });
         if calling {
             self.refresh_video(cx);
         }
-        if calling == self.call_open {
+        if calling == self.call_open && !needs_call_shell_reconcile(calling, self.call_view_visible)
+        {
             if calling {
                 self.ui.widget(cx, ids!(call_view)).redraw(cx);
             }
@@ -1288,5 +1319,49 @@ impl App {
             });
             self.set_screen(cx, "identity");
         }
+    }
+}
+
+/// User-facing line after accepting an invite (unit-tested).
+pub(crate) fn join_accept_status_line(pk: &str) -> String {
+    format!("Joined {}", short_key(pk))
+}
+
+/// Skip a full transcript reload when the user re-taps the same open room.
+pub(crate) fn should_refresh_transcript_on_open(
+    peer_changed: bool,
+    rev: u64,
+    chat_rev: u64,
+    painted_peer: &str,
+    open_peer: &str,
+) -> bool {
+    peer_changed || rev != chat_rev || painted_peer != open_peer
+}
+
+#[cfg(test)]
+mod join_flow_tests {
+    use super::{join_accept_status_line, should_refresh_transcript_on_open};
+
+    #[test]
+    fn join_status_uses_short_key_not_full_hex() {
+        let pk = "ab".repeat(32);
+        let line = join_accept_status_line(&pk);
+        assert!(line.starts_with("Joined "));
+        assert!(!line.contains(&pk));
+        assert!(line.len() < pk.len() + 8);
+    }
+
+    #[test]
+    fn same_room_reselect_skips_transcript_reload() {
+        let pk = "aa".repeat(32);
+        assert!(!should_refresh_transcript_on_open(false, 5, 5, &pk, &pk));
+    }
+
+    #[test]
+    fn peer_change_or_revision_bump_refreshes() {
+        let pk = "aa".repeat(32);
+        assert!(should_refresh_transcript_on_open(true, 5, 5, &pk, &pk));
+        assert!(should_refresh_transcript_on_open(false, 6, 5, &pk, &pk));
+        assert!(should_refresh_transcript_on_open(false, 5, 5, "other", &pk));
     }
 }

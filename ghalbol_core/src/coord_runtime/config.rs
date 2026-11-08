@@ -5,9 +5,14 @@ use super::register::schedule_register_presence;
 use super::state::*;
 use std::sync::atomic::Ordering;
 
+/// Match preferences `MAX_COORD_BASE_URL_CHARS` — drop pathological list entries.
+const MAX_COORD_URL_CHARS: usize = 2048;
+
 pub(super) fn normalize_coord_url(url: &str) -> Option<String> {
     let t = url.trim().trim_end_matches('/');
-    if t.is_empty() {
+    if t.is_empty() || t.chars().count() > MAX_COORD_URL_CHARS {
+        None
+    } else if !(t.starts_with("https://") || t.starts_with("http://")) {
         None
     } else {
         Some(t.to_string())

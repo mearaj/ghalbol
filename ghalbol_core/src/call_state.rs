@@ -8,6 +8,18 @@ use crate::call_sig_v1::CallSigKind;
 
 /// Match Makepad `CallController._maxLiveInviteAgeMs` — invites and ringing UI must not outlive this.
 pub const MAX_LIVE_CALL_INVITE_AGE_MS: i64 = 45_000;
+/// Match transport/call_media call_id ceiling — reject before HashMap insert.
+const MAX_CALL_ID_CHARS: usize = 128;
+/// Bound concurrent peer call rows under invite storms.
+const MAX_PEER_CALL_ROWS: usize = 256;
+
+fn validate_call_id(call_id: &str) -> Result<(), String> {
+    let t = call_id.trim();
+    if t.is_empty() || t.len() > MAX_CALL_ID_CHARS {
+        return Err("call_id invalid".into());
+    }
+    Ok(())
+}
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -223,6 +235,7 @@ pub fn apply_outbound_ex(
     kind: CallSigKind,
     invite_video: bool,
 ) -> Result<(), String> {
+    validate_call_id(call_id)?;
     let key = peer_pk_hex.trim().to_ascii_lowercase();
     let mut g = store().lock().map_err(|_| "call state lock".to_string())?;
     let cur = g.get(&key).cloned();
@@ -230,6 +243,9 @@ pub fn apply_outbound_ex(
         CallSigKind::Invite => {
             match cur {
                 None => {
+                    if g.len() >= MAX_PEER_CALL_ROWS {
+                        return Err("too many active calls".into());
+                    }
                     g.insert(
                         key,
                         fresh_call(
@@ -265,13 +281,16 @@ pub fn apply_outbound_ex(
             if c.call_id != call_id {
                 return Err("call_id mismatch".to_string());
             }
-            if c.phase != CallPhase::IncomingRinging {
-                return Err("call not in incoming_ringing".to_string());
+            match c.phase {
+                CallPhase::IncomingRinging => {
+                    g.insert(
+                        key,
+                        fresh_call(call_id.to_string(), CallPhase::Connected, c.video_enabled),
+                    );
+                }
+                CallPhase::Connected => {}
+                _ => return Err("call not in incoming_ringing".to_string()),
             }
-            g.insert(
-                key,
-                fresh_call(call_id.to_string(), CallPhase::Connected, c.video_enabled),
-            );
         }
         CallSigKind::Reject | CallSigKind::Hangup => {
             g.remove(&key);
@@ -339,6 +358,7 @@ pub fn apply_inbound_ex(
     kind: CallSigKind,
     invite_video: bool,
 ) -> Result<(), String> {
+    validate_call_id(call_id)?;
     let key = peer_pk_hex.trim().to_ascii_lowercase();
     let mut g = store().lock().map_err(|_| "call state lock".to_string())?;
     let cur = g.get(&key).cloned();
@@ -346,6 +366,9 @@ pub fn apply_inbound_ex(
         CallSigKind::Invite => {
             match cur {
                 None => {
+                    if g.len() >= MAX_PEER_CALL_ROWS {
+                        return Err("too many active calls".into());
+                    }
                     g.insert(
                         key,
                         fresh_call(
@@ -380,10 +403,16 @@ pub fn apply_inbound_ex(
             if c.call_id != call_id {
                 return Err("call_id mismatch".to_string());
             }
-            g.insert(
-                key,
-                fresh_call(call_id.to_string(), CallPhase::Connected, c.video_enabled),
-            );
+            match c.phase {
+                CallPhase::OutgoingRinging => {
+                    g.insert(
+                        key,
+                        fresh_call(call_id.to_string(), CallPhase::Connected, c.video_enabled),
+                    );
+                }
+                CallPhase::Connected => {}
+                _ => return Err("accept on unexpected phase".to_string()),
+            }
         }
         CallSigKind::Reject | CallSigKind::Hangup => {
             g.remove(&key);
@@ -513,5 +542,77 @@ mod tests {
         assert!(invite_payload_wants_video(&serde_json::json!({ "media": "video" })));
         assert!(!invite_payload_wants_video(&serde_json::json!({ "media": "audio" })));
         assert!(!invite_payload_wants_video(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn duplicate_outbound_invite_same_call_id_is_idempotent() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "0365b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        apply_outbound_ex(PK, "call-dup", CallSigKind::Invite, false).unwrap();
+        apply_outbound_ex(PK, "call-dup", CallSigKind::Invite, false).unwrap();
+        assert_eq!(phase_for_peer(PK), CallPhase::OutgoingRinging);
+    }
+
+    #[test]
+    fn accept_rejects_wrong_call_id_while_ringing() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "0395b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        apply_inbound_ex(PK, "call-real", CallSigKind::Invite, false).unwrap();
+        assert!(apply_outbound_ex(PK, "call-other", CallSigKind::Accept, false).is_err());
+        assert_eq!(phase_for_peer(PK), CallPhase::IncomingRinging);
+    }
+
+    #[test]
+    fn hangup_on_idle_is_harmless() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "0375b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        apply_outbound_ex(PK, "gone", CallSigKind::Hangup, false).unwrap();
+        assert_eq!(phase_for_peer(PK), CallPhase::Idle);
+    }
+
+    #[test]
+    fn duplicate_outbound_accept_is_idempotent_when_connected() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "0385b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        apply_inbound_ex(PK, "call-acc", CallSigKind::Invite, false).unwrap();
+        apply_outbound_ex(PK, "call-acc", CallSigKind::Accept, false).unwrap();
+        apply_outbound_ex(PK, "call-acc", CallSigKind::Accept, false).unwrap();
+        assert_eq!(phase_for_peer(PK), CallPhase::Connected);
+    }
+
+    #[test]
+    fn inbound_accept_rejects_while_incoming_ringing() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "0399b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        apply_inbound_ex(PK, "call-in", CallSigKind::Invite, false).unwrap();
+        assert!(apply_inbound_ex(PK, "call-in", CallSigKind::Accept, false).is_err());
+        assert_eq!(phase_for_peer(PK), CallPhase::IncomingRinging);
+    }
+
+    #[test]
+    fn duplicate_inbound_accept_idempotent_on_outgoing_ringing() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "03a9b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        apply_outbound_ex(PK, "call-out", CallSigKind::Invite, false).unwrap();
+        apply_inbound_ex(PK, "call-out", CallSigKind::Accept, false).unwrap();
+        apply_inbound_ex(PK, "call-out", CallSigKind::Accept, false).unwrap();
+        assert_eq!(phase_for_peer(PK), CallPhase::Connected);
+    }
+
+    #[test]
+    fn reject_oversized_or_empty_call_id() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "03b9b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        let huge = "c".repeat(MAX_CALL_ID_CHARS + 1);
+        assert!(apply_outbound_ex(PK, &huge, CallSigKind::Invite, false).is_err());
+        assert!(apply_inbound_ex(PK, "", CallSigKind::Invite, false).is_err());
+        assert_eq!(phase_for_peer(PK), CallPhase::Idle);
     }
 }

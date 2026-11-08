@@ -2,11 +2,15 @@
 
 #[cfg(target_os = "android")]
 mod imp {
+    use crate::p2p::network_transport::{
+        jni_attach_ok_without_pending_exception, multicast_lock_clear_slot_after_release_attempt,
+    };
     use jni::objects::{JObject, JObjectArray, JValue};
     use jni::{Env, JavaVM, jni_sig, jni_str};
 
     use crate::p2p::network_transport::{
-        OsDefaultTransport, OsNetworkSnapshot, detect_local_network_profile,
+        OsNetworkSnapshot, android_default_transport_from_caps, android_disconnected_os_snapshot,
+        android_retained_os_snapshot_on_probe_failure, android_wifi_link_up_from_caps,
     };
 
     // android.net.NetworkCapabilities
@@ -17,33 +21,13 @@ mod imp {
     const TRANSPORT_ETHERNET: i32 = 3;
 
     pub fn probe_connectivity_truth() -> OsNetworkSnapshot {
+        let cached = crate::p2p::network_transport::os_network_snapshot();
         if !crate::call_media::android_p2p_context_ready() {
-            return if_addrs_fallback();
+            return android_retained_os_snapshot_on_probe_failure(cached);
         }
-        probe_connectivity_truth_jni().unwrap_or_else(|_| if_addrs_fallback())
-    }
-
-    fn if_addrs_fallback() -> OsNetworkSnapshot {
-        let p = detect_local_network_profile();
-        let has_active_lan = p.has_rfc1918_on_wifi
-            || (p.has_rfc1918_ipv4
-                && (p.has_wifi_iface
-                    || p.has_tether_iface
-                    || p.has_usb_iface
-                    || (!p.has_cellular_iface && !p.has_cgnat_ipv4)));
-        OsNetworkSnapshot {
-            default_transport: if has_active_lan {
-                OsDefaultTransport::Wifi
-            } else if p.has_cellular_iface || p.has_cgnat_ipv4 {
-                OsDefaultTransport::Cellular
-            } else {
-                OsDefaultTransport::None
-            },
-            internet_validated: false,
-            has_internet: p.has_public_ipv4 || p.has_global_ipv6 || p.has_rfc1918_ipv4,
-            wifi_link_up: p.has_wifi_iface || p.has_rfc1918_on_wifi,
-            default_route_iface: None,
-        }
+        probe_connectivity_truth_jni().unwrap_or_else(|_| {
+            android_retained_os_snapshot_on_probe_failure(cached)
+        })
     }
 
     /// Wi-Fi `MulticastLock` held while the node runs (see [`hold_multicast_lock`]).
@@ -54,14 +38,27 @@ mod imp {
     /// mDNS never sees LAN peers and calls fall back to the coord bridge. Needs
     /// `CHANGE_WIFI_MULTICAST_STATE` in the manifest.
     pub fn hold_multicast_lock(hold: bool) {
-        if !crate::call_media::android_p2p_context_ready() {
+        if !hold {
+            let mut slot = MULTICAST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                return;
+            }
+            if !crate::call_media::android_p2p_context_ready() {
+                let _ = slot.take();
+                crate::p2p::native_log::warn(
+                    "connect",
+                    "wifi multicast lock: cleared Rust slot (JNI context gone)",
+                );
+                return;
+            }
+        } else if !crate::call_media::android_p2p_context_ready() {
             return;
         }
         let ctx = ndk_context::android_context();
         let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) };
         let result = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
             let mut slot = MULTICAST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let result = if hold {
+            let inner = if hold {
                 if slot.is_some() {
                     return Ok(());
                 }
@@ -71,16 +68,29 @@ mod imp {
                 // `activity` is Makepad's global ref. Dropping it would delete it.
                 std::mem::forget(activity);
                 acquire_multicast_lock(env, &context).map(|lock| *slot = Some(lock))
-            } else if let Some(lock) = slot.take() {
-                env.call_method(&lock, jni_str!("release"), jni_sig!("()V"), &[])
-                    .map(|_| ())
+            } else if slot.is_some() {
+                let release_result =
+                    env.call_method(&slot.as_ref().unwrap(), jni_str!("release"), jni_sig!("()V"), &[]);
+                let release_ok = release_result.is_ok();
+                let had_exception = release_ok && env.exception_check();
+                if had_exception {
+                    env.exception_clear();
+                }
+                if multicast_lock_clear_slot_after_release_attempt(release_ok, had_exception) {
+                    let _ = slot.take();
+                }
+                release_result.map(|_| ())
             } else {
                 Ok(())
             };
-            if env.exception_check() {
+            let pending = env.exception_check();
+            if pending {
                 env.exception_clear();
             }
-            result
+            if !jni_attach_ok_without_pending_exception(inner.is_ok(), pending) {
+                return Err(jni::errors::Error::JavaException);
+            }
+            inner
         });
         if let Err(e) = result {
             crate::p2p::native_log::warn("connect", format!("wifi multicast lock: {e}"));
@@ -135,7 +145,20 @@ mod imp {
             &[JValue::Bool(false)],
         )?;
         env.call_method(&lock, jni_str!("acquire"), jni_sig!("()V"), &[])?;
-        env.new_global_ref(&lock)
+        if env.exception_check() {
+            env.exception_clear();
+            return Err(jni::errors::Error::JavaException);
+        }
+        match env.new_global_ref(&lock) {
+            Ok(global) => Ok(global),
+            Err(e) => {
+                let _ = env.call_method(&lock, jni_str!("release"), jni_sig!("()V"), &[]);
+                if env.exception_check() {
+                    env.exception_clear();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn with_connectivity_manager<F>(f: F) -> Result<OsNetworkSnapshot, String>
@@ -162,6 +185,9 @@ mod imp {
                     &[JValue::Object(&conn_service)],
                 )?
                 .l()?;
+            if cm.is_null() {
+                return Ok(android_disconnected_os_snapshot());
+            }
             f(env, &cm)
         })
         .map_err(|e| e.to_string())
@@ -169,9 +195,6 @@ mod imp {
 
     fn probe_connectivity_truth_jni() -> Result<OsNetworkSnapshot, String> {
         with_connectivity_manager(|env, cm| {
-            let mut snap = OsNetworkSnapshot::default();
-            snap.wifi_link_up = any_network_has_transport(env, cm, TRANSPORT_WIFI)?;
-
             let active = env
                 .call_method(
                     cm,
@@ -181,7 +204,7 @@ mod imp {
                 )?
                 .l()?;
             if active.is_null() {
-                return Ok(snap);
+                return Ok(android_disconnected_os_snapshot());
             }
             let caps = env
                 .call_method(
@@ -192,7 +215,7 @@ mod imp {
                 )?
                 .l()?;
             if caps.is_null() {
-                return Ok(snap);
+                return Ok(android_disconnected_os_snapshot());
             }
 
             let has_wifi = env
@@ -220,16 +243,9 @@ mod imp {
                 )?
                 .z()?;
 
-            snap.default_transport = if has_wifi {
-                OsDefaultTransport::Wifi
-            } else if has_eth {
-                OsDefaultTransport::Ethernet
-            } else if has_cell {
-                OsDefaultTransport::Cellular
-            } else {
-                OsDefaultTransport::None
-            };
-            snap.has_internet = env
+            let default_transport =
+                android_default_transport_from_caps(has_wifi, has_eth, has_cell);
+            let has_internet = env
                 .call_method(
                     &caps,
                     jni_str!("hasCapability"),
@@ -237,7 +253,7 @@ mod imp {
                     &[JValue::Int(NET_CAPABILITY_INTERNET)],
                 )?
                 .z()?;
-            snap.internet_validated = env
+            let internet_validated = env
                 .call_method(
                     &caps,
                     jni_str!("hasCapability"),
@@ -245,7 +261,15 @@ mod imp {
                     &[JValue::Int(NET_CAPABILITY_VALIDATED)],
                 )?
                 .z()?;
-            Ok(snap)
+            let any_wifi = any_network_has_transport(env, cm, TRANSPORT_WIFI)?;
+            let wifi_link_up = android_wifi_link_up_from_caps(default_transport, any_wifi);
+            Ok(OsNetworkSnapshot {
+                default_transport,
+                internet_validated,
+                has_internet,
+                wifi_link_up,
+                default_route_iface: None,
+            })
         })
     }
 
@@ -262,6 +286,9 @@ mod imp {
                 &[],
             )?
             .l()?;
+        if networks.is_null() {
+            return Ok(false);
+        }
         let arr = JObjectArray::<JObject>::cast_local(env, networks)?;
         let len = arr.len(env)?;
         for i in 0..len {
@@ -297,6 +324,12 @@ mod imp {
 pub use imp::{hold_multicast_lock, probe_connectivity_truth};
 
 #[cfg(not(target_os = "android"))]
-pub fn probe_connectivity_truth() -> crate::p2p::network_transport::OsNetworkSnapshot {
-    crate::p2p::network_transport::OsNetworkSnapshot::default()
+use crate::p2p::network_transport::OsNetworkSnapshot;
+
+#[cfg(not(target_os = "android"))]
+pub fn probe_connectivity_truth() -> OsNetworkSnapshot {
+    OsNetworkSnapshot::default()
 }
+
+#[cfg(not(target_os = "android"))]
+pub fn hold_multicast_lock(_hold: bool) {}

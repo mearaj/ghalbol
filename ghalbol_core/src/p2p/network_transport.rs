@@ -17,7 +17,7 @@ pub(crate) enum OsDefaultTransport {
     Ethernet,
 }
 
-/// Authoritative OS network snapshot — updated on connectivity callbacks + each `network_tick`.
+/// Authoritative OS network snapshot — updated on each connect upkeep tick (~1s) and platform probes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OsNetworkSnapshot {
     pub default_transport: OsDefaultTransport,
@@ -38,7 +38,7 @@ fn os_network_mx() -> &'static std::sync::RwLock<OsNetworkSnapshot> {
     OS_NETWORK_SNAPSHOT.get_or_init(|| std::sync::RwLock::new(OsNetworkSnapshot::default()))
 }
 
-/// Probe OS connectivity and cache — call on Android notify + each `network_tick`.
+/// Probe OS connectivity and cache — `connect/worker.rs` calls this each upkeep tick (~1s).
 pub(crate) fn refresh_os_network_truth() {
     let snap = probe_os_network_truth_platform();
     if let Ok(mut g) = os_network_mx().write() {
@@ -52,6 +52,66 @@ pub(crate) fn os_network_snapshot() -> OsNetworkSnapshot {
         .ok()
         .map(|g| g.clone())
         .unwrap_or_default()
+}
+
+/// Android active-network caps: Wi‑Fi beats Ethernet beats Cellular (matches default-network precedence).
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn android_default_transport_from_caps(
+    has_wifi: bool,
+    has_ethernet: bool,
+    has_cellular: bool,
+) -> OsDefaultTransport {
+    if has_wifi {
+        OsDefaultTransport::Wifi
+    } else if has_ethernet {
+        OsDefaultTransport::Ethernet
+    } else if has_cellular {
+        OsDefaultTransport::Cellular
+    } else {
+        OsDefaultTransport::None
+    }
+}
+
+/// Airplane / no default network — never infer link or route from `if_addrs`.
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn android_disconnected_os_snapshot() -> OsNetworkSnapshot {
+    OsNetworkSnapshot::default()
+}
+
+/// Drop the cached `MulticastLock` after any release attempt so `hold=true` can re-acquire.
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn multicast_lock_clear_slot_after_release_attempt(
+    release_call_ok: bool,
+    had_pending_java_exception: bool,
+) -> bool {
+    let _ = (release_call_ok, had_pending_java_exception);
+    true
+}
+
+/// JNI attach callback returned `Ok` but the JVM still has a pending exception — treat as failure.
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn jni_attach_ok_without_pending_exception(
+    result_is_ok: bool,
+    pending_java_exception: bool,
+) -> bool {
+    result_is_ok && !pending_java_exception
+}
+
+/// JNI context gap or attach failure — keep the last good OS snapshot (do not poison with `if_addrs`).
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn android_retained_os_snapshot_on_probe_failure(
+    cached: OsNetworkSnapshot,
+) -> OsNetworkSnapshot {
+    cached
+}
+
+/// Wi‑Fi link for mDNS: active default is Wi‑Fi, or any connected network still has Wi‑Fi transport.
+#[cfg(any(test, target_os = "android"))]
+pub(crate) fn android_wifi_link_up_from_caps(
+    default_transport: OsDefaultTransport,
+    any_wifi_network: bool,
+) -> bool {
+    matches!(default_transport, OsDefaultTransport::Wifi) || any_wifi_network
 }
 
 fn probe_os_network_truth_platform() -> OsNetworkSnapshot {
@@ -152,6 +212,23 @@ impl LocalNetworkProfile {
             OsDefaultTransport::Wifi | OsDefaultTransport::Ethernet
         )
     }
+
+    /// `profile=mobile-data` — OS default route is cellular (TRANSPORT.md § Network truth).
+    pub(crate) fn on_mobile_data_path(&self) -> bool {
+        self.os_on_cellular_default()
+    }
+
+    /// `profile=lan` — OS default is Wi‑Fi/Ethernet and link state matches (not `if_addrs` alone).
+    pub(crate) fn has_active_lan(&self) -> bool {
+        if !self.os_on_lan_default() {
+            return false;
+        }
+        match self.os.default_transport {
+            OsDefaultTransport::Ethernet => true,
+            OsDefaultTransport::Wifi => self.os.wifi_link_up,
+            OsDefaultTransport::Cellular | OsDefaultTransport::None => false,
+        }
+    }
 }
 
 /// Android Wi‑Fi return can lag `if_addrs` while libp2p is already listening on RFC1918 TCP.
@@ -163,13 +240,17 @@ pub(crate) fn merge_os_network_truth(p: &mut LocalNetworkProfile) {
     if p.os.wifi_link_up {
         p.has_wifi_iface = true;
     }
-    if p.os_on_lan_default() {
-        if p.has_rfc1918_ipv4 || p.os.default_transport == OsDefaultTransport::Wifi {
+    if p.on_mobile_data_path() {
+        p.has_rfc1918_on_wifi = false;
+    } else if p.has_active_lan() {
+        if p.has_rfc1918_ipv4
+            || matches!(
+                p.os.default_transport,
+                OsDefaultTransport::Wifi | OsDefaultTransport::Ethernet
+            )
+        {
             p.has_rfc1918_on_wifi = true;
         }
-    }
-    if p.os_on_cellular_default() {
-        p.has_rfc1918_on_wifi = false;
     }
 }
 
@@ -200,6 +281,13 @@ fn iface_name_is_tether(name: &str) -> bool {
 /// Best-effort local network classification for dial strategy/logging:
 /// LAN vs WAN vs mobile-data vs tethering.
 pub(crate) fn detect_local_network_profile() -> LocalNetworkProfile {
+    let mut p = scan_if_addrs_profile();
+    merge_os_network_truth(&mut p);
+    p
+}
+
+/// `if_addrs` scan only — no OS default-route merge (Android JNI fallback uses this).
+pub(crate) fn scan_if_addrs_profile() -> LocalNetworkProfile {
     let mut p = LocalNetworkProfile::default();
     let Ok(ifs) = if_addrs::get_if_addrs() else {
         return p;
@@ -254,13 +342,29 @@ pub(crate) fn detect_local_network_profile() -> LocalNetworkProfile {
             }
         }
     }
-    merge_os_network_truth(&mut p);
     p
 }
 
 pub(crate) fn is_cgnat_ipv4(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 100 && (64..=127).contains(&o[1])
+}
+
+/// RFC1918 (or routable LAN) address for mDNS / direct LAN TCP dial — never loopback, docker, link-local, or CGNAT.
+pub(crate) fn prefer_lan_dial_ipv4(
+    candidates: impl IntoIterator<Item = std::net::Ipv4Addr>,
+) -> Option<std::net::Ipv4Addr> {
+    candidates.into_iter().find(|ip| {
+        !ip.is_loopback()
+            && !is_docker_or_link_local_ipv4(*ip)
+            && !is_cgnat_ipv4(*ip)
+            && ip.is_private()
+    })
+}
+
+/// Reject DM dials to shared / tailscale / carrier NAT space (not home RFC1918 LAN).
+fn is_non_dm_lan_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || is_docker_or_link_local_ipv4(ip) || is_cgnat_ipv4(ip)
 }
 
 /// Public routable IPv4 only — skip loopback, RFC1918, link-local, CGNAT, and docker0 (172.17.x).
@@ -271,15 +375,6 @@ pub(crate) fn is_public_bootstrap_ipv4(ip: std::net::Ipv4Addr) -> bool {
         && !is_docker_or_link_local_ipv4(ip)
         && !is_cgnat_ipv4(ip)
 }
-
-/// Resolve a Ghal Bol relay advertised by coord (`GET /v1/relay`) into concrete TCP dial
-/// multiaddrs `(PeerId, /ip4/<public-ip>/tcp/<port>/p2p/<id>)`.
-
-/// Append `/p2p-circuit` to the connected bootstrap TCP multiaddr (preserves live port).
-
-/// Lower rank = preferred bootstrap TCP family for this profile.
-
-/// CGNAT / shared address space (100.64.0.0/10) — Tailscale, carrier NAT, etc. Not home LAN RFC1918.
 
 pub(crate) fn ipv4_from_ma_str(s: &str) -> Option<std::net::Ipv4Addr> {
     let host = s.split("/ip4/").nth(1)?.split('/').next()?;
@@ -336,7 +431,7 @@ pub(crate) fn is_dm_dial_multiaddr(ma: &Multiaddr) -> bool {
         return false;
     }
     if let Some(ip) = ipv4_from_ma_str(&s) {
-        if ip.is_loopback() || is_docker_or_link_local_ipv4(ip) {
+        if is_non_dm_lan_ipv4(ip) {
             return false;
         }
         // Plain TCP to libp2p bootstrap port 4001 is a relay hop, not the DM peer.
@@ -515,9 +610,98 @@ pub(crate) fn is_docker_or_link_local_ipv4(ip: std::net::Ipv4Addr) -> bool {
 /// Expand `0.0.0.0` / `::` listeners into concrete LAN addresses for coord/mDNS peerstore.
 
 #[cfg(test)]
+static OS_SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn os_network_snapshot_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    OS_SNAPSHOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn set_os_network_snapshot_for_tests(snap: OsNetworkSnapshot) {
+    if let Ok(mut g) = os_network_mx().write() {
+        *g = snap;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::multiaddr_local::Multiaddr;
+
+    fn snap_cell_default_wifi_stale_in_ifaddrs() -> LocalNetworkProfile {
+        let _guard = os_network_snapshot_test_lock();
+        set_os_network_snapshot_for_tests(OsNetworkSnapshot {
+            default_transport: OsDefaultTransport::Cellular,
+            internet_validated: true,
+            has_internet: true,
+            wifi_link_up: true,
+            default_route_iface: Some("rmnet0".into()),
+        });
+        let mut p = LocalNetworkProfile {
+            has_rfc1918_ipv4: true,
+            has_wifi_iface: true,
+            has_cellular_iface: true,
+            has_rfc1918_on_wifi: true,
+            ..Default::default()
+        };
+        merge_os_network_truth(&mut p);
+        p
+    }
+
+    #[test]
+    fn cellular_default_clears_lan_from_ifaddrs() {
+        let p = snap_cell_default_wifi_stale_in_ifaddrs();
+        assert!(p.on_mobile_data_path());
+        assert!(!p.has_active_lan());
+        assert!(!p.has_rfc1918_on_wifi);
+    }
+
+    #[test]
+    fn has_active_lan_follows_os_not_ifaddrs() {
+        let _guard = os_network_snapshot_test_lock();
+        set_os_network_snapshot_for_tests(OsNetworkSnapshot {
+            default_transport: OsDefaultTransport::Wifi,
+            internet_validated: true,
+            has_internet: true,
+            wifi_link_up: true,
+            default_route_iface: Some("wlan0".into()),
+        });
+        let mut p = LocalNetworkProfile::default();
+        merge_os_network_truth(&mut p);
+        assert!(p.has_active_lan());
+
+        set_os_network_snapshot_for_tests(OsNetworkSnapshot {
+            default_transport: OsDefaultTransport::Wifi,
+            internet_validated: true,
+            has_internet: true,
+            wifi_link_up: false,
+            default_route_iface: Some("wlan0".into()),
+        });
+        merge_os_network_truth(&mut p);
+        assert!(!p.has_active_lan());
+    }
+
+    #[test]
+    fn ethernet_default_is_active_lan_without_wifi_link() {
+        let _guard = os_network_snapshot_test_lock();
+        set_os_network_snapshot_for_tests(OsNetworkSnapshot {
+            default_transport: OsDefaultTransport::Ethernet,
+            internet_validated: true,
+            has_internet: true,
+            wifi_link_up: false,
+            default_route_iface: Some("eth0".into()),
+        });
+        let mut p = LocalNetworkProfile {
+            has_rfc1918_ipv4: true,
+            ..Default::default()
+        };
+        merge_os_network_truth(&mut p);
+        assert!(p.has_active_lan());
+        assert!(p.has_rfc1918_on_wifi);
+    }
 
     #[test]
     fn peer_own_coord_register_rejects_relay_bootstrap_hop() {
@@ -579,6 +763,133 @@ mod tests {
         let out = sort_coord_dial_multiaddrs(vec![v6.clone(), v4.clone()]);
         assert_eq!(out[0], v4);
         assert_eq!(out[1], v6);
+    }
+
+    #[test]
+    fn prefer_lan_dial_ipv4_skips_loopback_docker_cgnat() {
+        let cgnat: std::net::Ipv4Addr = "100.64.0.2".parse().unwrap();
+        let docker: std::net::Ipv4Addr = "172.17.0.1".parse().unwrap();
+        let lan: std::net::Ipv4Addr = "192.168.1.42".parse().unwrap();
+        let loopback = std::net::Ipv4Addr::LOCALHOST;
+        assert_eq!(
+            prefer_lan_dial_ipv4([loopback, docker, cgnat, lan]),
+            Some(lan)
+        );
+        assert!(prefer_lan_dial_ipv4([loopback, docker, cgnat]).is_none());
+    }
+
+    #[test]
+    fn dm_dial_rejects_cgnat_tcp() {
+        let cgnat: Multiaddr = "/ip4/100.64.0.2/tcp/41234".parse().unwrap();
+        assert!(!is_dm_dial_multiaddr(&cgnat));
+        let lan: Multiaddr = "/ip4/192.168.0.5/tcp/41234".parse().unwrap();
+        assert!(is_dm_dial_multiaddr(&lan));
+    }
+
+    #[test]
+    fn is_cgnat_shared_address_space() {
+        assert!(is_cgnat_ipv4("100.64.1.1".parse().unwrap()));
+        assert!(is_cgnat_ipv4("100.127.255.1".parse().unwrap()));
+        assert!(!is_cgnat_ipv4("100.63.255.1".parse().unwrap()));
+        assert!(!is_cgnat_ipv4("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn android_network_multicast_release_always_clears_rust_slot() {
+        assert!(multicast_lock_clear_slot_after_release_attempt(true, false));
+        assert!(multicast_lock_clear_slot_after_release_attempt(true, true));
+        assert!(multicast_lock_clear_slot_after_release_attempt(false, false));
+    }
+
+    #[test]
+    fn android_network_jni_ok_rejects_pending_exception() {
+        assert!(jni_attach_ok_without_pending_exception(true, false));
+        assert!(!jni_attach_ok_without_pending_exception(true, true));
+        assert!(!jni_attach_ok_without_pending_exception(false, false));
+        assert!(!jni_attach_ok_without_pending_exception(false, true));
+    }
+
+    #[test]
+    fn android_network_disconnected_snapshot_is_conservative() {
+        let snap = android_disconnected_os_snapshot();
+        assert_eq!(snap.default_transport, OsDefaultTransport::None);
+        assert!(!snap.wifi_link_up);
+        assert!(!snap.has_internet);
+        assert!(!snap.internet_validated);
+    }
+
+    #[test]
+    fn android_network_caps_classify_transport_priority() {
+        assert_eq!(
+            android_default_transport_from_caps(true, true, true),
+            OsDefaultTransport::Wifi
+        );
+        assert_eq!(
+            android_default_transport_from_caps(false, true, true),
+            OsDefaultTransport::Ethernet
+        );
+        assert_eq!(
+            android_default_transport_from_caps(false, false, true),
+            OsDefaultTransport::Cellular
+        );
+        assert_eq!(
+            android_default_transport_from_caps(false, false, false),
+            OsDefaultTransport::None
+        );
+    }
+
+    #[test]
+    fn android_probe_failure_retains_prior_snapshot() {
+        let prior = OsNetworkSnapshot {
+            default_transport: OsDefaultTransport::Wifi,
+            internet_validated: true,
+            has_internet: true,
+            wifi_link_up: true,
+            default_route_iface: None,
+        };
+        let retained = android_retained_os_snapshot_on_probe_failure(prior.clone());
+        assert_eq!(retained, prior);
+        assert_ne!(
+            retained,
+            android_disconnected_os_snapshot(),
+            "must not downgrade to empty disconnected on JNI gap"
+        );
+    }
+
+    #[test]
+    fn android_wifi_link_up_from_caps_respects_default_and_scan() {
+        assert!(android_wifi_link_up_from_caps(
+            OsDefaultTransport::Wifi,
+            false
+        ));
+        assert!(!android_wifi_link_up_from_caps(
+            OsDefaultTransport::Cellular,
+            false
+        ));
+        assert!(android_wifi_link_up_from_caps(
+            OsDefaultTransport::Cellular,
+            true
+        ));
+        assert!(!android_wifi_link_up_from_caps(
+            OsDefaultTransport::None,
+            false
+        ));
+    }
+
+    #[test]
+    fn android_network_airplane_snapshot_clears_lan_from_ifaddrs() {
+        let _guard = os_network_snapshot_test_lock();
+        set_os_network_snapshot_for_tests(android_disconnected_os_snapshot());
+        let mut p = LocalNetworkProfile {
+            has_rfc1918_ipv4: true,
+            has_wifi_iface: true,
+            has_rfc1918_on_wifi: true,
+            ..Default::default()
+        };
+        merge_os_network_truth(&mut p);
+        assert!(!p.has_active_lan());
+        assert!(!p.on_mobile_data_path());
+        assert!(!p.os.wifi_link_up);
     }
 
     #[test]

@@ -5,10 +5,11 @@ use serde_json::{Value, json};
 use crate::call_state;
 use crate::p2p_runtime;
 
-use super::json_error;
+use super::{json_error, require_contact_pk};
 use super::contacts::peer_display_name;
 
 pub fn start_voice_call(peer_public_key_hex: &str) -> Result<String, String> {
+    let peer = require_contact_pk(peer_public_key_hex)?;
     let call_id = format!(
         "{:x}",
         std::time::SystemTime::now()
@@ -17,7 +18,7 @@ pub fn start_voice_call(peer_public_key_hex: &str) -> Result<String, String> {
             .unwrap_or(0)
     );
     let cfg = json!({
-        "recipient_public_key_hex": peer_public_key_hex,
+        "recipient_public_key_hex": peer,
         "call_id": call_id,
         "signal": "invite",
         "payload": {
@@ -28,13 +29,16 @@ pub fn start_voice_call(peer_public_key_hex: &str) -> Result<String, String> {
     });
     json_error(&p2p_runtime::p2p_call_signal(&cfg), "could not start call")?;
     if let Ok(mut g) = active_call().lock() {
-        *g = Some((call_id.clone(), peer_public_key_hex.to_string()));
+        *g = Some((call_id.clone(), peer));
     }
     let _ = start_call_media();
     Ok(call_id)
 }
 
 pub fn accept_incoming_call() -> Result<(), String> {
+    let _accept_guard = accept_incoming_once()
+        .lock()
+        .map_err(|_| "accept in progress".to_string())?;
     let status = p2p_runtime::p2p_call_status(&json!({}));
     if !call_is_incoming_ringing() {
         return Err("No incoming call".into());
@@ -52,6 +56,8 @@ pub fn accept_incoming_call() -> Result<(), String> {
     if call_id.is_empty() || peer.is_empty() {
         return Err("No incoming call".into());
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    crate::incoming_call_notify::dismiss_incoming_call();
     let cfg = json!({
         "recipient_public_key_hex": peer,
         "call_id": call_id,
@@ -71,9 +77,10 @@ pub fn accept_incoming_call() -> Result<(), String> {
 }
 
 pub fn start_video_call(peer_public_key_hex: &str) -> Result<String, String> {
+    let dial_peer = require_contact_pk(peer_public_key_hex)?;
     // Mid-call upgrade: if we already have this peer on the line, only start video.
     if let Ok((call_id, peer)) = current_call() {
-        if crate::public_key_util::same_contact_pk(&peer, peer_public_key_hex) {
+        if crate::public_key_util::same_contact_pk(&peer, &dial_peer) {
             let cfg = json!({
                 "action": "start",
                 "call_id": call_id,
@@ -93,7 +100,7 @@ pub fn start_video_call(peer_public_key_hex: &str) -> Result<String, String> {
             .unwrap_or(0)
     );
     let cfg = json!({
-        "recipient_public_key_hex": peer_public_key_hex,
+        "recipient_public_key_hex": dial_peer,
         "call_id": call_id,
         "signal": "invite",
         "payload": {
@@ -104,13 +111,13 @@ pub fn start_video_call(peer_public_key_hex: &str) -> Result<String, String> {
     });
     json_error(&p2p_runtime::p2p_call_signal(&cfg), "could not start call")?;
     if let Ok(mut g) = active_call().lock() {
-        *g = Some((call_id.clone(), peer_public_key_hex.to_string()));
+        *g = Some((call_id.clone(), dial_peer.clone()));
     }
     let _ = start_call_media();
     let cfg = json!({
         "action": "start",
         "call_id": call_id,
-        "recipient_public_key_hex": peer_public_key_hex,
+        "recipient_public_key_hex": dial_peer,
         "camera_enabled": true,
     });
     json_error(&p2p_runtime::p2p_call_video(&cfg), "could not start video")?;
@@ -173,20 +180,17 @@ fn start_call_media() -> Result<(), String> {
 
 pub fn end_call() -> Result<(), String> {
     let declining = call_is_incoming_ringing();
-    let (call_id, peer) = active_call()
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .or_else(|| {
-            let status = p2p_runtime::p2p_call_status(&json!({}));
-            let call_id = status.get("call_id").and_then(|v| v.as_str())?.to_string();
-            let peer = status
-                .get("peer_public_key_hex")
-                .and_then(|v| v.as_str())?
-                .to_string();
-            Some((call_id, peer))
-        })
-        .ok_or_else(|| "No active call".to_string())?;
+    let Some((call_id, peer)) = resolve_end_call_target() else {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        crate::incoming_call_notify::dismiss_incoming_call();
+        let _ = p2p_runtime::p2p_force_end_active_call("ui_hangup");
+        if let Ok(mut g) = active_call().lock() {
+            *g = None;
+        }
+        return Err("No active call".into());
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    crate::incoming_call_notify::dismiss_incoming_call();
     let signal = if declining { "reject" } else { "hangup" };
     let reason = if declining { "rejected" } else { "ui_hangup" };
     let cfg = json!({
@@ -337,6 +341,68 @@ fn active_call() -> &'static std::sync::Mutex<Option<(String, String)>> {
     CALL.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+fn accept_incoming_once() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// UI hangup target: host snapshot, native status, then in-memory ring phases (window close path).
+fn resolve_end_call_target() -> Option<(String, String)> {
+    if let Ok(g) = active_call().lock() {
+        if let Some(pair) = g.clone() {
+            return Some(pair);
+        }
+    }
+    let status = p2p_runtime::p2p_call_status(&json!({}));
+    if status.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        let call_id = status
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let peer = status
+            .get("peer_public_key_hex")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        return Some((call_id.to_string(), peer.to_string()));
+    }
+    if let Some((peer, call_id)) = call_state::first_incoming_ringing() {
+        return Some((call_id, peer));
+    }
+    if let Some((peer, call_id)) = call_state::first_outgoing_ringing() {
+        return Some((call_id, peer));
+    }
+    None
+}
+
+#[cfg(test)]
+mod call_end_tests {
+    use super::*;
+
+    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap()
+    }
+
+    const PK: &str = "03b5b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+
+    #[test]
+    fn resolve_end_call_from_ringing_store_without_host_snapshot() {
+        let _lock = lock_tests();
+        call_state::clear_all_calls();
+        if let Ok(mut g) = active_call().lock() {
+            *g = None;
+        }
+        call_state::apply_inbound_ex(PK, "ring-1", crate::call_sig_v1::CallSigKind::Invite, false)
+            .unwrap();
+        let resolved = resolve_end_call_target().expect("ringing call");
+        assert_eq!(resolved.0, "ring-1");
+        assert_eq!(resolved.1, PK);
+        call_state::clear_all_calls();
+    }
+}
+
 /// Play the incoming-call tone once per ring, a ringback while dialing, and stop when the banner clears.
 pub fn note_call_banner(line: &str) {
     #[cfg(target_os = "linux")]
@@ -351,7 +417,9 @@ pub fn note_call_banner(line: &str) {
             0
         };
         let prev = PHASE.swap(next, Ordering::Relaxed);
-        if next != 0 && prev != next {
+        if next == 0 && prev != 0 {
+            crate::incoming_call_notify::dismiss_incoming_call();
+        } else if next != 0 && prev != next {
             if next == 1 {
                 crate::linux_desktop_launch::play_incoming_ring();
             } else {

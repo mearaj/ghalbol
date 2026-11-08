@@ -40,7 +40,9 @@ pub use android_video::flip_camera;
 
 use crate::call_media::{MediaCrypto, MediaFrame};
 use jitter::VideoJitter;
-use packet::{Reassembler, VideoChunk, fragment_frame};
+use packet::{
+    Reassembler, VideoChunk, fragment_frame, MAX_VIDEO_MEDIA_PLAINTEXT, MAX_VIDEO_MEDIA_WIRE,
+};
 
 use std::collections::HashMap;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -50,6 +52,9 @@ struct FrameSlot {
     frame: RawVideoFrame,
     generation: u64,
 }
+
+/// Frames are large; keep at most a handful of call_ids (matches session call media cap).
+const MAX_FRAME_REGISTRY_ENTRIES: usize = 8;
 
 fn remote_registry() -> &'static StdMutex<HashMap<String, FrameSlot>> {
     static REG: OnceLock<StdMutex<HashMap<String, FrameSlot>>> = OnceLock::new();
@@ -61,6 +66,15 @@ fn local_registry() -> &'static StdMutex<HashMap<String, FrameSlot>> {
     REG.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+fn cap_frame_registry(m: &mut HashMap<String, FrameSlot>, call_id: &str) {
+    if m.contains_key(call_id) || m.len() < MAX_FRAME_REGISTRY_ENTRIES {
+        return;
+    }
+    if let Some(old) = m.keys().find(|k| k.as_str() != call_id).cloned() {
+        m.remove(&old);
+    }
+}
+
 /// Publish a freshly decoded **remote** frame for `call_id` (session render loop).
 pub fn publish_decoded_frame(call_id: &str, frame: RawVideoFrame) {
     let first = remote_registry()
@@ -69,6 +83,7 @@ pub fn publish_decoded_frame(call_id: &str, frame: RawVideoFrame) {
         .map(|m| !m.contains_key(call_id))
         .unwrap_or(false);
     if let Ok(mut m) = remote_registry().lock() {
+        cap_frame_registry(&mut m, call_id);
         let next_gen = m.get(call_id).map(|s| s.generation).unwrap_or(0) + 1;
         m.insert(
             call_id.to_string(),
@@ -99,6 +114,7 @@ pub fn publish_local_preview(call_id: &str, frame: RawVideoFrame) {
         .map(|m| !m.contains_key(call_id))
         .unwrap_or(false);
     if let Ok(mut m) = local_registry().lock() {
+        cap_frame_registry(&mut m, call_id);
         let frame_gen = m.get(call_id).map(|s| s.generation).unwrap_or(0) + 1;
         m.insert(
             call_id.to_string(),
@@ -144,16 +160,28 @@ fn pull_frame(
     Some((slot.frame.clone(), slot.generation))
 }
 
+/// Hard ceiling for RGBA conversion / downscale — pathological width×height must not OOM.
+const MAX_I420_CONVERT_DIM: u32 = 4_096;
+const MAX_I420_CONVERT_PIXELS: u64 = 8 * 1024 * 1024;
+
+fn i420_dims_safe(width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= MAX_I420_CONVERT_DIM
+        && height <= MAX_I420_CONVERT_DIM
+        && (u64::from(width) * u64::from(height)) <= MAX_I420_CONVERT_PIXELS
+}
+
 /// Convert a planar I420 frame to packed RGBA8888 natively (BT.601 full-range,
 /// fixed-point). Moving this off the Makepad UI isolate is the main per-frame
 /// latency win — The UI only feeds the result to `decodeImageFromPixels`.
 pub fn i420_to_rgba(frame: &RawVideoFrame) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
-    let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
-    if w == 0 || h == 0 {
-        return out;
+    if !i420_dims_safe(frame.width, frame.height) {
+        return Vec::new();
     }
+    let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
     let y_size = w * h;
     let uv_w = w / 2;
     let uv_h = h / 2;
@@ -188,6 +216,13 @@ pub fn i420_to_rgba(frame: &RawVideoFrame) -> Vec<u8> {
 pub fn i420_downscale_max_edge(frame: &RawVideoFrame, max_edge: u32) -> RawVideoFrame {
     let w = frame.width as usize;
     let h = frame.height as usize;
+    if !i420_dims_safe(frame.width, frame.height) {
+        return RawVideoFrame {
+            width: 0,
+            height: 0,
+            data: Vec::new(),
+        };
+    }
     if max_edge == 0 || frame.width.max(frame.height) <= max_edge {
         return frame.clone();
     }
@@ -319,7 +354,12 @@ impl VideoEngine {
         jitter_max: usize,
     ) -> Self {
         Self {
-            crypto: MediaCrypto::new(frame_key, local_is_a),
+            crypto: MediaCrypto::with_limits(
+                frame_key,
+                local_is_a,
+                MAX_VIDEO_MEDIA_WIRE,
+                MAX_VIDEO_MEDIA_PLAINTEXT,
+            ),
             encoder,
             decoder,
             reasm: Reassembler::new(reassembly_pending),
@@ -346,6 +386,9 @@ impl VideoEngine {
         let chunks = fragment_frame(frame_seq, &encoded, self.chunk_data_bytes);
         let mut wires = Vec::with_capacity(chunks.len());
         for chunk in chunks {
+            if self.tx_chunk_seq == u64::MAX {
+                return Err("video tx counter exhausted".to_string());
+            }
             let media = MediaFrame {
                 seq: self.tx_chunk_seq,
                 ts: frame_seq,
@@ -400,6 +443,11 @@ impl VideoEngine {
     #[cfg(test)]
     pub fn open_failures(&self) -> u64 {
         self.rx_open_failures
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_tx_chunk_seq_for_test(&mut self, v: u64) {
+        self.tx_chunk_seq = v;
     }
 }
 
@@ -476,6 +524,54 @@ mod tests {
     }
 
     #[test]
+    fn i420_to_rgba_cap_frame_stays_under_soft_latency_budget() {
+        let w = CAP_WIDTH as usize;
+        let h = CAP_HEIGHT as usize;
+        let i420_len = w * h + 2 * (w / 2) * (h / 2);
+        let frame = RawVideoFrame {
+            width: CAP_WIDTH,
+            height: CAP_HEIGHT,
+            data: vec![128u8; i420_len],
+        };
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            let rgba = i420_to_rgba(&frame);
+            assert_eq!(rgba.len(), w * h * 4);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "30× {CAP_WIDTH}x{CAP_HEIGHT} I420→RGBA took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn i420_convert_rejects_pathological_dimensions() {
+        let huge = i420_to_rgba(&RawVideoFrame {
+            width: MAX_I420_CONVERT_DIM + 1,
+            height: 64,
+            data: vec![0u8; 4],
+        });
+        assert!(huge.is_empty());
+        let pixels = i420_to_rgba(&RawVideoFrame {
+            width: 4096,
+            height: 4096,
+            data: vec![0u8; 4],
+        });
+        assert!(pixels.is_empty());
+        let down = i420_downscale_max_edge(
+            &RawVideoFrame {
+                width: MAX_I420_CONVERT_DIM + 1,
+                height: 32,
+                data: vec![0u8; 4],
+            },
+            320,
+        );
+        assert_eq!((down.width, down.height), (0, 0));
+        assert!(down.data.is_empty());
+    }
+
+    #[test]
     fn i420_to_rgba_max_edge_downscales_640x480() {
         let (w, h) = (640usize, 480usize);
         let i420_len = w * h + 2 * (w / 2) * (h / 2);
@@ -512,6 +608,34 @@ mod tests {
             8,
             16,
         )
+    }
+
+    #[test]
+    fn production_chunk_bytes_round_trip() {
+        let mut a = VideoEngine::with_params(
+            &key(),
+            true,
+            Box::new(NullVideoCodec),
+            Box::new(NullVideoCodec),
+            16 * 1024,
+            8,
+            16,
+        );
+        let mut b = VideoEngine::with_params(
+            &key(),
+            false,
+            Box::new(NullVideoCodec),
+            Box::new(NullVideoCodec),
+            16 * 1024,
+            8,
+            16,
+        );
+        let f = frame(640, 480, 0xCD, 48 * 1024);
+        for w in a.on_capture(&f, true).unwrap() {
+            b.on_wire(&w).unwrap();
+        }
+        assert_eq!(b.on_render().unwrap().unwrap(), f);
+        assert_eq!(b.open_failures(), 0);
     }
 
     #[test]
@@ -732,6 +856,40 @@ mod tests {
         let wires = a.on_capture(&frame(8, 8, 9, 10), true).unwrap();
         for w in &wires {
             assert!(b.on_wire(w).is_err());
+        }
+    }
+
+    #[test]
+    fn tx_chunk_counter_exhaustion_rejects_capture() {
+        let mut a = engine_a();
+        a.set_tx_chunk_seq_for_test(u64::MAX);
+        assert!(
+            a.on_capture(&frame(8, 8, 1, 10), true)
+                .unwrap_err()
+                .contains("counter exhausted")
+        );
+    }
+
+    #[test]
+    fn frame_registry_evicts_when_capped() {
+        if let Ok(mut m) = remote_registry().lock() {
+            m.clear();
+        }
+        let tiny = RawVideoFrame {
+            width: 2,
+            height: 2,
+            data: vec![0u8; 6],
+        };
+        for i in 0..(MAX_FRAME_REGISTRY_ENTRIES + 5) {
+            publish_decoded_frame(&format!("call-{i}"), tiny.clone());
+        }
+        let len = remote_registry().lock().map(|g| g.len()).unwrap_or(usize::MAX);
+        assert!(
+            len <= MAX_FRAME_REGISTRY_ENTRIES,
+            "remote frame registry grew past cap: {len}"
+        );
+        if let Ok(mut m) = remote_registry().lock() {
+            m.clear();
         }
     }
 }

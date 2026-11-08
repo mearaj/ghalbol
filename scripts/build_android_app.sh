@@ -47,6 +47,11 @@ if [[ -z "${GHALBOL_ENV:-}" ]]; then
     export GHALBOL_ENV=production
   fi
 fi
+ENV_FILE="$ROOT/apps/ghalbol/env/${GHALBOL_ENV}.env"
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Missing Android env file: $ENV_FILE (GHALBOL_ENV=${GHALBOL_ENV})" >&2
+  exit 1
+fi
 
 if ! command -v cargo-makepad >/dev/null 2>&1; then
   cargo install --git https://github.com/makepad/makepad --rev "$REV" cargo-makepad --locked
@@ -109,6 +114,7 @@ if [[ "$MODE" == "run" ]]; then
   fi
 fi
 
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 cargo makepad android --sdk-path="$SDK_DIR" "$MODE" -p ghalbol_app "${EXTRA[@]}"
 if [[ "$MODE" == "build" || "$MODE" == "build-aab" ]]; then
   echo "Finished. Artifacts under target/makepad-android-apk/."

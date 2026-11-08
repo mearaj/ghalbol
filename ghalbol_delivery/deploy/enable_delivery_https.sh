@@ -33,7 +33,11 @@ curl -fsS "http://127.0.0.1:8770/health" >/dev/null \
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "== sudo once for nginx (delivery.ghalbol.com :${HTTPS_PORT}) =="
   # Do not use sudo -E: a cargo/rust env from install in the same shell can break auth.
-  exec sudo /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --as-root
+  exec sudo \
+    DELIVERY_HOST="${HOST}" \
+    DELIVERY_HTTPS_PORT="${HTTPS_PORT}" \
+    DELIVERY_SELF_SIGNED="${DELIVERY_SELF_SIGNED:-0}" \
+    /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --as-root
 fi
 
 if [[ "${1:-}" == "--as-root" ]]; then

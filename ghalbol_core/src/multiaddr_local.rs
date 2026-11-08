@@ -61,7 +61,7 @@ impl Multiaddr {
         let mut out = Vec::new();
         let parts: Vec<&str> = self.0.split('/').filter(|p| !p.is_empty()).collect();
         let mut i = 0;
-        while i < parts.len() {
+        while i < parts.len() && out.len() < MAX_MULTIADDR_PROTOCOLS {
             match parts[i] {
                 "ip4" if i + 1 < parts.len() => {
                     out.push(Protocol::Ip4(parts[i + 1].to_string()));
@@ -95,6 +95,11 @@ impl Multiaddr {
     }
 }
 
+/// Hard cap — pathological dial strings must not allocate multi-MiB Multiaddrs.
+const MAX_MULTIADDR_CHARS: usize = 2_048;
+/// Bound protocol list expansion within the character ceiling (e.g. `/a/b/c/...`).
+const MAX_MULTIADDR_PROTOCOLS: usize = 64;
+
 impl FromStr for Multiaddr {
     type Err = String;
 
@@ -102,6 +107,9 @@ impl FromStr for Multiaddr {
         let t = s.trim();
         if t.is_empty() {
             return Err("empty multiaddr".into());
+        }
+        if t.len() > MAX_MULTIADDR_CHARS {
+            return Err("multiaddr too long".into());
         }
         Ok(Self(t.to_string()))
     }
@@ -128,5 +136,39 @@ mod tests {
         let mut ma: Multiaddr = "/ip4/1.2.3.4/tcp/4001/p2p/abc".parse().unwrap();
         ma.push(Protocol::P2pCircuit);
         assert!(ma.as_str().contains("/p2p-circuit"));
+    }
+
+    #[test]
+    fn parse_rejects_oversized_multiaddr() {
+        let huge = format!("/ip4/1.2.3.4/tcp/4001/p2p/{}", "a".repeat(MAX_MULTIADDR_CHARS));
+        assert!(huge.parse::<Multiaddr>().is_err());
+        assert!("".parse::<Multiaddr>().is_err());
+    }
+
+    #[test]
+    fn protocols_list_is_hard_capped() {
+        let mut s = String::from("/ip4/1.2.3.4/tcp/1");
+        for i in 0..(MAX_MULTIADDR_PROTOCOLS + 40) {
+            s.push_str(&format!("/x{i}"));
+        }
+        assert!(s.len() <= MAX_MULTIADDR_CHARS);
+        let ma: Multiaddr = s.parse().unwrap();
+        assert!(ma.protocols().len() <= MAX_MULTIADDR_PROTOCOLS);
+    }
+
+    #[test]
+    fn parse_near_cap_stays_under_soft_latency_budget() {
+        let s = format!("/ip4/203.0.113.9/tcp/4001/p2p/{}", "ab".repeat(900));
+        assert!(s.len() < MAX_MULTIADDR_CHARS);
+        let start = std::time::Instant::now();
+        for _ in 0..2_000 {
+            let ma: Multiaddr = s.parse().unwrap();
+            let _ = ma.protocols().len();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "2000× near-cap multiaddr parse took {elapsed:?}"
+        );
     }
 }

@@ -73,7 +73,9 @@ Implementation: `should_throttle_register`, `spawn_register_presence_inner`, `co
 | Client `POST /v1/register` | **Public routable IPv4** `tcp`/`quic` endpoints (peer inbound DM listen), capabilities, optional `ipv4`/`ipv6` hints | Heartbeat TTL expiry (~90 s without heartbeat) |
 | **Rejected at POST** | RFC1918 LAN, loopback, CGNAT-only hosts posted as “public”, empty endpoint list | — |
 
-Server validation mirrors the client: `tcp` requires a globally routable IPv4 host ([`routes.rs`](../ghalbol_coord/src/routes.rs) `validate_endpoints`). Stored rows are filtered again in [`presence.rs`](../ghalbol_coord/src/presence.rs).
+Server validation mirrors the client: `tcp` and `quic` require a globally routable IPv4 host ([`routes.rs`](../ghalbol_coord/src/routes.rs) `validate_endpoints`). Stored rows are filtered again in [`presence.rs`](../ghalbol_coord/src/presence.rs).
+
+**Heartbeat does not resurrect an expired row.** `POST /v1/heartbeat` updates `last_heartbeat_unix_ms` only while that row is still inside the TTL and still has a dialable endpoint. After expiry the response is **404**; the client signs `POST /v1/register` again. A slower in-flight register cannot move the stored heartbeat backwards (`MAX` of the stored stamp and the writer’s stamp). Purge deletes rows whose heartbeat is **strictly older** than the cutoff. Heartbeats are limited to 8 per 20 seconds per identity (**429**).
 
 ---
 
@@ -99,8 +101,16 @@ Bridge **`connect_url`** in JSON responses uses `GHALBOL_COORD_PUBLIC_URL` / `GH
 | Max relayed bytes | unlimited (`0`) | `GHALBOL_BRIDGE_MAX_BYTES` |
 | Max concurrent bridges per identity | 4 | `GHALBOL_BRIDGE_MAX_PER_PEER` |
 | Idle timeout | 120 s | `GHALBOL_BRIDGE_IDLE_SECS` |
+| Unpaired pre-pair buffer | 256 KiB / 64 frames | fixed |
+| WebSocket message | 8 MiB | fixed |
+| Pending poll | 40 / 10 s per identity | fixed |
+| Pending poll response | 32 items per request | fixed |
+| Global unpaired pending | 4096 | fixed |
+| HTTP JSON body | 64 KiB | fixed |
+| In-flight HTTP | 512 | fixed |
+| Stored peers (SQLite) | 50 000 distinct rows | fixed |
 
-A new `POST /v1/bridge/request` for the same caller→callee (or same `call_id`) **replaces** stale unpaired entries so WSS retries are not blocked.
+The per-identity cap counts each bridge **once**, whether it is still pending or already active, and it applies to both caller and callee. Check-and-insert is one critical section. A new `POST /v1/bridge/request` for the same caller→callee (or same `call_id`) **replaces** an unpaired pending entry and any half-open socket so WSS retries are not blocked. When that pending TTL passes, the half-open socket is closed. A second connect for a role that is already attached is rejected. SIGINT/SIGTERM stops accepting and closes bridge sockets; a stuck connection is aborted after about 8 seconds.
 
 ---
 
@@ -193,7 +203,9 @@ Routes: [`ghalbol_coord/src/routes.rs`](../ghalbol_coord/src/routes.rs).
 
 Same string in JSON (`public_key_hex`) and in `/v1/peers/{…}` paths. **Bare hex** (no `:`) means implicit **`secp256k1`**; other algorithms use `algorithm:hex` (e.g. `ed25519:…` → path `ed25519%3A…`). Server: `normalize_identity_wire()` in [`identity.rs`](../ghalbol_coord/src/identity.rs).
 
-**Register signature:** canonical message `ghalbol:register:v1\n<nonce_hex>\n<identity_wire>` (wire lowercased), signed with the device identity key — secp256k1 ECDSA DER, ed25519, or ecdsa-p256 DER per algorithm ([`auth.rs`](../ghalbol_coord/src/auth.rs)).
+**Register signature:** canonical message `ghalbol:register:v1\n<nonce_hex>\n<identity_wire>` (wire lowercased), signed with the device identity key — secp256k1 ECDSA DER, ed25519, or ecdsa-p256 DER per algorithm ([`auth.rs`](../ghalbol_coord/src/auth.rs)). Signing domains are not renamed.
+
+Register and bridge challenges are stored separately. Repeating a challenge request returns the current unexpired nonce, so a second request does not invalidate a signature already in flight. A wrong nonce or a bad signature does not consume the challenge.
 
 **Bridge request signature:** domain `ghalbol:bridge:request:v1` (see challenge response `message_domain`).
 

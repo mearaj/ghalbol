@@ -16,10 +16,11 @@ source "$ROOT/scripts/stage-desktop-package.sh"
 export GHALBOL_ROOT="$ROOT"
 load_ghalbol_env production
 makepad_enable_package_dir
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 
 OUT="$ROOT/dist/windows"
-rm -rf "$OUT"
-mkdir -p "$OUT"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ghalbol-windows.XXXXXX")"
+trap '[[ -n "${STAGE:-}" ]] && rm -rf "$STAGE"' EXIT
 TARGET="$(windows_default_target)"
 
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
@@ -50,13 +51,14 @@ if [[ -z "$EXE" ]]; then
   exit 1
 fi
 
-cp -f "$EXE" "$OUT/ghalbol-app.exe"
-makepad_copy_desktop_resources "$OUT"
-stage_desktop_package "$OUT" windows
+WIN_EXE="$(desktop_bin_name).exe"
+cp -f "$EXE" "$STAGE/$WIN_EXE"
+makepad_copy_desktop_resources "$STAGE"
+stage_desktop_package "$STAGE" windows
 
-SIZE="$(du -h "$OUT/ghalbol-app.exe" | awk '{print $1}')"
+SIZE="$(du -h "$STAGE/$WIN_EXE" | awk '{print $1}')"
 
-cat >"$OUT/README.txt" <<EOF
+cat >"$STAGE/README.txt" <<EOF
 GhalBol Chat Windows (production)
 =================================
 App id:   ${GHALBOL_APP_ID}
@@ -69,11 +71,17 @@ Install (recommended):
 → %LOCALAPPDATA%\\Programs\\Ghal Bol\\
 
 Portable run (no install):
-  .\\ghalbol-app.exe
+  .\\${WIN_EXE}
 
 Uninstall:
   Start Menu → Uninstall Ghal Bol
   or double-click Uninstall.bat
 EOF
+
+rm -rf "$OUT"
+mkdir -p "$(dirname "$OUT")"
+mv "$STAGE" "$OUT"
+STAGE=""
+trap - EXIT
 
 echo "Windows production package: $OUT/"

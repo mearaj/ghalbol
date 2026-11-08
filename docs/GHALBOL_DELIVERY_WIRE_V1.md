@@ -42,6 +42,8 @@ Sign with the device identity key (algorithm-specific, same rules as `POST /v1/r
 
 After `session.ready`, the connection is bound to `identity_wire`. All mailbox operations on this socket are scoped to that identity.
 
+The session challenge is bound to the WebSocket that sent `session.open`. A signature for that nonce is accepted only on that connection. Parallel connections for the same identity each have their own challenge and `op_nonce_hex`, so one upload cannot invalidate another.
+
 ### Per-operation signatures (upload / extend)
 
 Sensitive mutating ops include an inline proof even on an authenticated socket:
@@ -51,7 +53,7 @@ Sensitive mutating ops include an inline proof even on an authenticated socket:
 | `ghalbol:delivery:upload:v1\n<nonce_hex>\n<message_id>\n<recipient_wire_lower>` | `message.upload` |
 | `ghalbol:delivery:extend:v1\n<nonce_hex>\n<message_id>` | `mailbox.ttl.extend` |
 
-Server issues a fresh `op_nonce_hex` in `session.ready` and rotates it after each successful signed op (or TTL 60s).
+Server issues a fresh `op_nonce_hex` in `session.ready` and rotates it after each **successful** signed op (or TTL 60s). A failed upload or extend leaves the same `op_nonce_hex` valid so the client can retry. The nonce is per connection.
 
 ## Policy and quota (server → client)
 
@@ -147,7 +149,7 @@ Recipient acknowledges delivery (deletes ciphertext, retains metadata).
 }
 ```
 
-Scoped: `recipient_wire == session identity` and row addressed to recipient.
+Scoped: `recipient_wire == session identity` and the row matches `(recipient_wire, message_id, sender_wire)` (two senders may reuse the same `message_id` for one recipient). Wrong `sender_wire` → `not_found` (no row leak).
 
 Response: `inbox.ack.ok`.
 
@@ -241,6 +243,8 @@ Client patches outbound transcript `delivery=read` (implies `delivered`; monoton
 
 Response: `inbox.read.ok`.
 
+Replayed `inbox.read` when the row is already `read` returns `inbox.read.ok` and does not push another `message.read_to_sender`.
+
 ## Outbound transcript states (delivery mode)
 
 Canonical sender-side `delivery` values when `GHALBOL_DELIVERY_URL` is set:
@@ -301,11 +305,20 @@ Response to `mailbox.outbox.list`:
 }
 ```
 
-`state`: `queued` | `delivered` | `expired` (metadata rows may remain after blob delete).
+`state`: `queued` | `delivered` | `read` | `expired` (metadata rows may remain after blob delete).
 
 ### `quota.warning`
 
-Proactive notice when `used_bytes / allocated_bytes >= 0.9`.
+Proactive notice to the sender when `used_bytes / allocated_bytes >= 0.9` (after upload, and on `session.ready` if already over the line).
+
+```json
+{
+  "type": "quota.warning",
+  "allocated_bytes": 524288000,
+  "used_bytes": 480000000,
+  "pending_count": 12
+}
+```
 
 ### `error`
 
@@ -321,8 +334,9 @@ Proactive notice when `used_bytes / allocated_bytes >= 0.9`.
 | Code | Meaning |
 |------|---------|
 | `unauthorized` | Auth failed |
+| `rate_limited` | Socket exceeded the per-second frame budget |
 | `forbidden` | Cross-peer access |
-| `quota_exceeded` | Upload would exceed allocation |
+| `quota_exceeded` | Upload would exceed byte allocation or per-peer pending message count |
 | `invalid_envelope` | Parse/sig/cipher failure |
 | `not_found` | Unknown message_id |
 | `ttl_invalid` | Extend/upload TTL out of bounds |
@@ -337,6 +351,7 @@ Proactive notice when `used_bytes / allocated_bytes >= 0.9`.
 | `message.upload` | `envelope.sender_wire == session identity` |
 | `quota.status` | Own quota row only |
 | `inbox.ack` | `envelope.recipient_wire == session identity` |
+| `inbox.read` | Same scope as `inbox.ack`; replay after `read` does not re-notify |
 
 **Never** return another peer's quota, mailbox rows, or ciphertext to the wrong session.
 
@@ -347,11 +362,16 @@ Proactive notice when `used_bytes / allocated_bytes >= 0.9`.
   "ok": true,
   "service": "ghalbol_delivery",
   "instance_id": "home-pc",
-  "schema_version": 1,
+  "schema_version": 2,
   "connected_peers": 3,
+  "live_sockets": 4,
   "pending_messages": 12,
   "pending_bytes": 45678,
-  "oldest_pending_age_secs": 42
+  "oldest_pending_age_secs": 42,
+  "rejected_frames": 0,
+  "auth_failures": 0,
+  "uploads_total": 10,
+  "messages_expired": 1
 }
 ```
 
@@ -371,5 +391,11 @@ Structured fields only: `identity_wire`, `message_id`, `bytes`, `state`, `reject
 | `GHALBOL_DELIVERY_MAX_TTL_SECS` | `2592000` (30d) |
 | `GHALBOL_DELIVERY_DEFAULT_TTL_SECS` | `604800` (7d) |
 | `GHALBOL_DELIVERY_QUOTA_BYTES_PER_PEER` | `524288000` (500 MB) |
+| `GHALBOL_DELIVERY_MAX_WS_MESSAGE_BYTES` | `12582912` (12 MiB; hard cap 32 MiB) |
+| `GHALBOL_DELIVERY_MAX_CONNECTIONS` | `4096` |
+| `GHALBOL_DELIVERY_MAX_FRAMES_PER_SEC` | `200` |
+| `GHALBOL_DELIVERY_AUTH_TIMEOUT_SECS` | `30` |
+
+WebSocket text frames larger than `GHALBOL_DELIVERY_MAX_WS_MESSAGE_BYTES` are rejected (and the socket is closed). Envelope ciphertext is capped at 4 MiB (8 MiB hex), matching the client. Unauthenticated sockets are closed after `GHALBOL_DELIVERY_AUTH_TIMEOUT_SECS`. Frames above `GHALBOL_DELIVERY_MAX_FRAMES_PER_SEC` get a `rate_limited` error and are dropped for that second; the socket stays open.
 
 Client: `GHALBOL_DELIVERY_URL` (`ws://` or `wss://` base, path `/v1/ws`).

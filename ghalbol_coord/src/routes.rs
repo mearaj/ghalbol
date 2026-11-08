@@ -1,29 +1,40 @@
 use crate::AppState;
-use crate::auth::{ChallengeStore, verify_registration_signature};
-use crate::bridge::{
-    bridge_challenge, get_bridge_pending, post_bridge_request, ws_bridge_connect,
+use crate::auth::{
+    ChallengePurpose, ChallengeStore, decode_nonce_hex, decode_signature_hex,
+    verify_registration_signature,
 };
-use crate::identity::{normalize_identity_wire, percent_decode_uri_component};
+use crate::bridge::{bridge_challenge, get_bridge_pending, post_bridge_request, ws_bridge_connect};
 use crate::error::{ApiResult, ServerError};
-use crate::presence::{PeerEndpoint, PeerRecord};
+use crate::identity::{check_identity_param_len, normalize_identity_wire, percent_decode_uri_component};
+use crate::json_extract::ApiJson;
+use crate::limits::{KeyedRateLimit, bridge_poll_limiter, heartbeat_limiter};
+use crate::presence::{PeerEndpoint, PeerRecord, is_public_routable_ipv4};
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use hex::FromHex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
-/// Challenge store (ephemeral; not persisted).
+fn spawn_join_err(_: tokio::task::JoinError) -> ServerError {
+    ServerError::Internal("internal error".into())
+}
+
+/// Challenge store (ephemeral; not persisted) plus per-identity request budgets.
 pub struct RouteState {
     pub app: Arc<AppState>,
     pub challenges: Mutex<ChallengeStore>,
+    pub heartbeat_limits: Mutex<KeyedRateLimit>,
+    pub bridge_poll_limits: Mutex<KeyedRateLimit>,
 }
 
 pub fn router(app: Arc<AppState>) -> Router {
     let state = Arc::new(RouteState {
         app: Arc::clone(&app),
         challenges: Mutex::new(ChallengeStore::default()),
+        heartbeat_limits: Mutex::new(heartbeat_limiter()),
+        bridge_poll_limits: Mutex::new(bridge_poll_limiter()),
     });
 
     Router::new()
@@ -78,16 +89,26 @@ struct ChallengeResponse {
 
 async fn register_challenge(
     State(state): State<Arc<RouteState>>,
-    Json(req): Json<ChallengeRequest>,
+    ApiJson(req): ApiJson<ChallengeRequest>,
 ) -> ApiResult<Json<ChallengeResponse>> {
+    check_identity_param_len(req.public_key_hex.trim())?;
+    let pk = normalize_identity_wire(&req.public_key_hex)?;
     let mut ch = state.challenges.lock().await;
     ch.purge_expired();
-    let pending = ch.issue(&req.public_key_hex, state.app.config.challenge_ttl)?;
-    let pk = normalize_identity_wire(&req.public_key_hex)?;
+    let pending = ch.issue(
+        ChallengePurpose::Register,
+        &pk,
+        state.app.config.challenge_ttl,
+    )?;
+    let expires_in_secs = pending
+        .expires_at
+        .checked_duration_since(Instant::now())
+        .map(|d| d.as_secs().max(1))
+        .unwrap_or(1);
     Ok(Json(ChallengeResponse {
         public_key_hex: pk,
         nonce_hex: hex::encode(pending.nonce),
-        expires_in_secs: state.app.config.challenge_ttl.as_secs(),
+        expires_in_secs,
         message_domain: "ghalbol:register:v1",
     }))
 }
@@ -112,34 +133,37 @@ struct RegisterResponse {
 
 async fn register(
     State(state): State<Arc<RouteState>>,
-    Json(req): Json<RegisterRequest>,
+    ApiJson(req): ApiJson<RegisterRequest>,
 ) -> ApiResult<Json<RegisterResponse>> {
+    check_identity_param_len(req.public_key_hex.trim())?;
     let pk = normalize_identity_wire(&req.public_key_hex)?;
-    let nonce: [u8; 32] = decode_fixed_32(&req.nonce_hex, "nonce_hex")?;
-    let sig = hex::decode(req.signature_hex.trim())
-        .map_err(|e| ServerError::BadRequest(format!("signature_hex: {e}")))?;
+    let caps = clean_capabilities(req.transport_capabilities)?;
+    let ipv4 = clean_ip_hint(req.ipv4, false)?;
+    let ipv6 = clean_ip_hint(req.ipv6, true)?;
+    validate_endpoints(&req.endpoints)?;
+    let endpoints = req.endpoints;
+    let nonce = decode_nonce_hex(&req.nonce_hex)?;
+    let sig = decode_signature_hex(&req.signature_hex)?;
 
     {
         let mut ch = state.challenges.lock().await;
-        ch.take_valid(&pk, &nonce)?;
+        // Peek first so a bad signature does not burn the victim's challenge.
+        ch.peek_valid(ChallengePurpose::Register, &pk, &nonce)?;
         verify_registration_signature(&pk, &nonce, &sig)?;
     }
 
-    let caps = if req.transport_capabilities.is_empty() {
-        vec!["tcp".into(), "sync-v1".into()]
-    } else {
-        req.transport_capabilities
-    };
-
-    validate_endpoints(&req.endpoints)?;
-    let endpoints = req.endpoints;
-
     let store = Arc::clone(&state.app.presence);
+    let pk_for_store = pk.clone();
     let peer = tokio::task::spawn_blocking(move || {
-        store.merge_client_register(pk, endpoints, caps, req.ipv6, req.ipv4)
+        store.merge_client_register(pk_for_store, endpoints, caps, ipv6, ipv4)
     })
     .await
-    .map_err(|e| ServerError::Internal(format!("task join: {e}")))??;
+    .map_err(spawn_join_err)??;
+
+    {
+        let mut ch = state.challenges.lock().await;
+        ch.take_valid(ChallengePurpose::Register, &pk, &nonce)?;
+    }
 
     tracing::info!(
         public_key = %peer.public_key_hex,
@@ -162,13 +186,22 @@ struct HeartbeatResponse {
 
 async fn heartbeat(
     State(state): State<Arc<RouteState>>,
-    Json(req): Json<HeartbeatRequest>,
+    ApiJson(req): ApiJson<HeartbeatRequest>,
 ) -> ApiResult<Json<HeartbeatResponse>> {
+    let wire = req.public_key_hex.trim();
+    check_identity_param_len(wire)?;
+    {
+        let mut limits = state.heartbeat_limits.lock().await;
+        if !limits.allow(wire) {
+            return Err(ServerError::RateLimited("heartbeat rate limit".into()));
+        }
+    }
+    let pk = normalize_identity_wire(wire)?;
     let store = Arc::clone(&state.app.presence);
-    let pk = normalize_identity_wire(&req.public_key_hex)?;
-    let peer = tokio::task::spawn_blocking(move || store.heartbeat(&pk))
+    let ttl = state.app.config.presence_ttl;
+    let peer = tokio::task::spawn_blocking(move || store.heartbeat(&pk, ttl))
         .await
-        .map_err(|e| ServerError::Internal(format!("task join: {e}")))??;
+        .map_err(spawn_join_err)??;
     tracing::debug!(public_key = %peer.public_key_hex, "heartbeat");
     Ok(Json(HeartbeatResponse { ok: true, peer }))
 }
@@ -177,13 +210,18 @@ async fn get_peer(
     State(state): State<Arc<RouteState>>,
     Path(identity_wire): Path<String>,
 ) -> ApiResult<Json<PeerRecord>> {
+    check_identity_param_len(&identity_wire)?;
     let store = Arc::clone(&state.app.presence);
     let ttl = state.app.config.presence_ttl;
     let decoded = percent_decode_uri_component(&identity_wire);
+    check_identity_param_len(&decoded)?;
+    if decoded.trim().is_empty() {
+        return Err(ServerError::BadRequest("identity empty".into()));
+    }
     let pk = normalize_identity_wire(&decoded)?;
     let peer = tokio::task::spawn_blocking(move || store.get(&pk, ttl))
         .await
-        .map_err(|e| ServerError::Internal(format!("task join: {e}")))??;
+        .map_err(spawn_join_err)??;
     Ok(Json(peer))
 }
 
@@ -197,24 +235,59 @@ async fn list_peers(State(state): State<Arc<RouteState>>) -> ApiResult<Json<Peer
     let ttl = state.app.config.presence_ttl;
     let peers = tokio::task::spawn_blocking(move || store.list_online(ttl))
         .await
-        .map_err(|e| ServerError::Internal(format!("task join: {e}")))??;
+        .map_err(spawn_join_err)??;
     Ok(Json(PeerListResponse { peers }))
 }
 
-fn is_public_routable_tcp_host(host: &str) -> bool {
-    let host = host.trim();
-    if host.is_empty() || host.contains(':') {
-        return false;
-    }
-    let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
-        return false;
+fn clean_capabilities(caps: Vec<String>) -> ApiResult<Vec<String>> {
+    let caps = if caps.is_empty() {
+        vec!["tcp".into(), "sync-v1".into()]
+    } else {
+        caps
     };
-    !ip.is_private()
-        && !ip.is_loopback()
-        && !ip.is_unspecified()
-        && !ip.is_link_local()
-        && !(ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 0x40)
+    if caps.len() > 16 {
+        return Err(ServerError::BadRequest(
+            "too many transport capabilities".into(),
+        ));
+    }
+    for cap in &caps {
+        if cap.is_empty()
+            || cap.len() > 64
+            || cap.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        {
+            return Err(ServerError::BadRequest(
+                "invalid transport capability".into(),
+            ));
+        }
+    }
+    Ok(caps)
 }
+
+fn clean_ip_hint(value: Option<String>, v6: bool) -> ApiResult<Option<String>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 64 {
+        return Err(ServerError::BadRequest("ip hint too long".into()));
+    }
+    if v6 {
+        let ip: std::net::Ipv6Addr = trimmed
+            .parse()
+            .map_err(|_| ServerError::BadRequest("ipv6 hint invalid".into()))?;
+        Ok(Some(ip.to_string()))
+    } else {
+        let ip: std::net::Ipv4Addr = trimmed
+            .parse()
+            .map_err(|_| ServerError::BadRequest("ipv4 hint invalid".into()))?;
+        Ok(Some(ip.to_string()))
+    }
+}
+
+const MAX_ENDPOINT_SCHEME_LEN: usize = 8;
 
 fn validate_endpoints(endpoints: &[PeerEndpoint]) -> ApiResult<()> {
     if endpoints.is_empty() {
@@ -224,42 +297,240 @@ fn validate_endpoints(endpoints: &[PeerEndpoint]) -> ApiResult<()> {
         return Err(ServerError::BadRequest("too many endpoints".into()));
     }
     for ep in endpoints {
-        match ep.scheme.as_str() {
+        let scheme = ep.scheme.trim();
+        if scheme.is_empty() || scheme.len() > MAX_ENDPOINT_SCHEME_LEN {
+            return Err(ServerError::BadRequest("invalid endpoint scheme".into()));
+        }
+        match scheme {
             "tcp" | "quic" => {
-                if ep.host.trim().is_empty() {
+                if ep.host.trim().is_empty() || ep.host.len() > 15 {
                     return Err(ServerError::BadRequest("endpoint host empty".into()));
                 }
                 if ep.port == 0 {
                     return Err(ServerError::BadRequest("endpoint port required".into()));
                 }
-                if ep.scheme == "tcp" && !is_public_routable_tcp_host(&ep.host) {
+                if !is_public_routable_ipv4(&ep.host) {
                     return Err(ServerError::BadRequest(
-                        "coord register accepts public routable IPv4 TCP only — \
+                        "coord register accepts public routable IPv4 TCP or QUIC only — \
                          LAN uses mDNS; WAN text uses delivery server"
                             .into(),
                     ));
                 }
             }
-            other => {
-                return Err(ServerError::BadRequest(format!(
-                    "unsupported endpoint scheme: {other}"
-                )));
+            _ => {
+                return Err(ServerError::BadRequest("unsupported endpoint scheme".into()));
             }
         }
     }
     Ok(())
 }
 
-fn decode_fixed_32(hex_s: &str, field: &str) -> ApiResult<[u8; 32]> {
-    let bytes = Vec::from_hex(hex_s.trim())
-        .map_err(|e| ServerError::BadRequest(format!("{field}: {e}")))?;
-    if bytes.len() != 32 {
-        return Err(ServerError::BadRequest(format!(
-            "{field}: expected 32 bytes, got {}",
-            bytes.len()
-        )));
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use crate::auth::{ChallengePurpose, ChallengeStore, registration_message_digest};
+    use crate::presence::{PeerEndpoint, PresenceStore};
+    use secp256k1::{Secp256k1, SecretKey};
+
+    fn secp_pk(seed: u8) -> (SecretKey, String) {
+        let sk = SecretKey::from_byte_array([seed; 32]).expect("key");
+        let secp = Secp256k1::new();
+        let wire = hex::encode(sk.public_key(&secp).serialize());
+        (sk, wire)
     }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+
+    fn sample_ep(host: &str) -> Vec<PeerEndpoint> {
+        vec![PeerEndpoint {
+            scheme: "tcp".into(),
+            host: host.into(),
+            port: 41_234,
+        }]
+    }
+
+    #[test]
+    fn presence_capacity_rejection_does_not_consume_register_challenge() {
+        let store = PresenceStore::open_in_memory().expect("db");
+        let ep = sample_ep("203.0.113.60");
+        for seed in 0u8..4 {
+            let pk = secp_pk(seed + 60).1;
+            store
+                .merge_client_register(pk, ep.clone(), vec!["tcp".into()], None, None)
+                .expect("under cap");
+        }
+        let (sk, pk) = secp_pk(99);
+        let mut ch = ChallengeStore::default();
+        let challenge = ch
+            .issue(
+                ChallengePurpose::Register,
+                &pk,
+                std::time::Duration::from_secs(120),
+            )
+            .unwrap();
+        let secp = Secp256k1::new();
+        let sig = secp.sign_ecdsa(
+            registration_message_digest(&challenge.nonce, &pk),
+            &sk,
+        );
+        ch.peek_valid(ChallengePurpose::Register, &pk, &challenge.nonce)
+            .unwrap();
+        verify_registration_signature(&pk, &challenge.nonce, &sig.serialize_der()).unwrap();
+        let capped = store.merge_client_register(
+            pk.clone(),
+            sample_ep("203.0.113.99"),
+            vec!["tcp".into()],
+            None,
+            None,
+        );
+        assert!(matches!(capped, Err(ServerError::RateLimited(_))));
+        ch.take_valid(ChallengePurpose::Register, &pk, &challenge.nonce)
+            .expect("challenge must survive presence capacity rejection");
+    }
 }
+
+#[cfg(test)]
+mod route_http_tests {
+    use super::*;
+    use crate::auth::registration_message_digest;
+    use crate::identity::MAX_IDENTITY_PARAM_LEN;
+    use crate::{AppState, ServerConfig};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use secp256k1::{Secp256k1, SecretKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn short_ttl_app() -> axum::Router {
+        let mut config = ServerConfig::default();
+        config.challenge_ttl = Duration::from_millis(1);
+        let state = Arc::new(AppState::open_in_memory(config).expect("db"));
+        router(state)
+    }
+
+    async fn post_json(
+        app: &axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+        content_type: bool,
+    ) -> axum::response::Response {
+        let mut req = Request::builder().method("POST").uri(uri);
+        if content_type {
+            req = req.header("content-type", "application/json");
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn error_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["error"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn register_challenge_requires_json_content_type() {
+        let app = test_router();
+        let (_sk, pk) = secp_pair(41);
+        let resp = post_json(
+            &app,
+            "/v1/register/challenge",
+            serde_json::json!({ "public_key_hex": pk }),
+            false,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(error_text(resp).await.contains("content-type"));
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_valid_register_body_returns_unauthorized() {
+        let app = short_ttl_app();
+        let (sk, pk_hex) = secp_pair(42);
+        let secp = Secp256k1::new();
+
+        let ch = post_json(
+            &app,
+            "/v1/register/challenge",
+            serde_json::json!({ "public_key_hex": pk_hex }),
+            true,
+        )
+        .await;
+        assert_eq!(ch.status(), StatusCode::OK);
+        let ch_body = axum::body::to_bytes(ch.into_body(), 4096).await.unwrap();
+        let ch_json: serde_json::Value = serde_json::from_slice(&ch_body).unwrap();
+        let nonce_hex = ch_json["nonce_hex"].as_str().unwrap();
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hex::decode(nonce_hex).unwrap());
+        let sig = secp.sign_ecdsa(registration_message_digest(&nonce, &pk_hex), &sk);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let reg = post_json(
+            &app,
+            "/v1/register",
+            serde_json::json!({
+                "public_key_hex": pk_hex,
+                "nonce_hex": nonce_hex,
+                "signature_hex": hex::encode(sig.serialize_der()),
+                "endpoints": [{ "scheme": "tcp", "host": "203.0.113.42", "port": 41234 }]
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(reg.status(), StatusCode::UNAUTHORIZED);
+        let err = error_text(reg).await;
+        assert!(err.contains("expired"));
+        assert!(!err.to_lowercase().contains("join"));
+    }
+
+    #[tokio::test]
+    async fn lookup_empty_identity_is_bad_request() {
+        let app = test_router();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/peers/%20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(error_text(resp).await.contains("identity empty"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_oversized_identity_wire_rejected_before_store() {
+        let app = test_router();
+        let huge = "ab".repeat(MAX_IDENTITY_PARAM_LEN + 1);
+        let resp = post_json(
+            &app,
+            "/v1/heartbeat",
+            serde_json::json!({ "public_key_hex": huge }),
+            true,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = error_text(resp).await;
+        assert!(err.contains("too long"));
+    }
+
+    fn test_router() -> axum::Router {
+        let state = Arc::new(AppState::open_in_memory(ServerConfig::default()).expect("db"));
+        router(state)
+    }
+
+    fn secp_pair(seed: u8) -> (SecretKey, String) {
+        let sk = SecretKey::from_byte_array([seed; 32]).expect("key");
+        let secp = Secp256k1::new();
+        let pk = hex::encode(sk.public_key(&secp).serialize());
+        (sk, pk)
+    }
+}
+

@@ -281,10 +281,23 @@ fn scan_camera_blocking() -> Result<String, String> {
     Err("Scan stopped".into())
 }
 
+/// Same order of magnitude as Android's picker gate — pathological multi‑hundred‑MP
+/// pictures must not hang the invite sheet on decode.
+const MAX_QR_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_QR_DECODE_PIXELS: u64 = 16 * 1024 * 1024;
+
 pub fn decode_qr_file(path: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("could not open picture: {e}"))?;
+    if meta.len() > MAX_QR_FILE_BYTES {
+        return Err("picture is too large to scan".into());
+    }
     let img = image::open(path)
         .map_err(|e| format!("could not open picture: {e}"))?
         .to_luma8();
+    let pixels = u64::from(img.width()).saturating_mul(u64::from(img.height()));
+    if pixels > MAX_QR_DECODE_PIXELS {
+        return Err("picture resolution is too high to scan".into());
+    }
     crate::qr_luma::decode_luma(img.width() as usize, img.height() as usize, img.as_raw())
 }
 

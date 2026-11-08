@@ -9,12 +9,19 @@ use std::path::PathBuf;
 use std::process::{Command, exit};
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("tools/ghalbol-windows-dev → workspace root");
+    let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR").map(PathBuf::from) else {
+        eprintln!("CARGO_MANIFEST_DIR unset");
+        exit(1);
+    };
+    let Some(root) = manifest_dir.parent().and_then(|p| p.parent()) else {
+        eprintln!("tools/ghalbol-windows-dev: cannot resolve workspace root");
+        exit(1);
+    };
     let script = root.join("apps/ghalbol/scripts/windows-dev.sh");
+    if !script.is_file() {
+        eprintln!("missing {}", script.display());
+        exit(1);
+    }
     let mut cmd = Command::new("bash");
     cmd.arg(&script);
     cmd.args(env::args().skip(1));

@@ -37,23 +37,41 @@ pub(crate) async fn dispatch_mux_payload(channel: u32, payload: &[u8], ctx: &Wir
     }
 }
 
+/// Length-prefixed DM mux frame on channel 0 (`msg_v1` body cap, exact size — no trailing junk).
+pub(crate) fn channel0_dm_frame_body_ok(frame: &[u8]) -> bool {
+    if frame.len() < 4 {
+        return false;
+    }
+    let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    len <= crate::msg_v1::MAX_MSG_FRAME_BODY_BYTES && frame.len() == 4 + len
+}
+
+/// Max JSON on the attachment mux channel (small control messages only).
+const MAX_ATTACH_MUX_JSON_BYTES: usize = 64 * 1024;
+
 async fn handle_channel0_frame(payload: &[u8], ctx: &WireDispatchCtx) {
-    let frame = payload.to_vec();
-    let share = match frame_wire_share(&frame) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if share == CALL_SHARE {
-        handle_inbound_call_frame(&frame, ctx).await;
+    if call_signal_frame_body_ok(payload) {
+        if let Ok(share) = frame_wire_share(payload) {
+            if share == CALL_SHARE {
+                handle_inbound_call_frame(payload, ctx).await;
+                return;
+            }
+        }
+    }
+    if !channel0_dm_frame_body_ok(payload) {
+        native_log::warn(
+            "connect",
+            format!("drop malformed channel0 frame from {}", ctx.peer),
+        );
         return;
     }
-    if share != MSG_SHARE {
-        return;
-    }
-    let env = match frame_bytes_to_envelope(&frame) {
+    let env = match frame_bytes_to_envelope(payload) {
         Ok(e) => e,
         Err(_) => return,
     };
+    if env.wire_share != MSG_SHARE {
+        return;
+    }
     let identity = ctx.session.identity.clone();
     let peer_transport_pk = ctx
         .session
@@ -471,6 +489,17 @@ async fn handle_channel0_frame(payload: &[u8], ctx: &WireDispatchCtx) {
 }
 
 async fn handle_attachment_payload(payload: &[u8], ctx: &WireDispatchCtx) {
+    if payload.len() > MAX_ATTACH_MUX_JSON_BYTES {
+        native_log::warn(
+            "attach",
+            format!(
+                "drop oversized attachment mux json from {} ({} bytes)",
+                ctx.peer,
+                payload.len()
+            ),
+        );
+        return;
+    }
     let action = serde_json::from_slice::<serde_json::Value>(payload)
         .ok()
         .and_then(|v| v.get("action").and_then(|x| x.as_str()).map(str::to_string))
@@ -534,10 +563,38 @@ async fn handle_attachment_payload(payload: &[u8], ctx: &WireDispatchCtx) {
     }
 }
 
+pub(crate) fn call_signal_frame_body_ok(frame: &[u8]) -> bool {
+    if frame.len() < 4 {
+        return false;
+    }
+    let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    len <= crate::call_sig_v1::MAX_CALL_SIGNAL_FRAME_BODY_BYTES && frame.len() == 4 + len
+}
+
 async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
+    if !call_signal_frame_body_ok(frame) {
+        native_log::warn(
+            "call",
+            format!("drop malformed call frame from {}", ctx.peer),
+        );
+        return;
+    }
     let env = match call_envelope_from_frame(frame) {
-        Ok(e) => e,
-        Err(_) => return,
+        Ok(e) if e.wire_share == CALL_SHARE => e,
+        Ok(_) => {
+            native_log::warn(
+                "call",
+                format!("drop call frame with wrong share from {}", ctx.peer),
+            );
+            return;
+        }
+        Err(e) => {
+            native_log::warn(
+                "call",
+                format!("drop call frame from {}: {e}", ctx.peer),
+            );
+            return;
+        }
     };
     let identity = ctx.session.identity.clone();
     let peer_transport_pk = ctx
@@ -577,14 +634,24 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
         || crate::p2p::call_active::snapshot()
             .filter(|s| s.call_id == parsed.call_id)
             .is_some_and(|s| s.video_active || s.camera_on || s.remote_video_on);
-    if call_state::apply_inbound_ex(
+    if let Err(e) = call_state::apply_inbound_ex(
         &parsed.sender_public_key_hex,
         &parsed.call_id,
         parsed.kind,
         invite_video,
-    )
-    .is_err()
-    {
+    ) {
+        if matches!(parsed.kind, CallSigKind::Hangup | CallSigKind::Reject) {
+            platform_incoming_call_dismiss();
+            call_state::clear_peer(&parsed.sender_public_key_hex);
+        }
+        native_log::warn(
+            "call",
+            format!(
+                "ignore call {} from {}: {e}",
+                parsed.kind.wire_name(),
+                ctx.peer
+            ),
+        );
         return;
     }
     match parsed.kind {
@@ -701,29 +768,32 @@ struct CallStreamHeader {
 }
 
 async fn handle_call_media_payload(payload: &[u8], ctx: &WireDispatchCtx, video: bool) {
-    if let Ok(header) = serde_json::from_slice::<CallStreamHeader>(payload) {
-        if video && !header.call_id.trim().is_empty() {
-            // Peer's first video mux frame is the stream header — open a receive
-            // session (camera off) so subsequent sealed chunks have a wire_in.
-            let _ = start_call_video_for_peer(
-                Arc::clone(&ctx.session),
-                ctx.writers.clone(),
-                header.call_id.clone(),
-                ctx.peer.clone(),
-                false,
-                ctx.events_tx.clone(),
-            )
-            .await;
-            crate::p2p::call_active::set_remote_video_on(&header.call_id, true);
-            emit_call_media(
-                &ctx.events_tx,
-                &header.call_id,
-                &ctx.peer,
-                "remote_video_on",
-                None,
-            );
+    const MAX_CALL_MEDIA_HEADER_JSON: usize = 4 * 1024;
+    if payload.len() <= MAX_CALL_MEDIA_HEADER_JSON {
+        if let Ok(header) = serde_json::from_slice::<CallStreamHeader>(payload) {
+            if video && !header.call_id.trim().is_empty() {
+                // Peer's first video mux frame is the stream header — open a receive
+                // session (camera off) so subsequent sealed chunks have a wire_in.
+                let _ = start_call_video_for_peer(
+                    Arc::clone(&ctx.session),
+                    ctx.writers.clone(),
+                    header.call_id.clone(),
+                    ctx.peer.clone(),
+                    false,
+                    ctx.events_tx.clone(),
+                )
+                .await;
+                crate::p2p::call_active::set_remote_video_on(&header.call_id, true);
+                emit_call_media(
+                    &ctx.events_tx,
+                    &header.call_id,
+                    &ctx.peer,
+                    "remote_video_on",
+                    None,
+                );
+            }
+            return;
         }
-        return;
     }
     if video {
         if let Some(tx) = ctx.session.call_video_wire_in_any(&ctx.peer) {
@@ -1240,4 +1310,38 @@ fn derive_call_media_keys(
         &peer_wire,
         call_id,
     )
+}
+
+#[cfg(test)]
+mod call_frame_tests {
+    use super::{call_signal_frame_body_ok, channel0_dm_frame_body_ok};
+    use crate::call_sig_v1::MAX_CALL_SIGNAL_FRAME_BODY_BYTES;
+    use crate::msg_v1::MAX_MSG_FRAME_BODY_BYTES;
+
+    #[test]
+    fn rejects_truncated_and_oversize_call_frame_len() {
+        assert!(!call_signal_frame_body_ok(&[]));
+        assert!(!call_signal_frame_body_ok(&[5, 0, 0, 0]));
+        let oversize_len = (MAX_CALL_SIGNAL_FRAME_BODY_BYTES + 1) as u32;
+        assert!(!call_signal_frame_body_ok(&oversize_len.to_le_bytes()));
+        let mut ok = (5u32).to_le_bytes().to_vec();
+        ok.extend_from_slice(b"12345");
+        assert!(call_signal_frame_body_ok(&ok));
+        let mut trailing = ok.clone();
+        trailing.push(0xff);
+        assert!(!call_signal_frame_body_ok(&trailing));
+    }
+
+    #[test]
+    fn dm_frame_gate_allows_msg_cap_above_call_share_peek() {
+        let body_len = MAX_CALL_SIGNAL_FRAME_BODY_BYTES + 1024;
+        assert!(body_len <= MAX_MSG_FRAME_BODY_BYTES);
+        let mut frame = (body_len as u32).to_le_bytes().to_vec();
+        frame.extend(std::iter::repeat(b'x').take(body_len));
+        assert!(!call_signal_frame_body_ok(&frame));
+        assert!(channel0_dm_frame_body_ok(&frame));
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(!channel0_dm_frame_body_ok(&trailing));
+    }
 }

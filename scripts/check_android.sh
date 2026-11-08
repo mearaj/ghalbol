@@ -13,6 +13,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 TARGET="${1:-aarch64-linux-android}"
+export GHALBOL_ENV="${GHALBOL_ENV:-development}"
+export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 APP="$ROOT/apps/ghalbol"
 WRAP="$ROOT/target/android-check-wrapper"
 

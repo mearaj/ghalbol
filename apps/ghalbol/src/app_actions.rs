@@ -91,18 +91,28 @@ impl MatchEvent for App {
         }
         if self.ui.button(cx, ids!(delete_button)).clicked(actions) {
             self.pull_password(cx);
+            let _ = host::end_call();
+            self.refresh_call_line(cx);
             match host::delete_identity(&self.namespace, &self.password) {
                 Ok(()) => {
                     self.session = None;
+                    self.call_open = false;
                     self.password.clear();
                     self.create_new = true;
                     script_eval!(cx, {
+                        mod.state.screen = "identity"
                         mod.state.status = "Identity deleted from this device"
+                        ui.hub_view.set_visible(false)
+                        ui.sheet_view.set_visible(false)
+                        ui.call_view.set_visible(false)
+                        ui.identity_view.set_visible(true)
                         ui.identity_copy.render()
                     });
+                    self.set_screen(cx, "identity");
                     self.push_identity_copy(cx);
                 }
                 Err(e) => {
+                    let e = clamp_ui_display_line(&e);
                     script_eval!(cx, {
                         mod.state.status = #(e)
                         ui.identity_copy.render()
@@ -127,6 +137,7 @@ impl MatchEvent for App {
                 match self.import_backup() {
                     Ok(session) => self.finish_import_backup(cx, session),
                     Err(e) => {
+                        let e = clamp_ui_display_line(&e);
                         script_eval!(cx, {
                             mod.state.status = #(e)
                             ui.identity_copy.render()
@@ -247,7 +258,7 @@ impl MatchEvent for App {
                 .pick_file()
             {
                 Some(path) => self.join_from_qr_picture(cx, &path.display().to_string()),
-                None => self.show_call_line(cx, "No picture chosen".into()),
+                None => self.show_chat_error(cx, "No picture chosen".into()),
             }
         }
         if self.ui.button(cx, ids!(contacts_button)).clicked(actions) {
@@ -274,15 +285,9 @@ impl MatchEvent for App {
         if self.ui.button(cx, ids!(video_button)).clicked(actions) {
             let peer = self.open_peer.clone();
             if peer.is_empty() {
-                script_eval!(cx, {
-                    mod.state.call_line = "Select a chat first"
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, "Select a chat first".into());
             } else if let Err(e) = host::start_video_call(&peer) {
-                script_eval!(cx, {
-                    mod.state.call_line = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             } else {
                 self.camera_on = true;
                 // Open call chrome immediately — do not wait for a later poll event.
@@ -290,109 +295,87 @@ impl MatchEvent for App {
             }
         }
         if self.ui.button(cx, ids!(mute_button)).clicked(actions) {
-            self.mic_muted = !self.mic_muted;
-            let label = if self.mic_muted { "Unmute" } else { "Mute" };
-            script_eval!(cx, { ui.mute_button.set_text(#(label)) });
-            let muted = self.mic_muted;
-            let msg = match host::set_mic_muted(muted) {
+            let next_muted = !self.mic_muted;
+            match host::set_mic_muted(next_muted) {
                 Ok(()) => {
-                    if muted {
+                    self.mic_muted = next_muted;
+                    let label = if self.mic_muted { "Unmute" } else { "Mute" };
+                    script_eval!(cx, { ui.mute_button.set_text(#(label)) });
+                    let msg = if self.mic_muted {
                         "Microphone off".into()
                     } else {
                         "Microphone on".into()
-                    }
+                    };
+                    self.show_call_line(cx, msg);
                 }
-                Err(e) => e,
-            };
-            script_eval!(cx, {
-                mod.state.call_line = #(msg)
-                ui.chat_log.render()
-            });
+                Err(e) => self.show_chat_error(cx, e),
+            }
         }
         if self.ui.button(cx, ids!(speaker_button)).clicked(actions) {
-            self.speaker_on = !self.speaker_on;
-            let on = self.speaker_on;
+            let on = !self.speaker_on;
             let label = if on {
                 i18n::phrase(&self.lang, "speaker")
             } else {
                 i18n::phrase(&self.lang, "speaker_off")
             };
-            let msg = match host::set_speaker(on) {
-                Ok(()) => label.clone(),
-                Err(e) => e,
-            };
-            script_eval!(cx, {
-                ui.speaker_button.set_text(#(label))
-                mod.state.call_line = #(msg)
-                ui.call_copy.render()
-            });
+            match host::set_speaker(on) {
+                Ok(()) => {
+                    self.speaker_on = on;
+                    let label_ui = label.clone();
+                    script_eval!(cx, { ui.speaker_button.set_text(#(label_ui)) });
+                    self.show_call_line(cx, label);
+                }
+                Err(e) => self.show_chat_error(cx, e),
+            }
         }
         if self.ui.button(cx, ids!(camera_button)).clicked(actions) {
             let on = !self.camera_on;
-            let msg = match host::set_call_camera_enabled(on) {
+            match host::set_call_camera_enabled(on) {
                 Ok(()) => {
                     self.camera_on = on;
-                    if on {
+                    let label = if self.camera_on {
                         i18n::phrase(&self.lang, "camera_on")
                     } else {
                         i18n::phrase(&self.lang, "camera_off")
-                    }
+                    };
+                    let label_ui = label.clone();
+                    script_eval!(cx, { ui.camera_button.set_text(#(label_ui)) });
+                    self.show_call_line(cx, label);
                 }
-                Err(e) => e,
-            };
-            let label = if self.camera_on {
-                i18n::phrase(&self.lang, "camera_on")
-            } else {
-                i18n::phrase(&self.lang, "camera_off")
-            };
-            script_eval!(cx, {
-                ui.camera_button.set_text(#(label))
-                mod.state.call_line = #(msg)
-                ui.call_copy.render()
-            });
+                Err(e) => self.show_chat_error(cx, e),
+            }
         }
         if self.ui.button(cx, ids!(flip_camera_button)).clicked(actions) {
-            let msg = match host::flip_call_camera() {
-                Ok(()) => i18n::phrase(&self.lang, "flip_camera").to_string(),
-                Err(e) => e,
-            };
-            script_eval!(cx, {
-                mod.state.call_line = #(msg)
-                ui.call_copy.render()
-            });
+            match host::flip_call_camera() {
+                Ok(()) => {
+                    self.show_call_line(
+                        cx,
+                        i18n::phrase(&self.lang, "flip_camera").to_string(),
+                    );
+                }
+                Err(e) => self.show_chat_error(cx, e),
+            }
         }
         if self.ui.button(cx, ids!(call_button)).clicked(actions) {
             let peer = self.open_peer.clone();
             if peer.is_empty() {
-                script_eval!(cx, {
-                    mod.state.call_line = "Select a chat first"
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, "Select a chat first".into());
             } else if let Err(e) = host::start_voice_call(&peer) {
-                script_eval!(cx, {
-                    mod.state.call_line = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             } else {
                 self.refresh_call_line(cx);
             }
         }
         if self.ui.button(cx, ids!(accept_call_button)).clicked(actions) {
             if let Err(e) = host::accept_incoming_call() {
-                script_eval!(cx, {
-                    mod.state.call_line = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             } else {
                 self.refresh_call_line(cx);
             }
         }
         if self.ui.button(cx, ids!(end_call_button)).clicked(actions) {
             if let Err(e) = host::end_call() {
-                script_eval!(cx, {
-                    mod.state.call_line = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             } else {
                 self.refresh_call_line(cx);
             }
@@ -417,18 +400,14 @@ impl MatchEvent for App {
         {
             self.set_chat_menu_open(cx, false);
             let peer = self.open_peer.clone();
-            let msg = if peer.is_empty() {
-                "Select a chat first".into()
+            if peer.is_empty() {
+                self.show_chat_error(cx, "Select a chat first".into());
             } else {
                 match host::mark_known(&self.namespace, &peer) {
-                    Ok(()) => "Added".into(),
-                    Err(e) => e,
+                    Ok(()) => self.show_call_line(cx, "Added".into()),
+                    Err(e) => self.show_chat_error(cx, e),
                 }
-            };
-            script_eval!(cx, {
-                mod.state.call_line = #(msg)
-                ui.chat_log.render()
-            });
+            }
             self.roster_ver = u64::MAX;
             self.refresh_roster(cx);
         }
@@ -450,15 +429,9 @@ impl MatchEvent for App {
             self.set_chat_menu_open(cx, false);
             let peer = self.open_peer.clone();
             if peer.is_empty() {
-                script_eval!(cx, {
-                    mod.state.call_line = "Select a chat first"
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, "Select a chat first".into());
             } else if let Err(e) = host::start_voice_call(&peer) {
-                script_eval!(cx, {
-                    mod.state.call_line = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             } else {
                 self.refresh_call_line(cx);
             }
@@ -467,15 +440,9 @@ impl MatchEvent for App {
             self.set_chat_menu_open(cx, false);
             let peer = self.open_peer.clone();
             if peer.is_empty() {
-                script_eval!(cx, {
-                    mod.state.call_line = "Select a chat first"
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, "Select a chat first".into());
             } else if let Err(e) = host::start_video_call(&peer) {
-                script_eval!(cx, {
-                    mod.state.call_line = #(e)
-                    ui.chat_log.render()
-                });
+                self.show_chat_error(cx, e);
             } else {
                 self.refresh_call_line(cx);
             }
@@ -506,7 +473,7 @@ impl MatchEvent for App {
         if self.ui.button(cx, ids!(choose_file_button)).clicked(actions) {
             let peer = self.open_peer.clone();
             if peer.is_empty() {
-                self.show_call_line(cx, "Select a chat first".into());
+                self.show_chat_error(cx, "Select a chat first".into());
             } else {
                 #[cfg(target_os = "android")]
                 android_pick::pick_attachment(cx, &peer);

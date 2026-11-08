@@ -415,14 +415,24 @@ impl Camera {
         }
         Ok(cam)
     }
+
+    /// Stop the repeating request before drop (shared by QR / video stop paths).
+    pub(crate) fn stop(&mut self) {
+        unsafe {
+            if !self.session.is_null() {
+                ACameraCaptureSession_stopRepeating(self.session);
+            }
+        }
+    }
 }
 
 impl Drop for Camera {
     fn drop(&mut self) {
+        self.stop();
         unsafe {
             if !self.session.is_null() {
-                ACameraCaptureSession_stopRepeating(self.session);
                 ACameraCaptureSession_close(self.session);
+                self.session = std::ptr::null_mut();
             }
             if !self.target.is_null() {
                 ACameraOutputTarget_free(self.target);

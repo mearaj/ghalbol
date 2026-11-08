@@ -29,6 +29,7 @@ elif find "${WORKSPACE_ROOT}/ghalbol_coord/src" -name '*.rs' -newer "${BIN}" -pr
 fi
 
 if [[ "${need_build}" -eq 1 ]]; then
+  export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
   cargo build --release -p ghalbol_coord --bin ghalbol_coord
 fi
 
@@ -40,10 +41,10 @@ fi
 # Phones on Wi‑Fi need a routable bind (override with 127.0.0.1:8765 for loopback-only).
 export GHALBOL_COORD_LISTEN="${GHALBOL_COORD_LISTEN:-0.0.0.0:8765}"
 
-if [[ -n "${GHALBOL_COORD_PUBLIC_BASE_URL:-}" ]]; then
-  echo "coord public base: ${GHALBOL_COORD_PUBLIC_BASE_URL}" >&2
+if [[ -n "${GHALBOL_COORD_PUBLIC_URL:-}" ]]; then
+  echo "coord public base: ${GHALBOL_COORD_PUBLIC_URL}" >&2
 else
-  echo "NOTE: set GHALBOL_COORD_PUBLIC_BASE_URL for bridge connect_url in responses (see COORDINATION_SERVER.md)." >&2
+  echo "NOTE: set GHALBOL_COORD_PUBLIC_URL for bridge connect_url in responses (see COORDINATION_SERVER.md)." >&2
 fi
 
 exec "${BIN}"

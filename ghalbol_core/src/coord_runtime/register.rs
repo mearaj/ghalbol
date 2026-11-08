@@ -351,6 +351,16 @@ pub fn rebuild_coord_endpoints_from_listen(addrs: &[Multiaddr]) {
         schedule_check_relay_presence_once();
     }
 }
+/// Drains a register deferred while the worker was busy or (when unregistered) throttled.
+/// Force — a skipped `spawn_register_presence_inner(true)` must not lose to `should_throttle_register`.
+pub(super) fn drain_coord_register_pending() -> bool {
+    if COORD_REG_PENDING.swap(false, Ordering::AcqRel) {
+        spawn_register_presence_inner(true);
+        return true;
+    }
+    false
+}
+
 pub fn coord_register_tick(listen_snapshot: &[Multiaddr]) {
     if !coord_is_configured() {
         return;
@@ -364,8 +374,7 @@ pub fn coord_register_tick(listen_snapshot: &[Multiaddr]) {
             ensure_coord_presence_polling();
             schedule_check_relay_presence_once();
         }
-    } else if COORD_REG_PENDING.swap(false, Ordering::AcqRel) {
-        spawn_register_presence_inner(false);
+    } else if drain_coord_register_pending() {
     } else if !coord_link_recently_ok() && COORD_CONSEC_FAILS.load(Ordering::Relaxed) >= 1 {
         let now = unix_ms_now();
         if !coord_recovery_throttled(now) {
@@ -414,6 +423,45 @@ pub fn on_listen_dm_addr(addr: &DmDialAddr) {
         spawn_register_presence_inner(true);
     }
 }
+/// Match coord server upsert truncate — ignore pathological lookup rows.
+const MAX_COORD_LOOKUP_TCP_ENDPOINTS: usize = 8;
+const MAX_COORD_ENDPOINT_HOST_CHARS: usize = 253;
+const MAX_COORD_ENDPOINT_SCHEME_CHARS: usize = 16;
+
+/// TCP/QUIC rows from a coord lookup that are safe to dial (no relay bootstrap / link-local).
+pub(super) fn filter_coord_record_tcp_for_dial(endpoints: &[CoordEndpoint]) -> Vec<CoordEndpoint> {
+    let bootstraps = coord_relay_bootstrap_tcp_keys();
+    endpoints
+        .iter()
+        .filter(|e| {
+            let scheme = e.scheme.as_str();
+            if scheme.len() > MAX_COORD_ENDPOINT_SCHEME_CHARS
+                || e.host.len() > MAX_COORD_ENDPOINT_HOST_CHARS
+            {
+                return false;
+            }
+            if scheme != "tcp" && scheme != "quic" {
+                return false;
+            }
+            if e.port == 0 || e.port == 4001 || e.host.trim().is_empty() {
+                return false;
+            }
+            if scheme == "tcp" {
+                is_coord_publishable_host(&e.host)
+                    && !crate::p2p::network_transport::is_relay_bootstrap_tcp(
+                        &e.host,
+                        e.port,
+                        &bootstraps,
+                    )
+            } else {
+                is_coord_publishable_host(&e.host)
+            }
+        })
+        .take(MAX_COORD_LOOKUP_TCP_ENDPOINTS)
+        .cloned()
+        .collect()
+}
+
 pub(super) fn endpoints_for_coord_register(eps: Vec<CoordEndpoint>) -> Vec<CoordEndpoint> {
     let tcp: Vec<CoordEndpoint> = eps.into_iter().filter(|e| e.scheme == "tcp").collect();
     if !coord_is_configured() {

@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::identity::{Identity, IdentityAlgorithm};
 use crate::keystore_v1::DecryptedIdentity;
 
+/// Cap untrusted signature blobs before algorithm-specific parsing (DoS hardening).
+const MAX_IDENTITY_SIGNATURE_LEN: usize = 256;
+
 fn secp256k1_sign(secret: &secp256k1::SecretKey, msg: &[u8]) -> Result<Vec<u8>, String> {
     let secp = Secp256k1::new();
     let digest: [u8; 32] = Sha256::digest(msg).into();
@@ -62,6 +65,9 @@ pub fn verify_identity_signature(
     msg: &[u8],
     signature: &[u8],
 ) -> Result<(), String> {
+    if signature.is_empty() || signature.len() > MAX_IDENTITY_SIGNATURE_LEN {
+        return Err("signature length out of range".to_string());
+    }
     let id = Identity::parse(sender_identity_wire)?;
     match id.algorithm {
         IdentityAlgorithm::Secp256k1 => secp256k1_verify(&id.public_key, msg, signature),
@@ -121,5 +127,14 @@ mod tests {
         let msg = b"ghalbol envelope canonical";
         let sig = id.sign_message(msg).unwrap();
         verify_identity_signature(&id.identity_wire(), msg, &sig).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_oversized_signature_blob() {
+        let (_ks, id) =
+            create_keystore_v1_with_algorithm("pw", IdentityAlgorithm::Ed25519, None).unwrap();
+        let msg = b"test";
+        let junk = vec![0u8; MAX_IDENTITY_SIGNATURE_LEN + 1];
+        assert!(verify_identity_signature(&id.identity_wire(), msg, &junk).is_err());
     }
 }

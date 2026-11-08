@@ -5,14 +5,21 @@ use sha2::{Digest, Sha256};
 use crate::identity::IdentityAlgorithm;
 use crate::keystore_v1::DecryptedIdentity;
 
+/// Matches contact identity wire ceilings used elsewhere (invite / delivery auth).
+const MAX_REGISTER_IDENTITY_WIRE_BYTES: usize = 256;
+
 /// Canonical bytes both peers sign for coord registration.
-pub fn registration_challenge_bytes(nonce: &[u8; 32], identity_wire: &str) -> Vec<u8> {
-    format!(
+pub fn registration_challenge_bytes(nonce: &[u8; 32], identity_wire: &str) -> Result<Vec<u8>, String> {
+    let wire = identity_wire.trim();
+    if wire.is_empty() || wire.len() > MAX_REGISTER_IDENTITY_WIRE_BYTES {
+        return Err("identity_wire length out of range for register challenge".into());
+    }
+    Ok(format!(
         "ghalbol:register:v1\n{}\n{}",
         hex::encode(nonce),
-        identity_wire.trim().to_ascii_lowercase()
+        wire.to_ascii_lowercase()
     )
-    .into_bytes()
+    .into_bytes())
 }
 
 /// Sign registration challenge for `POST /v1/register`.
@@ -21,12 +28,13 @@ pub fn sign_coord_registration(
     nonce: &[u8; 32],
     identity_wire: &str,
 ) -> Result<Vec<u8>, String> {
-    let bytes = registration_challenge_bytes(nonce, identity_wire);
+    let bytes = registration_challenge_bytes(nonce, identity_wire)?;
     match ident.algorithm() {
         IdentityAlgorithm::Secp256k1 => {
             let hash = Sha256::digest(&bytes);
             let msg = secp256k1::Message::from_digest(hash.into());
-            let sig = secp256k1::Secp256k1::new().sign_ecdsa(msg, ident.secp256k1_secret());
+            let sig =
+                secp256k1::Secp256k1::new().sign_ecdsa(msg, ident.try_secp256k1_secret()?);
             Ok(sig.serialize_der().to_vec())
         }
         IdentityAlgorithm::Ed25519 | IdentityAlgorithm::EcdsaP256 => ident.sign_message(&bytes),
@@ -46,7 +54,7 @@ mod tests {
         let wire = id.identity_wire();
         let nonce = [9u8; 32];
         let sig = sign_coord_registration(&id, &nonce, &wire).unwrap();
-        let bytes = registration_challenge_bytes(&nonce, &wire);
+        let bytes = registration_challenge_bytes(&nonce, &wire).unwrap();
         let hash = Sha256::digest(&bytes);
         let msg = secp256k1::Message::from_digest(hash.into());
         let secp = secp256k1::Secp256k1::new();
@@ -61,7 +69,16 @@ mod tests {
         let wire = id.identity_wire();
         let nonce = [3u8; 32];
         let sig = sign_coord_registration(&id, &nonce, &wire).unwrap();
-        let bytes = registration_challenge_bytes(&nonce, &wire);
+        let bytes = registration_challenge_bytes(&nonce, &wire).unwrap();
         verify_identity_signature(&wire, &bytes, &sig).unwrap();
+    }
+
+    #[test]
+    fn register_challenge_rejects_empty_and_oversized_wire() {
+        let nonce = [1u8; 32];
+        assert!(registration_challenge_bytes(&nonce, "").is_err());
+        assert!(registration_challenge_bytes(&nonce, "   ").is_err());
+        let huge = "a".repeat(MAX_REGISTER_IDENTITY_WIRE_BYTES + 1);
+        assert!(registration_challenge_bytes(&nonce, &huge).is_err());
     }
 }

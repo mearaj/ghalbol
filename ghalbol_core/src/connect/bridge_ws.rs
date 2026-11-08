@@ -7,11 +7,16 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async, client_async_tls, tungstenite::Message,
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config, client_async_with_config,
+    tungstenite::Message,
 };
 
-use super::bridge_client::BridgeRequestResult;
+use super::bridge_client::{
+    validate_bridge_connect_url, validate_bridge_id, validate_bridge_token, BridgeRequestResult,
+};
+use super::types::session_peer_from_identity_wire;
 use super::peer_session::{PeerSessionRegistry, start_session_io};
 use super::session::SessionState;
 use super::types::{GossipChatEvent, SessionPeer};
@@ -38,15 +43,18 @@ fn bridge_coord_client() -> Result<CoordHttpClient, String> {
 
 /// Coord returns `https://…/v1/bridge/connect`; tungstenite needs `wss://`.
 fn bridge_ws_url(connect_url: &str, bridge_id: &str, token: &str) -> String {
-    let base = connect_url.trim_end_matches('/');
-    let ws = if let Some(rest) = base.strip_prefix("https://") {
+    let base = connect_url.trim().trim_end_matches('/');
+    let path = base.split('?').next().unwrap_or(base);
+    let ws = if let Some(rest) = path.strip_prefix("https://") {
         format!("wss://{rest}")
-    } else if let Some(rest) = base.strip_prefix("http://") {
+    } else if let Some(rest) = path.strip_prefix("http://") {
         format!("ws://{rest}")
     } else {
-        base.to_string()
+        path.to_string()
     };
-    format!("{ws}?bridge_id={bridge_id}&token={token}")
+    let bid = crate::identity::percent_encode_uri_component(bridge_id.trim());
+    let tok = crate::identity::percent_encode_uri_component(token.trim());
+    format!("{ws}?bridge_id={bid}&token={tok}")
 }
 
 /// Callee-side bridge notification from `GET /v1/bridge/pending`.
@@ -61,6 +69,16 @@ pub struct BridgePendingItem {
 
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const WS_DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Match coord `MAX_WS_MESSAGE_BYTES` — drop hostile frames before duplex fill.
+const MAX_BRIDGE_CLIENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Pathological `pending` arrays must not allocate unbounded BridgePendingItem rows.
+const MAX_BRIDGE_PENDING_ITEMS: usize = 64;
+
+fn bridge_ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_BRIDGE_CLIENT_FRAME_BYTES))
+        .max_frame_size(Some(MAX_BRIDGE_CLIENT_FRAME_BYTES))
+}
 
 type BridgeWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -71,14 +89,15 @@ async fn try_open_bridge_ws_dial(url: &str, dial: &str) -> Result<BridgeWs, Stri
     let stream = TcpStream::connect(dial)
         .await
         .map_err(|e| format!("tcp {dial}: {e}"))?;
+    let cfg = Some(bridge_ws_config());
     let tls = url.trim().starts_with("wss://");
     if tls {
-        let (ws, _) = client_async_tls(req, stream)
+        let (ws, _) = client_async_tls_with_config(req, stream, cfg, None)
             .await
             .map_err(|e| format!("wss handshake: {e}"))?;
         Ok(ws)
     } else {
-        let (ws, _) = client_async(req, MaybeTlsStream::Plain(stream))
+        let (ws, _) = client_async_with_config(req, MaybeTlsStream::Plain(stream), cfg)
             .await
             .map_err(|e| format!("ws handshake: {e}"))?;
         Ok(ws)
@@ -162,9 +181,17 @@ pub async fn connect_bridge_session(
     let (noise_io, bridge_io) = tokio::io::duplex(2 * 1024 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_io);
 
-    tokio::spawn(async move {
+    let relay_ws_in = tokio::spawn(async move {
         while let Some(msg) = ws_read.next().await {
             match msg {
+                Ok(Message::Binary(b)) if b.is_empty() => continue,
+                Ok(Message::Binary(b)) if b.len() > MAX_BRIDGE_CLIENT_FRAME_BYTES => {
+                    native_log::warn(
+                        "bridge",
+                        format!("dropping oversized bridge frame ({} bytes)", b.len()),
+                    );
+                    break;
+                }
                 Ok(Message::Binary(b)) => {
                     if bridge_write.write_all(&b).await.is_err() {
                         break;
@@ -174,9 +201,10 @@ pub async fn connect_bridge_session(
                 _ => {}
             }
         }
+        let _ = bridge_write.shutdown().await;
     });
 
-    tokio::spawn(async move {
+    let relay_ws_out = tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         loop {
             match bridge_read.read(&mut buf).await {
@@ -193,8 +221,11 @@ pub async fn connect_bridge_session(
                 Err(_) => break,
             }
         }
+        let _ = ws_write.close().await;
     });
 
+    let reg_watch = Arc::clone(&registry);
+    let peer_watch = peer_wire.clone();
     let (read, write) = tokio::io::split(noise_io);
     start_session_io(
         registry,
@@ -207,7 +238,46 @@ pub async fn connect_bridge_session(
         write,
     )
     .await;
+
+    if !reg_watch.has_session(&peer_watch) {
+        relay_ws_in.abort();
+        relay_ws_out.abort();
+        return Err("bridge noise session not established".into());
+    }
+
     Ok(())
+}
+
+const MAX_BRIDGE_CALL_ID_LEN: usize = 128;
+
+/// Parse and validate one coord `pending` row (unit-tested; HTTP poll uses this).
+pub(crate) fn bridge_pending_item_from_json(
+    item: &serde_json::Value,
+) -> Option<BridgePendingItem> {
+    let bridge_id = item.get("bridge_id")?.as_str()?;
+    let call_id = item.get("call_id")?.as_str()?;
+    let caller_identity_wire = item.get("caller_identity_wire")?.as_str()?;
+    let token = item.get("token")?.as_str()?;
+    let connect_url = item.get("connect_url")?.as_str()?;
+    validate_bridge_id(bridge_id).ok()?;
+    validate_bridge_token(token).ok()?;
+    validate_bridge_connect_url(connect_url).ok()?;
+    let call_id = call_id.trim();
+    if call_id.is_empty() || call_id.len() > MAX_BRIDGE_CALL_ID_LEN {
+        return None;
+    }
+    if caller_identity_wire.is_empty() || caller_identity_wire.len() > 192 {
+        return None;
+    }
+    let caller_identity_wire =
+        session_peer_from_identity_wire(caller_identity_wire).ok()?;
+    Some(BridgePendingItem {
+        bridge_id: bridge_id.trim().to_string(),
+        call_id: call_id.to_string(),
+        caller_identity_wire,
+        token: token.trim().to_string(),
+        connect_url: connect_url.trim().to_string(),
+    })
 }
 
 /// Poll coord for inbound bridge pairing (callee role). Blocking HTTP — call from `spawn_blocking`.
@@ -222,18 +292,16 @@ pub fn poll_bridge_pending_blocking(identity_wire: &str) -> Result<Vec<BridgePen
     );
     let v = client.get_json(&url)?;
     let mut out = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
     if let Some(items) = v.get("pending").and_then(|x| x.as_array()) {
-        for item in items {
-            out.push(BridgePendingItem {
-                bridge_id: item["bridge_id"].as_str().unwrap_or_default().to_string(),
-                call_id: item["call_id"].as_str().unwrap_or_default().to_string(),
-                caller_identity_wire: item["caller_identity_wire"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-                token: item["token"].as_str().unwrap_or_default().to_string(),
-                connect_url: item["connect_url"].as_str().unwrap_or_default().to_string(),
-            });
+        for item in items.iter().take(MAX_BRIDGE_PENDING_ITEMS) {
+            let Some(parsed) = bridge_pending_item_from_json(item) else {
+                continue;
+            };
+            if !seen_ids.insert(parsed.bridge_id.clone()) {
+                continue;
+            }
+            out.push(parsed);
         }
     }
     Ok(out)
@@ -277,7 +345,10 @@ pub fn bridge_request_for_call(
 
 #[cfg(test)]
 mod tests {
-    use super::bridge_ws_url;
+    use super::{
+        bridge_pending_item_from_json, bridge_ws_config, bridge_ws_url,
+        MAX_BRIDGE_CLIENT_FRAME_BYTES, MAX_BRIDGE_PENDING_ITEMS,
+    };
 
     #[test]
     fn bridge_ws_url_converts_https_to_wss() {
@@ -303,5 +374,66 @@ mod tests {
             u,
             "wss://coord1.ghalbol.com:8443/v1/bridge/connect?bridge_id=bid&token=tok"
         );
+    }
+
+    #[test]
+    fn bridge_client_frame_and_pending_caps_match_policy() {
+        assert_eq!(MAX_BRIDGE_CLIENT_FRAME_BYTES, 8 * 1024 * 1024);
+        assert_eq!(MAX_BRIDGE_PENDING_ITEMS, 64);
+        let cfg = bridge_ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_BRIDGE_CLIENT_FRAME_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_BRIDGE_CLIENT_FRAME_BYTES));
+    }
+
+    #[test]
+    fn bridge_ws_url_strips_stale_query_and_percent_encodes() {
+        let u = bridge_ws_url(
+            "wss://coord/v1/bridge/connect?stale=1",
+            "ab",
+            "cd",
+        );
+        assert_eq!(u, "wss://coord/v1/bridge/connect?bridge_id=ab&token=cd");
+    }
+
+    #[test]
+    fn bridge_pending_item_from_json_normalizes_caller() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_byte_array([3u8; 32]).expect("sk");
+        let bare = hex::encode(sk.public_key(&secp).serialize());
+        let prefixed = format!("secp256k1:{bare}");
+        let token = "c".repeat(64);
+        let item = serde_json::json!({
+            "bridge_id": "a".repeat(32),
+            "call_id": "call-1",
+            "caller_identity_wire": prefixed,
+            "token": token,
+            "connect_url": "wss://coord/v1/bridge/connect",
+        });
+        let parsed = bridge_pending_item_from_json(&item).expect("parsed");
+        assert_eq!(parsed.caller_identity_wire, bare);
+        assert!(bridge_pending_item_from_json(&serde_json::json!({
+            "bridge_id": "bad-id",
+            "call_id": "x",
+            "caller_identity_wire": bare,
+            "token": token,
+            "connect_url": "wss://coord/v1/bridge/connect",
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn bridge_pending_item_rejects_token_over_coord_connect_limit() {
+        let secp = secp256k1::Secp256k1::new();
+        let sk = secp256k1::SecretKey::from_byte_array([4u8; 32]).expect("sk");
+        let bare = hex::encode(sk.public_key(&secp).serialize());
+        let long_token = "f".repeat(129);
+        let item = serde_json::json!({
+            "bridge_id": "a".repeat(32),
+            "call_id": "call-1",
+            "caller_identity_wire": bare,
+            "token": long_token,
+            "connect_url": "wss://coord/v1/bridge/connect",
+        });
+        assert!(bridge_pending_item_from_json(&item).is_none());
     }
 }

@@ -97,3 +97,45 @@ pub(crate) fn read_ack_cutoff_ms(session: &SessionState, peer: &SessionPeer) -> 
         .filter(|t| *t > 0)
         .unwrap_or_else(chrono_now_ms)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    use crate::connect::session::SessionState;
+    use crate::connect::ui_session;
+    use crate::create_keystore_v1;
+
+    fn test_session() -> SessionState {
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        SessionState::new(id, &[], Some("com.ghalbol.test".into())).unwrap()
+    }
+
+    #[test]
+    fn begin_chat_room_session_sets_live_clock() {
+        clear_chat_room_session();
+        let session = test_session();
+        let peer: SessionPeer = "aa".repeat(32);
+        begin_chat_room_session(&session, &peer);
+        assert!(chat_room_session_at_ms() > 0);
+        clear_chat_room_session();
+        assert_eq!(chat_room_session_at_ms(), 0);
+    }
+
+    #[test]
+    fn read_ack_cutoff_prefers_live_session_clock() {
+        clear_chat_room_session();
+        let (_ks, contact) = create_keystore_v1("pw-room", None).unwrap();
+        let peer = contact.identity_wire();
+        let session = test_session();
+        let pinned = 1_700_000_123_456i64;
+        CHAT_ROOM_SESSION_AT_MS.store(pinned, Ordering::Relaxed);
+        session.set_foreground_peer(Some(peer.clone()));
+        ui_session::sync_foreground_peer_now(Some(peer.clone()));
+        let cutoff = read_ack_cutoff_ms(&session, &peer);
+        assert_eq!(cutoff, pinned);
+        ui_session::sync_foreground_peer_now(None);
+        clear_chat_room_session();
+    }
+}

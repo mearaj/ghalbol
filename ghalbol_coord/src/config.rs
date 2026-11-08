@@ -68,8 +68,8 @@ impl ServerConfig {
                 tracing::warn!(listen = %s, "GHALBOL_COORD_LISTEN invalid; using default");
             }
         }
-        if let Ok(s) = std::env::var("GHALBOL_COORD_DB")
-            .or_else(|_| std::env::var("GHALBOL_SERVER_DB"))
+        if let Ok(s) =
+            std::env::var("GHALBOL_COORD_DB").or_else(|_| std::env::var("GHALBOL_SERVER_DB"))
         {
             let t = s.trim();
             if !t.is_empty() {

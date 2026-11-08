@@ -1,9 +1,64 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::SystemTime;
 
 use directories::ProjectDirs;
+use fs4::fs_std::FileExt;
 use thiserror::Error;
+
+/// Serialize keystore load/save so concurrent unlock + change-password cannot
+/// interleave tmp write / rename on the same path.
+fn keystore_io() -> &'static Mutex<()> {
+    static IO: OnceLock<Mutex<()>> = OnceLock::new();
+    IO.get_or_init(|| Mutex::new(()))
+}
+
+/// In-process mutex + cross-process flock for keystore read/modify/write.
+struct KeystoreIoGuard {
+    _process: MutexGuard<'static, ()>,
+    _lock_file: File,
+}
+
+impl KeystoreIoGuard {
+    fn acquire(cfg: &StorageConfig) -> Result<Self, KeystoreStorageError> {
+        let process = keystore_io()
+            .lock()
+            .map_err(|_| io::Error::other("keystore io mutex poisoned"))?;
+        let path = keystore_v1_path(cfg)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        let _ = restrict_private_file(&lock_path);
+        lock_file.lock_exclusive().map_err(|e| {
+            io::Error::other(format!("keystore flock {lock_path:?}: {e}"))
+        })?;
+        Ok(Self {
+            _process: process,
+            _lock_file: lock_file,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn restrict_private_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_private_file(path: &Path) -> io::Result<()> {
+    let _ = path;
+    Ok(())
+}
 
 use crate::identity::IdentityAlgorithm;
 use crate::keystore_v1::{
@@ -75,8 +130,17 @@ pub(crate) fn sanitize_namespace(ns: &str) -> Result<(), KeystoreStorageError> {
     if ns.is_empty() || ns.len() > 200 {
         return Err(KeystoreStorageError::BadNamespace);
     }
-    // Keep it path-safe.
+    // Keep it path-safe: one logical install id, no traversal or odd path segments.
     if ns.contains("..") || ns.contains('/') || ns.contains('\\') {
+        return Err(KeystoreStorageError::BadNamespace);
+    }
+    if ns == "." {
+        return Err(KeystoreStorageError::BadNamespace);
+    }
+    if !ns
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
         return Err(KeystoreStorageError::BadNamespace);
     }
     Ok(())
@@ -143,22 +207,112 @@ pub fn keystore_v1_file_exists(cfg: &StorageConfig) -> Result<bool, KeystoreStor
     Ok(path.exists())
 }
 
-pub fn load_keystore_v1(
-    cfg: &StorageConfig,
-) -> Result<Option<StoredKeystore>, KeystoreStorageError> {
-    let path = keystore_v1_path(cfg)?;
+/// Slightly above [`MAX_KEYSTORE_JSON_IMPORT_BYTES`] so a pretty-printed on-disk file still loads.
+const MAX_KEYSTORE_ON_DISK_BYTES: usize = MAX_KEYSTORE_JSON_IMPORT_BYTES + 4096;
+
+fn file_modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn read_keystore_utf8_capped(path: &Path) -> Result<Option<String>, KeystoreStorageError> {
     if !path.exists() {
         return Ok(None);
     }
-    let s = fs::read_to_string(&path)?;
-    let ks = KeystoreV1::from_json_str(&s)?;
-    Ok(Some(StoredKeystore { path, keystore: ks }))
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let len = meta.len();
+    if len as usize > MAX_KEYSTORE_ON_DISK_BYTES {
+        return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
+            "keystore file exceeds size limit",
+        )));
+    }
+    let bytes = fs::read(path)?;
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(Some(s)),
+        // Treat garbage main as absent so a durable `.json.tmp` can recover.
+        Err(_) => Ok(None),
+    }
 }
 
-pub fn save_keystore_v1(
+fn parse_keystore_json(s: &str) -> Result<KeystoreV1, KeystoreStorageError> {
+    KeystoreV1::from_json_str(s).map_err(KeystoreStorageError::Crypto)
+}
+
+/// Finish a crash-interrupted `save_keystore_v1` (tmp written + synced, rename not done).
+fn adopt_keystore_tmp(main: &Path, tmp: &Path) {
+    if fs::rename(tmp, main).is_ok() {
+        let _ = restrict_private_file(main);
+    }
+}
+
+fn load_keystore_v1_unlocked(
+    cfg: &StorageConfig,
+) -> Result<Option<StoredKeystore>, KeystoreStorageError> {
+    let path = keystore_v1_path(cfg)?;
+    let tmp_path = path.with_extension("json.tmp");
+    let main_s = read_keystore_utf8_capped(&path)?;
+    let tmp_s = read_keystore_utf8_capped(&tmp_path)?;
+
+    if main_s.is_none() && tmp_s.is_none() {
+        return Ok(None);
+    }
+
+    let main_ks = main_s
+        .as_deref()
+        .and_then(|s| parse_keystore_json(s).ok());
+    let tmp_ks = tmp_s
+        .as_deref()
+        .and_then(|s| parse_keystore_json(s).ok());
+
+    let prefer_tmp = match (&main_ks, &tmp_ks) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(_), Some(_)) => matches!(
+            (file_modified(&path), file_modified(&tmp_path)),
+            (Some(m), Some(t)) if t >= m
+        ),
+        (None, None) => false,
+    };
+
+    if prefer_tmp {
+        if let Some(ks) = tmp_ks {
+            adopt_keystore_tmp(&path, &tmp_path);
+            return Ok(Some(StoredKeystore { path, keystore: ks }));
+        }
+    }
+
+    if let Some(ks) = main_ks {
+        if tmp_path.exists() {
+            if tmp_ks.is_none() {
+                let _ = fs::remove_file(&tmp_path);
+            } else if !prefer_tmp {
+                let _ = fs::remove_file(&tmp_path);
+            }
+        }
+        return Ok(Some(StoredKeystore { path, keystore: ks }));
+    }
+
+    if let Some(ks) = tmp_ks {
+        adopt_keystore_tmp(&path, &tmp_path);
+        return Ok(Some(StoredKeystore { path, keystore: ks }));
+    }
+
+    if let Some(s) = main_s {
+        return Err(parse_keystore_json(&s).unwrap_err());
+    }
+    if let Some(s) = tmp_s {
+        return Err(parse_keystore_json(&s).unwrap_err());
+    }
+    Ok(None)
+}
+
+fn save_keystore_v1_unlocked(
     cfg: &StorageConfig,
     ks: &KeystoreV1,
 ) -> Result<PathBuf, KeystoreStorageError> {
+    use std::io::Write;
     let path = keystore_v1_path(cfg)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -166,9 +320,41 @@ pub fn save_keystore_v1(
 
     let tmp_path = path.with_extension("json.tmp");
     let json = ks.to_json_string()?;
-    fs::write(&tmp_path, json.as_bytes())?;
+    {
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        restrict_private_file(&tmp_path)?;
+    }
     fs::rename(&tmp_path, &path)?;
+    restrict_private_file(&path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(path)
+}
+
+fn with_keystore_io<T>(
+    cfg: &StorageConfig,
+    f: impl FnOnce() -> Result<T, KeystoreStorageError>,
+) -> Result<T, KeystoreStorageError> {
+    let _guard = KeystoreIoGuard::acquire(cfg)?;
+    f()
+}
+
+pub fn load_keystore_v1(
+    cfg: &StorageConfig,
+) -> Result<Option<StoredKeystore>, KeystoreStorageError> {
+    with_keystore_io(cfg, || load_keystore_v1_unlocked(cfg))
+}
+
+pub fn save_keystore_v1(
+    cfg: &StorageConfig,
+    ks: &KeystoreV1,
+) -> Result<PathBuf, KeystoreStorageError> {
+    with_keystore_io(cfg, || save_keystore_v1_unlocked(cfg, ks))
 }
 
 /// High-level helper for UI:
@@ -187,15 +373,22 @@ pub fn create_or_unlock_identity_v1_with_algorithm(
     password: &str,
     create_algorithm: Option<IdentityAlgorithm>,
 ) -> Result<DecryptedIdentity, KeystoreStorageError> {
-    if let Some(stored) = load_keystore_v1(cfg)? {
-        let id = unlock_keystore_v1(password, &stored.keystore)?;
-        return Ok(id);
+    if password.trim().is_empty() {
+        return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
+            "password must not be empty",
+        )));
     }
+    with_keystore_io(cfg, || {
+        if let Some(stored) = load_keystore_v1_unlocked(cfg)? {
+            let id = unlock_keystore_v1(password, &stored.keystore)?;
+            return Ok(id);
+        }
 
-    let algo = create_algorithm.unwrap_or(IdentityAlgorithm::Secp256k1);
-    let (ks, id) = create_keystore_v1_with_algorithm(password, algo, None)?;
-    let _ = save_keystore_v1(cfg, &ks)?;
-    Ok(id)
+        let algo = create_algorithm.unwrap_or(IdentityAlgorithm::Secp256k1);
+        let (ks, id) = create_keystore_v1_with_algorithm(password, algo, None)?;
+        let _ = save_keystore_v1_unlocked(cfg, &ks)?;
+        Ok(id)
+    })
 }
 
 /// First-time setup: encrypt [secret_key_hex] (64 hex chars) with [password] and persist.
@@ -220,16 +413,18 @@ pub fn import_identity_from_secret_hex_v1_with_algorithm(
     secret_key_hex: &str,
     algorithm: IdentityAlgorithm,
 ) -> Result<DecryptedIdentity, KeystoreStorageError> {
-    if keystore_v1_file_exists(cfg)? {
-        return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
-            "keystore already exists; delete identity before import",
-        )));
-    }
-    let secret = parse_secret_bytes_for_algorithm(algorithm, secret_key_hex)?;
-    let (ks, id) =
-        create_keystore_v1_from_secret_with_algorithm(password, algorithm, &secret, None)?;
-    let _ = save_keystore_v1(cfg, &ks)?;
-    Ok(id)
+    with_keystore_io(cfg, || {
+        if keystore_v1_path(cfg)?.exists() {
+            return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
+                "keystore already exists; delete identity before import",
+            )));
+        }
+        let secret = parse_secret_bytes_for_algorithm(algorithm, secret_key_hex)?;
+        let (ks, id) =
+            create_keystore_v1_from_secret_with_algorithm(password, algorithm, &secret, None)?;
+        let _ = save_keystore_v1_unlocked(cfg, &ks)?;
+        Ok(id)
+    })
 }
 
 /// Verify [password] and return the secret key hex (sensitive) + algorithm.
@@ -253,20 +448,30 @@ pub fn export_keystore_json_v1(cfg: &StorageConfig) -> Result<String, KeystoreSt
 }
 
 /// Restore from exported JSON when no keystore exists; [password] must unlock the blob.
+/// Matches picker ceiling (`MAX_PICKED_BACKUP_BYTES`) — real keystores are under 1 KB.
+const MAX_KEYSTORE_JSON_IMPORT_BYTES: usize = 1024 * 1024;
+
 pub fn import_keystore_from_json_v1(
     cfg: &StorageConfig,
     password: &str,
     keystore_json: &str,
 ) -> Result<DecryptedIdentity, KeystoreStorageError> {
-    if keystore_v1_file_exists(cfg)? {
+    if keystore_json.len() > MAX_KEYSTORE_JSON_IMPORT_BYTES {
         return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
-            "keystore already exists; delete identity before import",
+            "keystore JSON exceeds size limit",
         )));
     }
-    let ks = KeystoreV1::from_json_str(keystore_json)?;
-    let id = unlock_keystore_v1(password, &ks)?;
-    let _ = save_keystore_v1(cfg, &ks)?;
-    Ok(id)
+    with_keystore_io(cfg, || {
+        if keystore_v1_path(cfg)?.exists() {
+            return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
+                "keystore already exists; delete identity before import",
+            )));
+        }
+        let ks = KeystoreV1::from_json_str(keystore_json)?;
+        let id = unlock_keystore_v1(password, &ks)?;
+        let _ = save_keystore_v1_unlocked(cfg, &ks)?;
+        Ok(id)
+    })
 }
 
 /// Re-encrypt the on-disk keystore under a new app password.
@@ -281,34 +486,39 @@ pub fn change_password_v1(
     old_password: &str,
     new_password: &str,
 ) -> Result<DecryptedIdentity, KeystoreStorageError> {
-    if new_password.is_empty() {
+    if new_password.trim().is_empty() {
         return Err(KeystoreStorageError::Crypto(KeystoreError::Invalid(
             "new password must not be empty",
         )));
     }
-    let stored = load_keystore_v1(cfg)?.ok_or(KeystoreStorageError::Crypto(
-        KeystoreError::Invalid("no keystore on disk"),
-    ))?;
-    let id = unlock_keystore_v1(old_password, &stored.keystore)?;
-    let algorithm = id.algorithm();
-    let secret_hex = secret_key_hex_from_identity(&id);
-    let secret = parse_secret_bytes_for_algorithm(algorithm, &secret_hex)?;
-    let (ks, new_id) =
-        create_keystore_v1_from_secret_with_algorithm(new_password, algorithm, &secret, None)?;
-    let _ = save_keystore_v1(cfg, &ks)?;
-    Ok(new_id)
+    with_keystore_io(cfg, || {
+        let stored = load_keystore_v1_unlocked(cfg)?.ok_or(KeystoreStorageError::Crypto(
+            KeystoreError::Invalid("no keystore on disk"),
+        ))?;
+        let id = unlock_keystore_v1(old_password, &stored.keystore)?;
+        let algorithm = id.algorithm();
+        let secret_hex = secret_key_hex_from_identity(&id);
+        let secret = parse_secret_bytes_for_algorithm(algorithm, &secret_hex)?;
+        let (ks, new_id) =
+            create_keystore_v1_from_secret_with_algorithm(new_password, algorithm, &secret, None)?;
+        let _ = save_keystore_v1_unlocked(cfg, &ks)?;
+        Ok(new_id)
+    })
 }
 
 /// Removes `keystore_v1.json` and `preferences_v1.json` for [cfg] if they exist.
 pub fn delete_stored_identity_v1(cfg: &StorageConfig) -> Result<(), KeystoreStorageError> {
-    let kp = keystore_v1_path(cfg)?;
-    if kp.exists() {
-        fs::remove_file(&kp)?;
-    }
-    let tmp = kp.with_extension("json.tmp");
-    if tmp.exists() {
-        let _ = fs::remove_file(&tmp);
-    }
+    with_keystore_io(cfg, || {
+        let kp = keystore_v1_path(cfg)?;
+        if kp.exists() {
+            fs::remove_file(&kp)?;
+        }
+        let tmp = kp.with_extension("json.tmp");
+        if tmp.exists() {
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(())
+    })?;
     crate::preferences_v1::delete_preferences_v1_file(cfg)?;
     Ok(())
 }
@@ -323,7 +533,9 @@ pub fn reset_first_time_identity_v1(cfg: &StorageConfig) -> Result<(), KeystoreS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keystore_v1::create_keystore_v1;
+    use crate::keystore_v1::{
+        create_keystore_v1, create_keystore_v1_from_secret_with_algorithm, unlock_keystore_v1,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -426,6 +638,46 @@ mod tests {
         let cfg = StorageConfig::new("dev.chpw3").with_override_data_dir(td.path());
         let _ = create_or_unlock_identity_v1(&cfg, "oldpw").unwrap();
         assert!(change_password_v1(&cfg, "oldpw", "").is_err());
+        assert!(change_password_v1(&cfg, "oldpw", "   \t").is_err());
+    }
+
+    #[test]
+    fn import_keystore_json_rejects_oversized_blob() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.huge.ks").with_override_data_dir(td.path());
+        let huge = "x".repeat(MAX_KEYSTORE_JSON_IMPORT_BYTES + 1);
+        let err = import_keystore_from_json_v1(&cfg, "pw", &huge).unwrap_err();
+        assert!(err.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn concurrent_first_create_yields_one_identity() {
+        use std::sync::Arc;
+        use std::thread;
+        let td = TempDir::new().unwrap();
+        let cfg = Arc::new(StorageConfig::new("dev.race").with_override_data_dir(td.path()));
+        let mut handles = Vec::new();
+        // Same password so losers unlock the winner's blob instead of failing decrypt.
+        for _ in 0..8 {
+            let cfg = Arc::clone(&cfg);
+            handles.push(thread::spawn(move || create_or_unlock_identity_v1(&cfg, "same-pw")));
+        }
+        let mut pks = Vec::new();
+        for h in handles {
+            pks.push(h.join().unwrap().unwrap().public_key_hex().to_string());
+        }
+        pks.sort();
+        pks.dedup();
+        assert_eq!(pks.len(), 1, "parallel create must not mint multiple identities");
+        assert!(load_keystore_v1(&cfg).unwrap().is_some());
+    }
+
+    #[test]
+    fn create_rejects_whitespace_only_password() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.empty.pw").with_override_data_dir(td.path());
+        assert!(create_or_unlock_identity_v1(&cfg, "").is_err());
+        assert!(create_or_unlock_identity_v1(&cfg, "  \n").is_err());
     }
 
     #[test]
@@ -481,5 +733,249 @@ mod tests {
         let path = linux_install_data_root("com.ghalbol.debug").unwrap();
         assert!(path.ends_with("com.ghalbol.debug"));
         assert!(!path.ends_with("com.ghalbol"));
+    }
+
+    #[test]
+    fn sanitize_namespace_rejects_traversal_and_control_chars() {
+        assert!(sanitize_namespace("com.ghalbol.debug").is_ok());
+        assert!(matches!(
+            sanitize_namespace("../escape"),
+            Err(KeystoreStorageError::BadNamespace)
+        ));
+        assert!(matches!(
+            sanitize_namespace("com/evil"),
+            Err(KeystoreStorageError::BadNamespace)
+        ));
+        assert!(matches!(
+            sanitize_namespace("com\nev"),
+            Err(KeystoreStorageError::BadNamespace)
+        ));
+        assert!(matches!(
+            sanitize_namespace("."),
+            Err(KeystoreStorageError::BadNamespace)
+        ));
+    }
+
+    #[test]
+    fn bad_namespace_rejects_keystore_path() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("bad/../x").with_override_data_dir(td.path());
+        assert!(matches!(
+            keystore_v1_path(&cfg),
+            Err(KeystoreStorageError::BadNamespace)
+        ));
+    }
+
+    #[test]
+    fn load_recovers_newer_tmp_after_interrupted_save() {
+        use std::io::Write;
+        use std::thread;
+        use std::time::Duration;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.tmprec").with_override_data_dir(td.path());
+        let id1 = create_or_unlock_identity_v1(&cfg, "oldpw").unwrap();
+        let (sk_hex, algo) = reveal_secret_key_hex_v1(&cfg, "oldpw").unwrap();
+        let secret = parse_secret_bytes_for_algorithm(algo, &sk_hex).unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+
+        // Simulate crash after tmp write: main still `oldpw`, tmp holds `newpw` rewrap.
+        let (new_ks, _) =
+            create_keystore_v1_from_secret_with_algorithm("newpw", algo, &secret, None).unwrap();
+        let new_json = new_ks.to_json_string().unwrap();
+        {
+            let mut f = fs::File::create(&tmp_path).unwrap();
+            f.write_all(new_json.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        thread::sleep(Duration::from_millis(20));
+
+        let stored = load_keystore_v1(&cfg).unwrap().expect("keystore present");
+        let id2 = unlock_keystore_v1("newpw", &stored.keystore).unwrap();
+        assert_eq!(id1.public_key_hex(), id2.public_key_hex());
+        assert!(!tmp_path.exists());
+        assert!(create_or_unlock_identity_v1(&cfg, "newpw").is_ok());
+    }
+
+    #[test]
+    fn load_rejects_oversize_on_disk_file() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.bigfile").with_override_data_dir(td.path());
+        let path = keystore_v1_path(&cfg).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![b'x'; MAX_KEYSTORE_ON_DISK_BYTES + 1]).unwrap();
+        let err = load_keystore_v1(&cfg).unwrap_err();
+        assert!(err.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn load_corrupt_main_uses_valid_tmp() {
+        use std::io::Write;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.corrupt").with_override_data_dir(td.path());
+        let _ = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+        let good = fs::read_to_string(&path).unwrap();
+        // Hold the IO mutex while planting corrupt main + durable tmp so a parallel
+        // save/load cannot observe a half-written recovery pair.
+        {
+            let _guard = keystore_io().lock().unwrap();
+            {
+                let mut f = fs::File::create(&path).unwrap();
+                f.write_all(b"{not json").unwrap();
+                f.sync_all().unwrap();
+            }
+            {
+                let mut f = fs::File::create(&tmp_path).unwrap();
+                f.write_all(good.as_bytes()).unwrap();
+                f.sync_all().unwrap();
+            }
+        }
+        let stored = load_keystore_v1(&cfg).unwrap().expect("recovered");
+        assert!(unlock_keystore_v1("pw", &stored.keystore).is_ok());
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn change_password_leaves_no_orphan_tmp() {
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.notmp").with_override_data_dir(td.path());
+        let _ = create_or_unlock_identity_v1(&cfg, "oldpw").unwrap();
+        change_password_v1(&cfg, "oldpw", "newpw").unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn save_finishes_rename_after_crash_left_tmp_only() {
+        use std::io::Write;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.crashsave").with_override_data_dir(td.path());
+        let id1 = create_or_unlock_identity_v1(&cfg, "pw1").unwrap();
+        let (sk_hex, algo) = reveal_secret_key_hex_v1(&cfg, "pw1").unwrap();
+        let secret = parse_secret_bytes_for_algorithm(algo, &sk_hex).unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+        let (new_ks, _) =
+            create_keystore_v1_from_secret_with_algorithm("pw2", algo, &secret, None).unwrap();
+        let json = new_ks.to_json_string().unwrap();
+        fs::remove_file(&path).unwrap();
+        {
+            let mut f = fs::File::create(&tmp_path).unwrap();
+            f.write_all(json.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(!path.exists());
+        assert!(tmp_path.exists());
+
+        let stored = load_keystore_v1(&cfg).unwrap().expect("adopts tmp-only");
+        let id2 = unlock_keystore_v1("pw2", &stored.keystore).unwrap();
+        assert_eq!(id1.public_key_hex(), id2.public_key_hex());
+        assert!(path.exists());
+        assert!(!tmp_path.exists());
+
+        let _ = save_keystore_v1(&cfg, &stored.keystore).unwrap();
+        assert!(path.exists());
+        assert!(!tmp_path.exists());
+        let again = load_keystore_v1(&cfg).unwrap().unwrap();
+        assert!(unlock_keystore_v1("pw2", &again.keystore).is_ok());
+    }
+
+    #[test]
+    fn keystore_lock_file_is_exclusive() {
+        use fs4::fs_std::FileExt;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.flock").with_override_data_dir(td.path());
+        let _ = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let lock_path = path.with_extension("json.lock");
+        assert!(lock_path.exists());
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held.lock_exclusive().unwrap();
+        let challenger = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            !challenger.try_lock_exclusive().unwrap(),
+            "second exclusive flock must fail while held"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_keystore_file_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.mode").with_override_data_dir(td.path());
+        let _ = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let lock_path = path.with_extension("json.lock");
+        let lock_mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(lock_mode, 0o600);
+    }
+
+    #[test]
+    fn load_recovers_valid_tmp_when_main_is_invalid_utf8() {
+        use std::io::Write;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.utf8.ks").with_override_data_dir(td.path());
+        let _ = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+        let good = fs::read(&path).unwrap();
+        fs::write(&path, &[0xff, 0xfe, 0x00, 0x01]).unwrap();
+        {
+            let mut f = fs::File::create(&tmp_path).unwrap();
+            f.write_all(&good).unwrap();
+            f.sync_all().unwrap();
+        }
+        let stored = load_keystore_v1(&cfg).unwrap().expect("tmp recovers");
+        assert!(unlock_keystore_v1("pw", &stored.keystore).is_ok());
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn adopt_keystore_tmp_keeps_durable_tmp_on_rename_failure() {
+        use std::io::Write;
+
+        let td = TempDir::new().unwrap();
+        let cfg = StorageConfig::new("dev.adoptfail").with_override_data_dir(td.path());
+        let _ = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = keystore_v1_path(&cfg).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+        let good = fs::read_to_string(&path).unwrap();
+        {
+            let mut f = fs::File::create(&tmp_path).unwrap();
+            f.write_all(good.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let stored = load_keystore_v1_unlocked(&cfg).unwrap().expect("reads tmp");
+        assert!(unlock_keystore_v1("pw", &stored.keystore).is_ok());
+        assert!(
+            tmp_path.exists(),
+            "rename onto directory must fail; durable tmp must not be deleted"
+        );
+
+        fs::remove_dir(&path).unwrap();
+        let _ = load_keystore_v1(&cfg).unwrap();
+        assert!(!tmp_path.exists());
     }
 }

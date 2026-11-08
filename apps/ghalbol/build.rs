@@ -50,6 +50,16 @@ fn main() {
         }
     });
 
+    match ghalbol_env.as_str() {
+        "development" | "production" => {}
+        other => {
+            panic!(
+                "GHALBOL_ENV must be development or production, got {:?}",
+                other
+            );
+        }
+    }
+
     let env_path = env_dir().join(format!("{ghalbol_env}.env"));
     println!("cargo:rerun-if-changed={}", env_path.display());
     println!("cargo:rerun-if-env-changed=GHALBOL_ENV");
@@ -59,6 +69,7 @@ fn main() {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
+    let mut file_ghalbol_env = String::new();
     if let Ok(text) = fs::read_to_string(&env_path) {
         for line in text.lines() {
             let line = line.trim();
@@ -70,15 +81,58 @@ fn main() {
             };
             let key = key.trim();
             let value = value.trim().trim_matches('"').trim_matches('\'');
-            if !key.is_empty() {
-                vars.insert(key.to_string(), value.to_string());
+            if key.is_empty() {
+                continue;
+            }
+            let valid_key = key
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid_key {
+                continue;
+            }
+            vars.insert(key.to_string(), value.to_string());
+            if key == "GHALBOL_ENV" {
+                file_ghalbol_env = value.to_string();
             }
         }
+    } else if ghalbol_env == "production" {
+        panic!(
+            "GhalBol production env file missing at {} — refusing release bake with defaults",
+            env_path.display()
+        );
     } else {
         println!(
             "cargo:warning=GhalBol env file missing at {} — using built-in defaults",
             env_path.display()
         );
+    }
+
+    if !file_ghalbol_env.is_empty() && file_ghalbol_env != ghalbol_env {
+        panic!(
+            "GHALBOL_ENV in {} is {:?} but build selected {:?}",
+            env_path.display(),
+            file_ghalbol_env,
+            ghalbol_env
+        );
+    }
+
+    if ghalbol_env == "production" {
+        for req in ["GHALBOL_APP_ID", "GHALBOL_APP_LABEL", "GHALBOL_COORD_URLS", "GHALBOL_DELIVERY_URL"]
+        {
+            let v = vars.get(req).map(String::as_str).unwrap_or("");
+            if v.is_empty() {
+                panic!(
+                    "GhalBol production env file at {} missing required key {}",
+                    env_path.display(),
+                    req
+                );
+            }
+        }
     }
 
     // Ensure ENV key matches the selected profile even if the file omits it.

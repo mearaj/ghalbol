@@ -13,6 +13,9 @@ pub fn normalize_contact_identity_wire(s: &str) -> Result<String, String> {
 }
 
 /// True when `s` is a valid contact identity wire string.
+pub fn is_valid_contact_identity_wire(s: &str) -> bool {
+    normalize_contact_identity_wire(s).is_ok()
+}
 
 fn secp256k1_protobuf_bytes(pk: &[u8]) -> Option<Vec<u8>> {
     if pk.len() != 33 {
@@ -74,6 +77,15 @@ pub fn legacy_libp2p_peer_id_str_from_public_key_hex(hex_s: &str) -> Option<Stri
 mod tests {
     use super::*;
     use crate::create_keystore_v1;
+
+    #[test]
+    fn is_valid_contact_identity_wire_rejects_garbage() {
+        assert!(!is_valid_contact_identity_wire(""));
+        assert!(!is_valid_contact_identity_wire("not-hex"));
+        assert!(!is_valid_contact_identity_wire(&"ab".repeat(1000)));
+        let (_ks, id) = create_keystore_v1("t-valid", None).unwrap();
+        assert!(is_valid_contact_identity_wire(&id.identity_wire()));
+    }
 
     #[test]
     fn same_contact_pk_matches_case() {

@@ -10,6 +10,20 @@ use super::recovery::clear_coord_lookup_backoff_for_pk;
 pub const LOOKUP_BACKGROUND_CAP: usize = 4;
 /// Recent disconnect stays urgent this long.
 const URGENT_WINDOW_MS: i64 = 60_000;
+/// Bound urgent map under adversarial disconnect floods.
+const MAX_URGENT_ENTRIES: usize = 4_096;
+/// Background rotation queue — same order of magnitude as contact roster caps.
+const MAX_BACKGROUND_LOOKUP_QUEUE: usize = 4_096;
+
+fn trim_urgent_map(g: &mut HashMap<String, i64>, now: i64) {
+    g.retain(|_, at| now.saturating_sub(*at) <= URGENT_WINDOW_MS);
+    while g.len() > MAX_URGENT_ENTRIES {
+        let Some(oldest) = g.iter().min_by_key(|(_, at)| *at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        g.remove(&oldest);
+    }
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -30,23 +44,23 @@ fn background_cursor() -> &'static Mutex<VecDeque<String>> {
 
 /// Call when a native session drops — peer becomes urgent for the next minute.
 pub fn note_peer_disconnect_urgent(public_key_hex: &str) {
-    let pk = public_key_hex.trim();
-    if pk.is_empty() || !crate::contacts_v1::is_valid_public_key_hex(pk) {
+    let Ok(pk) = crate::public_key_util::normalize_contact_identity_wire(public_key_hex) else {
         return;
-    }
-    clear_coord_lookup_backoff_for_pk(pk);
+    };
+    clear_coord_lookup_backoff_for_pk(&pk);
+    let now = now_ms();
     if let Ok(mut g) = urgent_map().lock() {
-        g.insert(pk.to_string(), now_ms());
+        g.insert(pk, now);
+        trim_urgent_map(&mut g, now);
     }
 }
 
 /// Intent beats backoff: open chat / queued outbound / call.
 pub fn note_peer_lookup_intent(public_key_hex: &str) {
-    let pk = public_key_hex.trim();
-    if pk.is_empty() || !crate::contacts_v1::is_valid_public_key_hex(pk) {
+    let Ok(pk) = crate::public_key_util::normalize_contact_identity_wire(public_key_hex) else {
         return;
-    }
-    clear_coord_lookup_backoff_for_pk(pk);
+    };
+    clear_coord_lookup_backoff_for_pk(&pk);
 }
 
 fn take_urgent(now: i64) -> Vec<String> {
@@ -123,13 +137,22 @@ pub fn peers_for_lookup_tick(
                     .any(|c| c.eq_ignore_ascii_case(x))
             });
         }
+        while q.len() > MAX_BACKGROUND_LOOKUP_QUEUE {
+            q.pop_front();
+        }
+        // Bound scans to queue length so skipped (priority/urgent/connected) peers do not
+        // drain the rotation without filling the background cap — starvation on large rosters.
+        let queue_len = q.len();
         let mut bg = 0usize;
-        while bg < LOOKUP_BACKGROUND_CAP {
+        let mut scans = 0usize;
+        while bg < LOOKUP_BACKGROUND_CAP && scans < queue_len {
             let Some(pk) = q.pop_front() else {
                 break;
             };
-            if seen.contains(&pk.to_ascii_lowercase()) || connected.contains(&pk.to_ascii_lowercase())
-            {
+            scans += 1;
+            let key = pk.to_ascii_lowercase();
+            if seen.contains(&key) || connected.contains(&key) {
+                q.push_back(pk);
                 continue;
             }
             push(&pk, &mut out, &mut seen);
@@ -145,8 +168,78 @@ pub fn peers_for_lookup_tick(
 mod tests {
     use super::*;
 
+    fn reset_lookup_schedule_globals() {
+        if let Ok(mut g) = urgent_map().lock() {
+            g.clear();
+        }
+        if let Ok(mut q) = background_cursor().lock() {
+            q.clear();
+        }
+    }
+
+    #[test]
+    fn background_fills_cap_when_queue_front_matches_priority() {
+        reset_lookup_schedule_globals();
+        let all: Vec<String> = (0..12).map(|i| format!("{:064x}", i + 10)).collect();
+        let priority = vec![all[0].clone(), all[1].clone()];
+        let list = peers_for_lookup_tick(&[], &priority, &all, &[]);
+        assert_eq!(list[0], all[0]);
+        assert_eq!(list[1], all[1]);
+        assert_eq!(list.len(), 2 + LOOKUP_BACKGROUND_CAP);
+        for p in list.iter().skip(2) {
+            assert_ne!(p, &all[0]);
+            assert_ne!(p, &all[1]);
+        }
+    }
+
+    #[test]
+    fn urgent_map_hard_caps_under_flood() {
+        reset_lookup_schedule_globals();
+        // Insert directly — `note_peer_disconnect_urgent` rejects non-curve points before insert.
+        {
+            let Ok(mut g) = urgent_map().lock() else {
+                return;
+            };
+            let now = now_ms();
+            for i in 0..(MAX_URGENT_ENTRIES + 32) {
+                g.insert(format!("peer-{i}"), now - 1_000);
+            }
+            trim_urgent_map(&mut g, now);
+            assert_eq!(g.len(), MAX_URGENT_ENTRIES);
+        }
+        reset_lookup_schedule_globals();
+    }
+
+    #[test]
+    fn urgent_map_evicts_oldest_not_arbitrary() {
+        let now = 10_000_000i64;
+        let mut g = HashMap::new();
+        for i in 0..(MAX_URGENT_ENTRIES + 2) {
+            g.insert(format!("peer-{i}"), now - 1_000 + i as i64);
+        }
+        trim_urgent_map(&mut g, now);
+        assert_eq!(g.len(), MAX_URGENT_ENTRIES);
+        assert!(!g.contains_key("peer-0"));
+        assert!(!g.contains_key("peer-1"));
+        assert!(g.contains_key(&format!("peer-{}", MAX_URGENT_ENTRIES + 1)));
+    }
+
+    #[test]
+    fn background_queue_bounded_under_huge_roster() {
+        reset_lookup_schedule_globals();
+        let all: Vec<String> = (0..5000).map(|i| format!("{:064x}", i + 100)).collect();
+        let _ = peers_for_lookup_tick(&[], &[], &all, &[]);
+        let q_len = background_cursor()
+            .lock()
+            .map(|q| q.len())
+            .unwrap_or(0);
+        assert!(q_len <= MAX_BACKGROUND_LOOKUP_QUEUE);
+        reset_lookup_schedule_globals();
+    }
+
     #[test]
     fn priority_before_background_and_cap() {
+        reset_lookup_schedule_globals();
         let all: Vec<String> = (0..20).map(|i| format!("{:064x}", i + 1)).collect();
         // Valid-looking hex lengths — use real-shaped fake keys of 66 chars for filter.
         // is_valid is not used in peers_for_lookup_tick itself.

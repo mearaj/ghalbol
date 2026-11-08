@@ -29,7 +29,7 @@ PUBLIC_IP=""
 PUBLIC_IP="$(resolve_a "${HOST}")"
 LOCAL_CACHE_IP="$(getent ahostsv4 "${HOST}" 2>/dev/null | awk '{print $1; exit}' || true)"
 CURRENT_IP=""
-CURRENT_IP="$(curl -4 -fsS --connect-timeout 8 https://api.ipify.org 2>/dev/null || true)"
+CURRENT_IP="$(curl -4 -fsS --max-filesize 64 --connect-timeout 8 https://api.ipify.org 2>/dev/null || true)"
 
 note "GoDaddy DNS"
 if [[ -z "${PUBLIC_IP}" ]]; then
@@ -76,6 +76,7 @@ fi
 
 note "WSS upgrade /v1/bridge/connect (nginx must forward Upgrade)"
 WS_BODY="$(mktemp)"
+trap 'rm -f "${WS_BODY:-}"' EXIT
 WS_CODE="$(curl -sS -o "${WS_BODY}" -w "%{http_code}" --http1.1 --resolve "${HOST}:${HTTPS_PORT}:127.0.0.1" \
   --connect-timeout 10 --max-time 8 \
   -H "Connection: Upgrade" -H "Upgrade: websocket" \

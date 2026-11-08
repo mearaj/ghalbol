@@ -137,11 +137,29 @@ pub fn voice_play_progress() -> Option<(String, u32, u32)> {
     Some((p.path.clone(), elapsed.min(p.duration_ms), p.duration_ms))
 }
 
+/// Soft ceiling — product notes are ≤2 minutes; a hostile path must not map huge files.
+const MAX_VOICE_PLAY_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+fn voice_play_path_allowed(path: &str) -> Result<(), String> {
+    let ns = crate::dm_event_handler::active_app_namespace()
+        .or_else(crate::app_paths::detect_keystore_app_namespace)
+        .unwrap_or_else(|| crate::storage::ANDROID_LIBRARY_NAMESPACE.to_string());
+    let cfg = crate::app_paths::storage_config_for_namespace(&ns);
+    let canonical = crate::app_paths::resolve_user_file_path(&cfg, path)
+        .map_err(|_| "invalid voice path".to_string())?;
+    let lower = canonical.to_string_lossy().to_ascii_lowercase();
+    if !(lower.ends_with(".opus") || lower.ends_with(".wav")) {
+        return Err("voice path must be .opus or .wav".into());
+    }
+    if canonical.metadata().map_err(|e| e.to_string())?.len() > MAX_VOICE_PLAY_FILE_BYTES {
+        return Err("voice file too large".into());
+    }
+    Ok(())
+}
+
 pub fn play_opus_file(path: &str) -> Result<bool, String> {
     let path = path.trim().to_string();
-    if path.is_empty() {
-        return Err("missing voice note".into());
-    }
+    voice_play_path_allowed(&path)?;
     if let Ok(mut current) = playing_slot().lock() {
         if current.as_ref().is_some_and(|s| s.path == path) {
             play_stop().store(true, Ordering::Relaxed);
@@ -305,4 +323,16 @@ where
             None,
         )
         .map_err(|e| format!("speaker stream: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::voice_play_path_allowed;
+
+    #[test]
+    fn voice_play_rejects_path_climb_and_wrong_ext() {
+        assert!(voice_play_path_allowed("../etc/passwd").is_err());
+        assert!(voice_play_path_allowed("/tmp/note.txt").is_err());
+        assert!(voice_play_path_allowed("").is_err());
+    }
 }

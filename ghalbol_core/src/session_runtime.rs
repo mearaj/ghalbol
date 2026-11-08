@@ -41,6 +41,9 @@ pub fn unlock_identity(app_namespace: &str, password: &str) -> Value {
         Ok(Ok(ident)) => {
             let pk = ident.public_key_hex();
             let libp2p_peer_id = Some(ident.identity_wire());
+            if session_unlocked() {
+                crate::p2p_runtime::p2p_stop();
+            }
             if let Err(e) = install_session(ident) {
                 return serde_json::json!({ "ok": false, "error": e });
             }
@@ -60,6 +63,10 @@ pub fn unlock_identity(app_namespace: &str, password: &str) -> Value {
 }
 
 pub fn lock_identity() {
+    if !session_unlocked() {
+        return;
+    }
+    crate::p2p_runtime::p2p_stop();
     if let Ok(mut g) = session_mx().lock() {
         *g = None;
     }
@@ -78,4 +85,24 @@ pub(crate) fn install_unlocked_identity(
     ident: crate::DecryptedIdentity,
 ) -> Result<(), &'static str> {
     install_session(ident)
+}
+
+#[cfg(test)]
+mod lock_teardown_tests {
+    use super::*;
+    use crate::create_keystore_v1;
+
+    #[test]
+    fn lock_identity_clears_unlocked_session() {
+        crate::p2p_runtime::p2p_stop();
+        let (_ks, id) = create_keystore_v1("pw", None).unwrap();
+        install_unlocked_identity(id).unwrap();
+        assert!(session_unlocked());
+        crate::p2p::sync_foreground_peer_now(Some("aa".repeat(32)));
+        crate::p2p::set_app_ack_read_enabled(true);
+        lock_identity();
+        assert!(!session_unlocked());
+        assert!(crate::p2p::live_foreground_peer_pk().is_none());
+        assert!(!crate::p2p::may_send_read_ack_for_contact_pk(&"aa".repeat(32)));
+    }
 }

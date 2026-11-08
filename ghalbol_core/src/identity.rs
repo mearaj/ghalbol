@@ -269,9 +269,15 @@ pub fn percent_decode_uri_component(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Longest supported identity public key on the wire (uncompressed P-256 SEC1).
+const MAX_IDENTITY_PUBKEY_HEX_LEN: usize = 132;
+
 fn decode_pubkey_hex(hex_s: &str) -> Result<Vec<u8>, String> {
     let s = hex_s.trim();
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if s.is_empty()
+        || s.len() > MAX_IDENTITY_PUBKEY_HEX_LEN
+        || !s.chars().all(|c| c.is_ascii_hexdigit())
+    {
         return Err("public key: invalid hex".to_string());
     }
     hex::decode(s).map_err(|e| format!("public key hex: {e}"))
@@ -329,5 +335,12 @@ mod tests {
     fn ml_dsa65_wire_rejects() {
         assert!(Identity::parse("ml-dsa-65:deadbeef").is_err());
         assert!(IdentityAlgorithm::from_wire_id("ml-dsa-65").is_err());
+    }
+
+    #[test]
+    fn pubkey_hex_rejects_oversized() {
+        let huge = "ab".repeat(MAX_IDENTITY_PUBKEY_HEX_LEN + 1);
+        assert!(Identity::parse(&huge).is_err());
+        assert!(Identity::parse(&format!("ed25519:{huge}")).is_err());
     }
 }

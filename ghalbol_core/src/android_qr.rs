@@ -64,13 +64,24 @@ fn publish_preview_y(y: &[u8], width: u32, height: u32, y_row: usize) {
 }
 
 fn gray_from_y(y: &[u8], width: usize, height: usize, y_row: usize) -> Option<Vec<u8>> {
-    if width == 0 || height == 0 || y_row < width || y.len() < y_row * (height - 1) + width {
+    if width == 0 || height == 0 || y_row < width {
         return None;
     }
-    let mut gray = vec![0u8; width * height];
+    let need = width.checked_mul(height)?;
+    if need > 16 * 1024 * 1024 {
+        return None;
+    }
+    let min_y = y_row
+        .checked_mul(height.checked_sub(1)?)?
+        .checked_add(width)?;
+    if y.len() < min_y {
+        return None;
+    }
+    let mut gray = vec![0u8; need];
     for row in 0..height {
-        gray[row * width..row * width + width]
-            .copy_from_slice(&y[row * y_row..row * y_row + width]);
+        let dst = row.checked_mul(width)?;
+        let src = row.checked_mul(y_row)?;
+        gray[dst..dst + width].copy_from_slice(&y[src..src + width]);
     }
     Some(gray)
 }
@@ -138,6 +149,7 @@ mod ndk {
                                     }
                                     cancel_flag().store(true, Ordering::SeqCst);
                                     CAPTURE.store(false, Ordering::Relaxed);
+                                    stop_camera();
                                 }
                             }
                             DECODE_BUSY.store(false, Ordering::Release);
@@ -161,8 +173,11 @@ mod ndk {
 
     pub fn stop_camera() {
         CAPTURE.store(false, Ordering::Relaxed);
-        // Take under the lock; the camera tears down when dropped outside it.
-        let camera = live().lock().ok().and_then(|mut g| g.take());
+        // Take under the lock; stop preview then tear down outside the lock.
+        let mut camera = live().lock().ok().and_then(|mut g| g.take());
+        if let Some(cam) = camera.as_mut() {
+            cam.stop();
+        }
         drop(camera);
     }
 }

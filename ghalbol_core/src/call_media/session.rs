@@ -130,7 +130,10 @@ pub async fn run_media_session(
             _ = stop_poll.tick() => {}
         }
     }
-    audio.playout_tx.closed().await;
+    engine.reset_receive_state();
+    // Drop our sender so we never block teardown waiting on `closed()` while we
+    // still hold this `Sender` handle.
+    drop(audio.playout_tx);
 }
 
 /// Test/headless audio backend: feeds preset capture frames, collects playout.
@@ -253,5 +256,28 @@ mod tests {
             played.iter().any(|f| f.iter().any(|&s| s != 0)),
             "B never played non-silent audio from A",
         );
+    }
+
+    #[tokio::test]
+    async fn stop_exits_session_promptly() {
+        let (out_tx, _out_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (_in_tx, in_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (mut backend, _) = MockAudioBackend::new(vec![tone(1)]);
+        let audio = backend.start().unwrap();
+        let eng = MediaEngine::new(&key(), true, Box::new(NullCodec), Box::new(NullCodec));
+        let ctl = MediaControls::new();
+        let h = tokio::spawn(run_media_session(
+            eng,
+            audio,
+            out_tx,
+            in_rx,
+            ctl.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        ctl.request_stop();
+        let _ = tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("session must exit within 1s after stop")
+            .expect("session task finished");
     }
 }

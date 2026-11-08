@@ -40,6 +40,12 @@ ghalbol_delivery import-mailbox --in mailbox-export.tar.zst --replace
 | `GHALBOL_DELIVERY_DATA_DIR` | `~/.local/share/com.ghalbol.delivery/ghalbol_delivery/` |
 | `GHALBOL_DDNS_CREDENTIALS` | unset — enables in-process GoDaddy DDNS when set |
 | `GHALBOL_DELIVERY_INSTANCE_ID` | hostname — exposed in `/health` for ops |
+| `GHALBOL_DELIVERY_MAX_WS_MESSAGE_BYTES` | `12582912` (12 MiB) |
+| `GHALBOL_DELIVERY_MAX_CONNECTIONS` | `4096` |
+| `GHALBOL_DELIVERY_MAX_FRAMES_PER_SEC` | `200` |
+| `GHALBOL_DELIVERY_AUTH_TIMEOUT_SECS` | `30` |
+
+SIGTERM and Ctrl-C stop new work, close mailbox sockets, stop the TTL sweeper, checkpoint SQLite, and then exit.
 
 ## Test
 

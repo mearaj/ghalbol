@@ -29,7 +29,7 @@ PUBLIC_IP=""
 PUBLIC_IP="$(resolve_a "${HOST}")"
 LOCAL_CACHE_IP="$(getent ahostsv4 "${HOST}" 2>/dev/null | awk '{print $1; exit}' || true)"
 CURRENT_IP=""
-CURRENT_IP="$(curl -4 -fsS --connect-timeout 8 https://api.ipify.org 2>/dev/null || true)"
+CURRENT_IP="$(curl -4 -fsS --max-filesize 64 --connect-timeout 8 https://api.ipify.org 2>/dev/null || true)"
 if [[ -z "${CURRENT_IP}" && -f "${DDNS_LAST_IP}" ]]; then
   CURRENT_IP="$(tr -d '[:space:]' < "${DDNS_LAST_IP}")"
 fi

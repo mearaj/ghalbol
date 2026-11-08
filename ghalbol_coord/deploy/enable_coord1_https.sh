@@ -6,9 +6,7 @@
 #
 # Run as normal user — one sudo password:
 #   ./ghalbol_coord/deploy/enable_coord1_https.sh
-if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-  exec sudo -E /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" "$@"
-fi
+set -euo pipefail
 
 DEPLOY_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 HOST="${COORD1_HOST:-coord1.ghalbol.com}"
@@ -25,8 +23,23 @@ fail() {
   exit 1
 }
 
+# --- user checks first (no sudo) ---
 echo "== preflight: coord on 127.0.0.1:8765 =="
 curl -fsS "http://127.0.0.1:8765/health" >/dev/null || fail "coord not on 127.0.0.1:8765 — run install_coord1_home.sh first"
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "== sudo once for nginx (${HOST} :${HTTPS_PORT}) =="
+  # Do not use sudo -E: a cargo/rust env from install in the same shell can break auth.
+  exec sudo \
+    COORD1_HOST="${HOST}" \
+    COORD1_HTTPS_PORT="${HTTPS_PORT}" \
+    COORD1_SELF_SIGNED="${COORD1_SELF_SIGNED:-0}" \
+    /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --as-root
+fi
+
+if [[ "${1:-}" == "--as-root" ]]; then
+  shift
+fi
 
 mkdir -p /etc/nginx/conf.d "${WEBROOT}/.well-known/acme-challenge"
 

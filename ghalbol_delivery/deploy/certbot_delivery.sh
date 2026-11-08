@@ -7,13 +7,20 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST="${DELIVERY_HOST:-delivery.ghalbol.com}"
-EMAIL="${CERTBOT_EMAIL:-mearajbhagad@gmail.com}"
+EMAIL="${CERTBOT_EMAIL:-}"
 LE_FULLCHAIN="/etc/letsencrypt/live/${HOST}/fullchain.pem"
 
 if [[ "${1:-}" == "--issue" ]]; then
+  if [[ -z "${EMAIL}" ]]; then
+    echo "error: set CERTBOT_EMAIL for Let's Encrypt" >&2
+    exit 1
+  fi
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "== certbot_delivery.sh: sudo once for certbot + nginx =="
-    exec sudo /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --issue
+    exec sudo \
+      CERTBOT_EMAIL="${CERTBOT_EMAIL}" \
+      DELIVERY_HOST="${DELIVERY_HOST:-delivery.ghalbol.com}" \
+      /usr/bin/env bash "$(readlink -f "${BASH_SOURCE[0]}")" --issue
   fi
   echo "== bootstrap nginx :80 for ACME =="
   mkdir -p /etc/nginx/conf.d /var/www/certbot/.well-known/acme-challenge

@@ -190,15 +190,7 @@ fn enqueue_send_text_dm(
         };
     }
     let recipient_log = recipient.trim();
-    let pk_short = if recipient_log.len() >= 16 {
-        format!(
-            "{}…{}",
-            &recipient_log[..8],
-            &recipient_log[recipient_log.len() - 8..]
-        )
-    } else {
-        recipient_log.to_string()
-    };
+    let pk_short = crate::flow_log::short_hex(recipient_log);
     native_log::info(
         "outbound",
         format!(

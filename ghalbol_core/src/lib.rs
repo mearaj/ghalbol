@@ -53,7 +53,7 @@ mod desktop_wake;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod delivery_auth;
 #[cfg(not(target_arch = "wasm32"))]
-mod delivery_client;
+pub mod delivery_client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod delivery_msg_v1;
 #[cfg(not(target_arch = "wasm32"))]
@@ -68,7 +68,7 @@ mod dm_transport;
 mod flow_log;
 mod identity;
 mod identity_sign;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 mod incoming_call_android;
 #[cfg(not(target_arch = "wasm32"))]
 mod incoming_call_notify;

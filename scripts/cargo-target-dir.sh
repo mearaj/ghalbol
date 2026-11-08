@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
 # Resolve cargo target directory — same pattern as Kumkaj workspace.
 cargo_target_dir() {
   # Try CARGO_TARGET_DIR env first, then default.

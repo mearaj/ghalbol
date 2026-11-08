@@ -1,10 +1,12 @@
 //! Persisted 1:1 contacts (`contacts_v1.json`) — same format as Makepad [ContactStore].
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use fs4::fs_std::FileExt;
 
 use serde_json::Value;
 use thiserror::Error;
@@ -21,6 +23,43 @@ static IO_CHAIN: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn io_chain() -> &'static Mutex<()> {
     IO_CHAIN.get_or_init(|| Mutex::new(()))
+}
+
+/// In-process mutex + cross-process flock for contacts read/modify/write.
+struct ContactsIoGuard {
+    _process: MutexGuard<'static, ()>,
+    _lock_file: File,
+}
+
+impl ContactsIoGuard {
+    fn acquire(path: &Path) -> Result<Self, ContactsError> {
+        let process = io_chain().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock_file.lock_exclusive().map_err(|e| {
+            ContactsError::Io(std::io::Error::other(format!(
+                "contacts flock {lock_path:?}: {e}"
+            )))
+        })?;
+        Ok(Self {
+            _process: process,
+            _lock_file: lock_file,
+        })
+    }
+
+    fn for_namespace(app_namespace: &str) -> Result<(Self, PathBuf), ContactsError> {
+        let cfg = storage_config_for_namespace(app_namespace);
+        let path = contacts_v1_path(&cfg)?;
+        Ok((Self::acquire(&path)?, path))
+    }
 }
 
 fn bump_change() {
@@ -129,7 +168,7 @@ impl SavedContact {
             display_alias: obj
                 .get("display_alias")
                 .and_then(|v| v.as_str())
-                .map(str::to_string),
+                .and_then(crate::preferences_v1::sanitize_peer_display_alias),
             availability_status: obj
                 .get("availability_status")
                 .and_then(|v| v.as_str())
@@ -137,7 +176,8 @@ impl SavedContact {
             last_message_preview: obj
                 .get("last_message_preview")
                 .and_then(|v| v.as_str())
-                .map(str::to_string),
+                .map(truncate_preview)
+                .filter(|s| !s.is_empty()),
             last_message_at_ms: obj.get("last_message_at_ms").and_then(|v| v.as_i64()),
             unread_count: obj
                 .get("unread_count")
@@ -154,7 +194,8 @@ impl SavedContact {
 }
 
 pub fn is_valid_public_key_hex(hex_s: &str) -> bool {
-    Identity::parse(hex_s).is_ok()
+    // Same wire rules as invite / dial paths (`normalize_contact_identity_wire`).
+    crate::public_key_util::is_valid_contact_identity_wire(hex_s)
 }
 
 #[derive(Debug, Error)]
@@ -175,39 +216,111 @@ fn decode_root_lenient(raw: &str) -> Option<Value> {
         return Some(serde_json::json!({}));
     }
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Some(v);
+        return v.is_object().then_some(v);
     }
     if !trimmed.starts_with('{') {
         return None;
     }
-    let mut lo = 2usize;
-    let mut hi = trimmed.len();
-    let mut best: Option<Value> = None;
-    while lo <= hi {
-        let mid = (lo + hi) / 2;
-        match serde_json::from_str::<Value>(&trimmed[..mid]) {
-            Ok(v) if v.is_object() => {
-                best = Some(v);
-                lo = mid + 1;
+    // Bound decode attempts — a multi‑MiB corruption of `}` chars must not O(n²) hang.
+    let mut attempts = 0u32;
+    for (idx, b) in trimmed.as_bytes().iter().enumerate().rev() {
+        if *b != b'}' {
+            continue;
+        }
+        attempts += 1;
+        if attempts > 64 {
+            break;
+        }
+        let end = idx + 1;
+        if end < 2 {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&trimmed[..end]) {
+            if v.is_object() {
+                return Some(v);
             }
-            _ => hi = mid.saturating_sub(1),
         }
     }
-    best
+    None
 }
 
-fn read_all(path: &Path) -> Result<HashMap<String, Vec<SavedContact>>, ContactsError> {
+/// Soft ceiling for contacts JSON (roster is small; a runaway file must not map into RAM).
+const MAX_CONTACTS_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
+fn file_modified(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn read_raw_capped(path: &Path) -> Result<Option<String>, ContactsError> {
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok(None);
     }
-    let raw = fs::read_to_string(path)?;
-    let root = match decode_root_lenient(&raw) {
-        Some(v) => v,
-        None => return Ok(HashMap::new()),
+    let meta = fs::metadata(path)?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_CONTACTS_JSON_BYTES {
+        return Err(ContactsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "contacts_v1.json exceeds size limit",
+        )));
+    }
+    let bytes = fs::read(path)?;
+    Ok(String::from_utf8(bytes).ok())
+}
+
+fn adopt_contacts_tmp(main: &Path, tmp: &Path) {
+    let _ = fs::rename(tmp, main);
+}
+
+fn contacts_share_identity(a: &SavedContact, b: &SavedContact) -> bool {
+    match (
+        Identity::parse(a.public_key_hex.trim()),
+        Identity::parse(b.public_key_hex.trim()),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Merge duplicate roster rows left by a crash mid-save (same identity, two array slots).
+fn merge_loaded_contacts(a: &SavedContact, b: &SavedContact) -> SavedContact {
+    let (newer, older) = if b.updated_at_ms.unwrap_or(0) >= a.updated_at_ms.unwrap_or(0) {
+        (b, a)
+    } else {
+        (a, b)
     };
-    let Some(obj) = root.as_object() else {
-        return Ok(HashMap::new());
-    };
+    SavedContact {
+        public_key_hex: a.public_key_hex.clone(),
+        display_alias: newer
+            .display_alias
+            .clone()
+            .or_else(|| older.display_alias.clone()),
+        availability_status: newer
+            .availability_status
+            .clone()
+            .or_else(|| older.availability_status.clone()),
+        last_message_preview: newer
+            .last_message_preview
+            .clone()
+            .or_else(|| older.last_message_preview.clone()),
+        last_message_at_ms: newer.last_message_at_ms.or(older.last_message_at_ms),
+        unread_count: newer.unread_count.max(older.unread_count),
+        created_at_ms: older.created_at_ms.or(newer.created_at_ms),
+        updated_at_ms: newer.updated_at_ms.or(older.updated_at_ms),
+        is_known: a.is_known || b.is_known,
+        is_blocked: if newer.is_known {
+            newer.is_blocked
+        } else {
+            newer.is_blocked || older.is_blocked
+        },
+        chat_room_exit_at_ms: newer.chat_room_exit_at_ms.or(older.chat_room_exit_at_ms),
+    }
+}
+
+fn parse_contacts_map(raw: &str) -> Option<HashMap<String, Vec<SavedContact>>> {
+    let root = decode_root_lenient(raw)?;
+    let obj = root.as_object()?;
     let mut out = HashMap::new();
     for (ns, val) in obj {
         let Some(arr) = val.as_array() else {
@@ -215,16 +328,61 @@ fn read_all(path: &Path) -> Result<HashMap<String, Vec<SavedContact>>, ContactsE
         };
         let mut list = Vec::new();
         for item in arr {
-            if let Some(c) = SavedContact::from_json(item) {
+            let Some(c) = SavedContact::from_json(item) else {
+                continue;
+            };
+            if let Some(i) = list.iter().position(|x| contacts_share_identity(x, &c)) {
+                list[i] = merge_loaded_contacts(&list[i], &c);
+            } else {
                 list.push(c);
             }
         }
         out.insert(ns.clone(), list);
     }
-    Ok(out)
+    Some(out)
+}
+
+fn read_all(path: &Path) -> Result<HashMap<String, Vec<SavedContact>>, ContactsError> {
+    let tmp_path = path.with_extension("json.tmp");
+    let main_raw = read_raw_capped(path)?;
+    let tmp_raw = read_raw_capped(&tmp_path)?;
+    let main_map = main_raw.as_deref().and_then(parse_contacts_map);
+    let tmp_map = tmp_raw.as_deref().and_then(parse_contacts_map);
+
+    let prefer_tmp = match (&main_map, &tmp_map) {
+        (None, Some(_)) => true,
+        (Some(_), None) => false,
+        (Some(_), Some(_)) => matches!(
+            (file_modified(path), file_modified(&tmp_path)),
+            (Some(m), Some(t)) if t >= m
+        ),
+        (None, None) => false,
+    };
+
+    if prefer_tmp {
+        if let Some(m) = tmp_map {
+            adopt_contacts_tmp(path, &tmp_path);
+            return Ok(m);
+        }
+    }
+
+    if let Some(m) = main_map {
+        if tmp_path.exists() && (tmp_map.is_none() || !prefer_tmp) {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        return Ok(m);
+    }
+
+    if let Some(m) = tmp_map {
+        adopt_contacts_tmp(path, &tmp_path);
+        return Ok(m);
+    }
+
+    Ok(HashMap::new())
 }
 
 fn write_all(path: &Path, all: &HashMap<String, Vec<SavedContact>>) -> Result<(), ContactsError> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -234,8 +392,17 @@ fn write_all(path: &Path, all: &HashMap<String, Vec<SavedContact>>) -> Result<()
         .collect();
     let json = serde_json::to_string_pretty(&encodable)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(tmp, path)?;
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -246,11 +413,7 @@ fn with_store<T>(
         HashMap<String, Vec<SavedContact>>,
     ) -> Result<(T, HashMap<String, Vec<SavedContact>>), ContactsError>,
 ) -> Result<T, ContactsError> {
-    let _guard = io_chain()
-        .lock()
-        .map_err(|_| ContactsError::Io(std::io::Error::other("contacts io mutex poisoned")))?;
-    let cfg = storage_config_for_namespace(app_namespace);
-    let path = contacts_v1_path(&cfg)?;
+    let (_guard, path) = ContactsIoGuard::for_namespace(app_namespace)?;
     let mut all = read_all(&path)?;
     let (out, next) = f(&path, all)?;
     all = next;
@@ -264,16 +427,24 @@ fn index_of(list: &[SavedContact], contact: &SavedContact) -> Option<usize> {
         return None;
     }
     let target = Identity::parse(contact.public_key_hex.trim()).ok()?;
+    index_of_identity(list, &target)
+}
+
+fn index_of_identity(list: &[SavedContact], target: &Identity) -> Option<usize> {
     list.iter().position(|c| {
         Identity::parse(c.public_key_hex.trim())
             .ok()
-            .is_some_and(|id| id == target)
+            .is_some_and(|id| id == *target)
     })
 }
 
+fn index_of_public_key_hex(list: &[SavedContact], public_key_hex: &str) -> Option<usize> {
+    let target = Identity::parse(public_key_hex.trim()).ok()?;
+    index_of_identity(list, &target)
+}
+
 pub fn list_contacts(app_namespace: &str) -> Result<Vec<SavedContact>, ContactsError> {
-    let cfg = storage_config_for_namespace(app_namespace);
-    let path = contacts_v1_path(&cfg)?;
+    let (_guard, path) = ContactsIoGuard::for_namespace(app_namespace)?;
     let mut all = read_all(&path)?;
     let mut dirty = false;
     {
@@ -378,7 +549,9 @@ pub fn upsert_contact(
             },
             last_message_preview: contact
                 .last_message_preview
-                .clone()
+                .as_deref()
+                .map(truncate_preview)
+                .filter(|s| !s.is_empty())
                 .or(base.last_message_preview.clone()),
             last_message_at_ms: contact.last_message_at_ms.or(base.last_message_at_ms),
             unread_count: if contact.last_message_preview.is_some()
@@ -391,7 +564,12 @@ pub fn upsert_contact(
             created_at_ms: base.created_at_ms.or(Some(now)),
             updated_at_ms: Some(now),
             is_known: contact.is_known || base.is_known,
-            is_blocked: contact.is_blocked || base.is_blocked,
+            // Inbound preview upserts keep block sticky; explicit `is_known` upserts honor block.
+            is_blocked: if contact.is_known {
+                contact.is_blocked
+            } else {
+                contact.is_blocked || base.is_blocked
+            },
             chat_room_exit_at_ms: contact.chat_room_exit_at_ms.or(base.chat_room_exit_at_ms),
         };
         if let Some(i) = idx {
@@ -467,7 +645,7 @@ pub fn set_contact_availability_status(
     let now = now_ms();
     with_store(app_namespace, |_path, mut all| {
         let list = all.entry(app_namespace.to_string()).or_default();
-        let Some(i) = list.iter().position(|c| c.public_key_hex == pk) else {
+        let Some(i) = index_of_public_key_hex(list, &pk) else {
             return Err(ContactsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "contact not found",
@@ -506,7 +684,7 @@ pub fn set_contact_trust(
     let now = now_ms();
     with_store(app_namespace, |_path, mut all| {
         let list = all.entry(app_namespace.to_string()).or_default();
-        let Some(i) = list.iter().position(|c| c.public_key_hex == pk) else {
+        let Some(i) = index_of_public_key_hex(list, &pk) else {
             return Err(ContactsError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "contact not found",
@@ -549,7 +727,7 @@ pub fn sync_chat_room_exit_at_ms(
     }
     with_store(app_namespace, |_path, mut all| {
         let list = all.entry(app_namespace.to_string()).or_default();
-        let Some(i) = list.iter().position(|c| c.public_key_hex == pk) else {
+        let Some(i) = index_of_public_key_hex(list, &pk) else {
             return Ok(((), all));
         };
         let mut c = list[i].clone();
@@ -599,7 +777,7 @@ pub fn record_inbound_preview(
     let at = message_at_ms.unwrap_or_else(now_ms);
     with_store(app_namespace, |_path, mut all| {
         let list = all.entry(app_namespace.to_string()).or_default();
-        let Some(i) = list.iter().position(|c| c.public_key_hex == pk) else {
+        let Some(i) = index_of_public_key_hex(list, &pk) else {
             return Ok(((), all));
         };
         let c = &list[i];
@@ -645,7 +823,7 @@ pub fn clear_unread(app_namespace: &str, public_key_hex: &str) -> Result<(), Con
     }
     with_store(app_namespace, |_path, mut all| {
         let list = all.entry(app_namespace.to_string()).or_default();
-        let Some(i) = list.iter().position(|c| c.public_key_hex == pk) else {
+        let Some(i) = index_of_public_key_hex(list, &pk) else {
             return Ok(((), all));
         };
         let c = list[i].clone();
@@ -780,6 +958,34 @@ mod tests {
     }
 
     #[test]
+    fn set_contact_trust_matches_mixed_case_wire() {
+        let iso = Isolate::new();
+        let ns = "dev.contacts.trust_case";
+        let cfg = iso.cfg(ns);
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let upper = REMOTE_PK.to_ascii_uppercase();
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: false,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let c = set_contact_trust(ns, &upper, Some(true), None).unwrap();
+        assert!(c.is_known);
+    }
+
+    #[test]
     fn set_contact_trust_updates_flags() {
         let iso = Isolate::new();
         let ns = "dev.contacts.trust";
@@ -810,6 +1016,280 @@ mod tests {
 
         let c = set_contact_trust(ns, REMOTE_PK, None, Some(true)).unwrap();
         assert!(c.is_blocked);
+    }
+
+    #[test]
+    fn upsert_known_clears_block_inbound_keeps_block() {
+        let iso = Isolate::new();
+        let ns = "dev.contacts.block_merge";
+        let cfg = iso.cfg(ns);
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: false,
+                is_blocked: true,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let blocked = find_by_public_key(ns, REMOTE_PK).unwrap().unwrap();
+        assert!(blocked.is_blocked);
+
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: Some("Re-added".to_string()),
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let added = find_by_public_key(ns, REMOTE_PK).unwrap().unwrap();
+        assert!(added.is_known);
+        assert!(!added.is_blocked);
+
+        set_contact_trust(ns, REMOTE_PK, None, Some(true)).unwrap();
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: None,
+                availability_status: None,
+                last_message_preview: Some("hey".to_string()),
+                last_message_at_ms: Some(1),
+                unread_count: 1,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: false,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let preview = find_by_public_key(ns, REMOTE_PK).unwrap().unwrap();
+        assert!(preview.is_blocked);
+        assert_eq!(preview.last_message_preview.as_deref(), Some("hey"));
+    }
+
+    #[test]
+    fn read_rejects_contacts_json_over_size_limit() {
+        let iso = Isolate::new();
+        let ns = "dev.contacts.huge";
+        let cfg = iso.cfg(ns);
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = contacts_v1_path(&cfg).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        // Sparse-ish: write a sentinel then seek — keep the test fast.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = fs::File::create(&path).unwrap();
+            f.write_all(b"{").unwrap();
+            f.seek(SeekFrom::Start(MAX_CONTACTS_JSON_BYTES + 1)).unwrap();
+            f.write_all(b"}").unwrap();
+        }
+        let err = list_contacts(ns).unwrap_err();
+        assert!(err.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn contacts_store_serializes_parallel_upserts() {
+        use std::thread;
+        let _iso = Isolate::new();
+        let ns = "dev.contacts.parallel";
+        let pk = REMOTE_PK.to_string();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let ns = ns.to_string();
+                let pk = pk.clone();
+                thread::spawn(move || {
+                    upsert_contact(
+                        &ns,
+                        SavedContact {
+                            public_key_hex: pk,
+                            display_alias: Some(format!("alias-{i}")),
+                            availability_status: None,
+                            last_message_preview: None,
+                            last_message_at_ms: None,
+                            unread_count: 0,
+                            created_at_ms: None,
+                            updated_at_ms: None,
+                            is_known: true,
+                            is_blocked: false,
+                            chat_room_exit_at_ms: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+        assert_eq!(list_contacts(ns).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn read_recovers_contacts_tmp_after_interrupted_save() {
+        use std::io::Write;
+        use std::thread;
+        use std::time::Duration;
+
+        let iso = Isolate::new();
+        let ns = "dev.contacts.tmp";
+        let cfg = iso.cfg(ns);
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: Some("Before".to_string()),
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let path = contacts_v1_path(&cfg).unwrap();
+        let tmp_path = path.with_extension("json.tmp");
+        let stale = fs::read_to_string(&path).unwrap();
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: Some("After".to_string()),
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: Some(99),
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let durable = fs::read_to_string(&path).unwrap();
+        fs::write(&path, stale).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        {
+            let mut f = fs::File::create(&tmp_path).unwrap();
+            f.write_all(durable.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        let row = list_contacts(ns).unwrap().into_iter().next().unwrap();
+        assert_eq!(row.display_alias.as_deref(), Some("After"));
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn load_dedupes_duplicate_public_keys_keeps_newer_row() {
+        let iso = Isolate::new();
+        let ns = "dev.contacts.dedupe";
+        let cfg = iso.cfg(ns);
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        let path = contacts_v1_path(&cfg).unwrap();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            &path,
+            format!(
+                r#"{{
+              "{ns}": [
+                {{
+                  "public_key_hex": "{REMOTE_PK}",
+                  "display_alias": "Old",
+                  "updated_at_ms": 1,
+                  "is_known": true,
+                  "is_blocked": false,
+                  "unread_count": 0
+                }},
+                {{
+                  "public_key_hex": "{REMOTE_PK}",
+                  "display_alias": "New",
+                  "updated_at_ms": 99,
+                  "is_known": true,
+                  "is_blocked": false,
+                  "unread_count": 0
+                }}
+              ]
+            }}"#
+            ),
+        )
+        .unwrap();
+        let rows = list_contacts(ns).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display_alias.as_deref(), Some("New"));
+    }
+
+    #[test]
+    fn read_recovers_contacts_json_after_suffix_garbage() {
+        let iso = Isolate::new();
+        let ns = "dev.contacts.corrupt";
+        let cfg = iso.cfg(ns);
+        let _id = create_or_unlock_identity_v1(&cfg, "pw").unwrap();
+        upsert_contact(
+            ns,
+            SavedContact {
+                public_key_hex: REMOTE_PK.to_string(),
+                display_alias: Some("Safe".to_string()),
+                availability_status: None,
+                last_message_preview: None,
+                last_message_at_ms: None,
+                unread_count: 0,
+                created_at_ms: None,
+                updated_at_ms: None,
+                is_known: true,
+                is_blocked: false,
+                chat_room_exit_at_ms: None,
+            },
+        )
+        .unwrap();
+        let path = contacts_v1_path(&cfg).unwrap();
+        let good = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{good}<<<<suffix>>>>")).unwrap();
+        let row = list_contacts(ns).unwrap().into_iter().next().unwrap();
+        assert_eq!(row.display_alias.as_deref(), Some("Safe"));
+    }
+
+    #[test]
+    fn from_json_sanitizes_alias_and_truncates_preview() {
+        let raw = serde_json::json!({
+            "public_key_hex": REMOTE_PK,
+            "display_alias": format!("  {}\n ", "A".repeat(80)),
+            "last_message_preview": "x".repeat(200),
+        });
+        let c = SavedContact::from_json(&raw).unwrap();
+        let alias = c.display_alias.unwrap();
+        assert!(alias.chars().count() <= 64);
+        assert!(!alias.contains('\n'));
+        assert!(c.last_message_preview.as_ref().unwrap().chars().count() <= 120);
     }
 
     #[test]

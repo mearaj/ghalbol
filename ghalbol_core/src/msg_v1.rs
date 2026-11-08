@@ -20,6 +20,31 @@ use crate::transport_kem_v1::{
 pub const MSG_SHARE: &str = "ghalbol_msg_v1";
 pub const MSG_FORMAT_VERSION: u64 = 2;
 
+/// DM wire frames are length-prefixed JSON; cap body size before decode (DoS hardening).
+/// Shared with connect framing so DM length-prefix checks stay in lockstep.
+pub const MAX_MSG_FRAME_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// `DM_CIPHER_TRANSPORT_V2` + symmetric seal (matches [`symmetric_seal`] ceiling).
+const MAX_DM_CIPHERTEXT_BYTES: usize = 1 + 8 * 1024 * 1024;
+const MAX_DM_CIPHERTEXT_HEX_CHARS: usize = MAX_DM_CIPHERTEXT_BYTES * 2;
+
+fn decode_dm_ciphertext_hex(ciphertext_hex: &str) -> Result<Vec<u8>, String> {
+    let t = ciphertext_hex.trim();
+    if t.is_empty() {
+        return Err("empty ciphertext".to_string());
+    }
+    if t.len() > MAX_DM_CIPHERTEXT_HEX_CHARS {
+        return Err("ciphertext hex too long".to_string());
+    }
+    if !t.len().is_multiple_of(2) {
+        return Err("ciphertext hex: odd length".to_string());
+    }
+    let sealed = hex::decode(t).map_err(|e| format!("ciphertext hex: {e}"))?;
+    if sealed.len() > MAX_DM_CIPHERTEXT_BYTES {
+        return Err("ciphertext too large".to_string());
+    }
+    Ok(sealed)
+}
+
 /// Optional transport KEM context for outbound DM text (`DM_CIPHER_TRANSPORT_V2`).
 pub struct DmSealTransportCtx<'a> {
     pub local_sk: &'a StaticSecret,
@@ -385,8 +410,7 @@ pub fn parse_envelope_with_transport(
             if env.ciphertext_hex.is_empty() {
                 return Err("text envelope missing ciphertext".to_string());
             }
-            let sealed = hex::decode(env.ciphertext_hex.trim())
-                .map_err(|e| format!("ciphertext hex: {e}"))?;
+            let sealed = decode_dm_ciphertext_hex(&env.ciphertext_hex)?;
             let plain = open_dm_ciphertext(
                 env.sender_public_key_hex.trim(),
                 &sealed,
@@ -411,8 +435,7 @@ pub fn parse_envelope_with_transport(
             if env.ciphertext_hex.is_empty() {
                 return Err("voice envelope missing ciphertext".to_string());
             }
-            let sealed = hex::decode(env.ciphertext_hex.trim())
-                .map_err(|e| format!("ciphertext hex: {e}"))?;
+            let sealed = decode_dm_ciphertext_hex(&env.ciphertext_hex)?;
             let plain = open_dm_ciphertext(
                 env.sender_public_key_hex.trim(),
                 &sealed,
@@ -433,8 +456,7 @@ pub fn parse_envelope_with_transport(
             if env.ciphertext_hex.is_empty() {
                 return Err("attachment_offer missing ciphertext".to_string());
             }
-            let sealed = hex::decode(env.ciphertext_hex.trim())
-                .map_err(|e| format!("ciphertext hex: {e}"))?;
+            let sealed = decode_dm_ciphertext_hex(&env.ciphertext_hex)?;
             let plain = open_dm_ciphertext(
                 env.sender_public_key_hex.trim(),
                 &sealed,
@@ -503,8 +525,7 @@ pub fn parse_envelope_with_transport(
             if env.ciphertext_hex.is_empty() {
                 return Err("availability_status missing ciphertext".to_string());
             }
-            let sealed = hex::decode(env.ciphertext_hex.trim())
-                .map_err(|e| format!("ciphertext hex: {e}"))?;
+            let sealed = decode_dm_ciphertext_hex(&env.ciphertext_hex)?;
             let plain = open_dm_ciphertext(
                 env.sender_public_key_hex.trim(),
                 &sealed,
@@ -603,6 +624,9 @@ fn open_dm_ciphertext(
 
 pub fn envelope_to_frame_bytes(env: &MsgEnvelope) -> Result<Vec<u8>, String> {
     let json = serde_json::to_vec(env).map_err(|e| format!("encode envelope: {e}"))?;
+    if json.len() > MAX_MSG_FRAME_BODY_BYTES {
+        return Err("frame body too large".to_string());
+    }
     let len = u32::try_from(json.len()).map_err(|_| "envelope too large".to_string())?;
     let mut out = Vec::with_capacity(4 + json.len());
     out.extend_from_slice(&len.to_le_bytes());
@@ -615,6 +639,9 @@ pub fn frame_bytes_to_envelope(frame: &[u8]) -> Result<MsgEnvelope, String> {
         return Err("frame too short".to_string());
     }
     let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    if len > MAX_MSG_FRAME_BODY_BYTES {
+        return Err("frame body too large".to_string());
+    }
     if frame.len() < 4 + len {
         return Err("frame truncated".to_string());
     }
@@ -734,6 +761,21 @@ mod tests {
     }
 
     #[test]
+    fn frame_decode_rejects_oversized_length_prefix() {
+        let len = (MAX_MSG_FRAME_BODY_BYTES + 1) as u32;
+        let mut frame = len.to_le_bytes().to_vec();
+        frame.extend_from_slice(b"{}");
+        assert!(frame_bytes_to_envelope(&frame).is_err());
+    }
+
+    #[test]
+    fn decode_dm_ciphertext_hex_rejects_oversized_before_alloc() {
+        let huge = "aa".repeat(MAX_DM_CIPHERTEXT_HEX_CHARS / 2 + 1);
+        let err = decode_dm_ciphertext_hex(&huge).unwrap_err();
+        assert!(err.contains("too long"));
+    }
+
+    #[test]
     fn transport_kem_v2_roundtrip_after_hello() {
         use crate::transport_kem_v1::{DM_CIPHER_TRANSPORT_V2, generate_transport_keypair};
 
@@ -775,5 +817,50 @@ mod tests {
             ParsedMsg::Text(t) => assert_eq!(t.text, "transport-v2"),
             _ => panic!("expected text"),
         }
+    }
+
+    /// Soft latency guard — catches accidental O(n²) / huge-alloc regressions on the
+    /// LAN DM build → frame → parse hot path. Bound is deliberately loose for slow CI hosts.
+    #[test]
+    fn text_build_frame_parse_stays_under_soft_latency_budget() {
+        let (_ks_a, alice) = create_keystore_v1("pw", None).unwrap();
+        let (_ks_b, bob) = create_keystore_v1("pw2", None).unwrap();
+        let (sk_a, pk_a, sk_b, pk_b) = transport_pair();
+        let start = std::time::Instant::now();
+        for i in 0..80 {
+            let env = build_text_envelope(
+                &format!("lat-{i}"),
+                &alice,
+                &bob.identity_wire(),
+                "latency-canary",
+                1_700_000_000_000 + i,
+                DmSealTransportCtx {
+                    local_sk: &sk_a,
+                    peer_pk: &pk_b,
+                },
+            )
+            .unwrap();
+            let frame = envelope_to_frame_bytes(&env).unwrap();
+            let decoded = frame_bytes_to_envelope(&frame).unwrap();
+            assert_eq!(decoded.id, env.id);
+            let parsed = parse_envelope_with_transport(
+                &decoded,
+                &bob,
+                Some(DmOpenTransportCtx {
+                    local_sk: &sk_b,
+                    peer_pk: &pk_a,
+                }),
+            )
+            .unwrap();
+            match parsed {
+                ParsedMsg::Text(t) => assert_eq!(t.text, "latency-canary"),
+                _ => panic!("expected text"),
+            }
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "80× DM text build/frame/parse took {elapsed:?} (budget 6s)"
+        );
     }
 }

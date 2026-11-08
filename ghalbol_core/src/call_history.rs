@@ -93,7 +93,8 @@ pub fn record_from_active(reason: &str) {
 pub fn record_ring_outcome(call_id: &str, peer_public_key_hex: &str, video: bool, reason: &str) {
     let call_id = call_id.trim();
     let peer = peer_public_key_hex.trim();
-    if call_id.is_empty() || peer.is_empty() {
+    // Match call_state / media ceilings — refuse pathological ids before transcript write.
+    if call_id.is_empty() || call_id.len() > 128 || peer.is_empty() || peer.len() > 192 {
         return;
     }
     let snap = ActiveCallSnapshot {
@@ -157,5 +158,13 @@ mod tests {
         assert!(!call_event_outgoing("remote_hangup", 1_500));
         assert!(call_event_outgoing("remote_hangup", 5_000));
         assert!(call_event_outgoing("ui_hangup", 800));
+    }
+
+    #[test]
+    fn record_ring_outcome_ignores_pathological_ids() {
+        // Must not panic or attempt a transcript write with absurd keys.
+        record_ring_outcome(&"c".repeat(200), &"aa".repeat(33), false, "missed");
+        record_ring_outcome("ok-call", &"p".repeat(300), true, "missed");
+        record_ring_outcome("", &"aa".repeat(33), false, "missed");
     }
 }

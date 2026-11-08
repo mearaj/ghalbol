@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # Makepad desktop packaging helpers shared by the Linux and Windows packages.
 #
 # Packaged layout (Makepad resolves `<crate>:resources/…` under MAKEPAD_PACKAGE_DIR, searched

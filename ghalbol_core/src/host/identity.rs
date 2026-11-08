@@ -1,5 +1,8 @@
 //! Session unlock/lock, keystore, password, and locale.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::p2p_runtime::p2p_stop;
 use crate::preferences_v1;
@@ -69,7 +72,86 @@ pub struct UnlockedSession {
     pub identity_wire: String,
 }
 
+/// Soft ceiling — Argon2 on multi‑MiB passwords is a local DoS.
+const MAX_APP_PASSWORD_BYTES: usize = 1024;
+/// Argon2 unlock is expensive; bound guess storms per namespace.
+const UNLOCK_MAX_ATTEMPTS: u32 = 8;
+const UNLOCK_WINDOW: Duration = Duration::from_secs(60);
+const UNLOCK_TRACKED_NAMESPACES: usize = 64;
+
+struct UnlockWindow {
+    start: Instant,
+    hits: u32,
+}
+
+fn unlock_rate_mx() -> &'static Mutex<HashMap<String, UnlockWindow>> {
+    static M: OnceLock<Mutex<HashMap<String, UnlockWindow>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn allow_unlock_attempt(app_namespace: &str) -> Result<(), String> {
+    let key = app_namespace.trim().to_string();
+    if key.is_empty() {
+        return Err("App namespace is required.".into());
+    }
+    // Same path-safe rules as storage — reject before allocating rate-limit map slots.
+    crate::storage::sanitize_namespace(&key).map_err(|_| {
+        "Invalid app namespace.".to_string()
+    })?;
+    let Ok(mut g) = unlock_rate_mx().lock() else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    if g.len() >= UNLOCK_TRACKED_NAMESPACES {
+        g.retain(|_, w| now.duration_since(w.start) < UNLOCK_WINDOW);
+    }
+    if g.len() >= UNLOCK_TRACKED_NAMESPACES && !g.contains_key(&key) {
+        return Err("Too many unlock attempts. Try again shortly.".into());
+    }
+    match g.get_mut(&key) {
+        Some(w) if now.duration_since(w.start) < UNLOCK_WINDOW => {
+            if w.hits >= UNLOCK_MAX_ATTEMPTS {
+                return Err("Too many unlock attempts. Try again shortly.".into());
+            }
+            w.hits = w.hits.saturating_add(1);
+        }
+        _ => {
+            g.insert(
+                key,
+                UnlockWindow {
+                    start: now,
+                    hits: 1,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn reset_unlock_rate_limits_for_test() {
+    if let Ok(mut g) = unlock_rate_mx().lock() {
+        g.clear();
+    }
+}
+
+fn reject_oversized_password(password: &str) -> Result<(), String> {
+    if password.len() > MAX_APP_PASSWORD_BYTES {
+        return Err("App password is too long.".into());
+    }
+    Ok(())
+}
+
+fn require_app_password(password: &str) -> Result<(), String> {
+    if password.trim().is_empty() {
+        return Err("App password is required.".into());
+    }
+    reject_oversized_password(password)
+}
+
 pub fn unlock(app_namespace: &str, password: &str) -> Result<UnlockedSession, String> {
+    require_app_password(password)?;
+    allow_unlock_attempt(app_namespace)?;
     let v = unlock_identity(app_namespace, password);
     if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
         let err = v
@@ -112,12 +194,11 @@ pub fn unlock_with_options(
     create_algorithm: Option<&str>,
     import_secret_hex: Option<&str>,
 ) -> Result<UnlockedSession, String> {
-    if password.is_empty() {
-        return Err("App password is required.".into());
-    }
+    require_app_password(password)?;
     if keystore_exists(app_namespace) {
         return unlock(app_namespace, password);
     }
+    allow_unlock_attempt(app_namespace)?;
     let algorithm = match create_algorithm {
         Some(id) => crate::IdentityAlgorithm::from_wire_id(id)?,
         None => crate::IdentityAlgorithm::Secp256k1,
@@ -146,9 +227,8 @@ pub fn import_keystore(
     password: &str,
     keystore_json: &str,
 ) -> Result<UnlockedSession, String> {
-    if password.is_empty() {
-        return Err("App password is required.".into());
-    }
+    require_app_password(password)?;
+    allow_unlock_attempt(app_namespace)?;
     let ident = crate::import_keystore_from_json_v1(
         &cfg(app_namespace),
         password,
@@ -159,6 +239,7 @@ pub fn import_keystore(
 }
 
 pub fn delete_identity(app_namespace: &str, password: &str) -> Result<(), String> {
+    require_app_password(password)?;
     unlock(app_namespace, password)?;
     crate::delete_stored_identity_v1(&cfg(app_namespace)).map_err(|e| e.to_string())?;
     lock();
@@ -193,7 +274,7 @@ pub fn take_view_invite() -> Option<String> {
         }
         use std::sync::Mutex;
         static SEEN: Mutex<String> = Mutex::new(String::new());
-        let mut seen = SEEN.lock().ok()?;
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if *seen == url {
             return None;
         }
@@ -214,6 +295,7 @@ pub fn unlocked_algorithm() -> Option<String> {
 }
 
 pub fn reveal_secret(app_namespace: &str, password: &str) -> Result<String, String> {
+    require_app_password(password)?;
     let (hex, algo) = crate::reveal_secret_key_hex_v1(&cfg(app_namespace), password)
         .map_err(|e| e.to_string())?;
     Ok(format!(
@@ -231,6 +313,9 @@ pub fn change_password(
     old_password: &str,
     new_password: &str,
 ) -> Result<(), String> {
+    require_app_password(old_password)?;
+    require_app_password(new_password)?;
+    allow_unlock_attempt(app_namespace)?;
     let ident = crate::change_password_v1(
         &cfg(app_namespace),
         old_password,
@@ -239,6 +324,56 @@ pub fn change_password(
     .map_err(|e| e.to_string())?;
     install_unlocked(app_namespace, ident)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod password_gate_tests {
+    use super::{MAX_APP_PASSWORD_BYTES, require_app_password, reject_oversized_password};
+
+    #[test]
+    fn rejects_oversized_app_password() {
+        let huge = "x".repeat(MAX_APP_PASSWORD_BYTES + 1);
+        assert!(reject_oversized_password(&huge)
+            .unwrap_err()
+            .contains("too long"));
+        assert!(reject_oversized_password("ok").is_ok());
+    }
+
+    #[test]
+    fn require_app_password_rejects_blank() {
+        assert!(require_app_password("").unwrap_err().contains("required"));
+        assert!(require_app_password("  \t").unwrap_err().contains("required"));
+        assert!(require_app_password("ok").is_ok());
+    }
+
+    #[test]
+    fn unlock_attempt_rate_limit_trips_then_resets_on_clear() {
+        use super::{
+            UNLOCK_MAX_ATTEMPTS, allow_unlock_attempt, reset_unlock_rate_limits_for_test,
+        };
+        reset_unlock_rate_limits_for_test();
+        let ns = "dev.unlock.rate.limit";
+        for _ in 0..UNLOCK_MAX_ATTEMPTS {
+            assert!(allow_unlock_attempt(ns).is_ok());
+        }
+        assert!(
+            allow_unlock_attempt(ns)
+                .unwrap_err()
+                .contains("Too many unlock attempts")
+        );
+        reset_unlock_rate_limits_for_test();
+        assert!(allow_unlock_attempt(ns).is_ok());
+    }
+
+    #[test]
+    fn unlock_attempt_rejects_unsafe_namespace() {
+        use super::allow_unlock_attempt;
+        assert!(allow_unlock_attempt("../escape").unwrap_err().contains("Invalid"));
+        assert!(allow_unlock_attempt(&"a".repeat(201))
+            .unwrap_err()
+            .contains("Invalid"));
+        assert!(allow_unlock_attempt("has space").is_err());
+    }
 }
 
 fn install_unlocked(

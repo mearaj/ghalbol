@@ -1,8 +1,19 @@
 //! Desktop incoming-call notification (Linux). Fired from the in-process node when an
 //! invite arrives so the user can click to focus the app.
 
+/// Whether to post a new banner (skip empty ids and duplicate rings for the same call).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn should_post_incoming_notification(
+    call_id: &str,
+    active: &Option<(String, u32)>,
+) -> bool {
+    let call_id = call_id.trim();
+    !call_id.is_empty() && !active.as_ref().is_some_and(|(id, _)| id == call_id)
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::should_post_incoming_notification;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, RwLock};
@@ -18,12 +29,13 @@ mod linux {
 
     fn short_pk(pk: &str) -> String {
         let p = pk.trim();
-        if p.len() >= 16 {
+        if p.is_empty() {
+            return "Contact".to_string();
+        }
+        if p.len() >= 16 && p.is_ascii() {
             format!("{}…", &p[..8])
-        } else if p.is_empty() {
-            "Contact".to_string()
         } else {
-            p.to_string()
+            p.chars().take(16).collect()
         }
     }
 
@@ -62,16 +74,16 @@ mod linux {
     }
 
     pub fn show(peer_public_key_hex: &str, call_id: &str) {
-        let call_id = call_id.trim();
-        if call_id.is_empty() {
+        let Ok(mut active) = ACTIVE.lock() else {
+            return;
+        };
+        if !should_post_incoming_notification(call_id, &active) {
             return;
         }
-        if let Ok(g) = ACTIVE.lock() {
-            if g.as_ref().is_some_and(|(id, _)| id == call_id) {
-                return;
-            }
+        if let Some((_prev, id)) = active.take() {
+            close_notification_by_id(id);
         }
-        dismiss();
+        drop(active);
         let body = format!(
             "{} is calling — tap to answer in Ghal Bol",
             short_pk(peer_public_key_hex)
@@ -182,3 +194,17 @@ pub fn show_incoming_call(_peer_public_key_hex: &str, _call_id: &str) {}
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn dismiss_incoming_call() {}
+
+#[cfg(test)]
+mod tests {
+    use super::should_post_incoming_notification;
+
+    #[test]
+    fn skip_duplicate_incoming_notification_for_same_call_id() {
+        let active = Some(("call-abc".to_string(), 42));
+        assert!(!should_post_incoming_notification("call-abc", &active));
+        assert!(should_post_incoming_notification("call-xyz", &active));
+        assert!(!should_post_incoming_notification("", &active));
+        assert!(!should_post_incoming_notification("  ", &None));
+    }
+}

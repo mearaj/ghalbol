@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 # Stage install/uninstall helpers + manifest into a desktop package folder.
 # Usage (after the binary + resources are in $OUT — see desktop-resources.sh):
 #   source scripts/desktop-ids.sh
@@ -12,8 +13,29 @@ stage_desktop_package() {
   local os="${2:?}" # linux | windows
   local root="${GHALBOL_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   local scripts="$root/scripts"
+  local bin_name
+  bin_name="$(desktop_bin_name)"
 
   mkdir -p "$out"
+
+  case "$os" in
+    linux)
+      if [[ ! -f "$out/$bin_name" ]]; then
+        echo "stage_desktop_package: missing Linux binary $out/$bin_name" >&2
+        return 1
+      fi
+      ;;
+    windows)
+      if [[ ! -f "$out/${bin_name}.exe" ]]; then
+        echo "stage_desktop_package: missing Windows binary $out/${bin_name}.exe" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "stage_desktop_package: unknown os '$os' (want linux|windows)" >&2
+      return 1
+      ;;
+  esac
 
   # Manifest baked into the package (install copies it into the install dir).
   {
@@ -33,6 +55,7 @@ stage_desktop_package() {
     # Portable launcher without a full install. Resources resolve beside the binary.
     cat >"$out/run.sh" <<EOF
 #!/usr/bin/env bash
+set -euo pipefail
 exec "\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)/$(desktop_bin_name)" "\$@"
 EOF
     chmod +x "$out/install.sh" "$out/uninstall.sh" "$out/run.sh" "$out/desktop-ids.sh"

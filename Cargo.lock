@@ -1825,6 +1825,7 @@ dependencies = [
  "futures",
  "futures-util",
  "ghalbol_coord",
+ "ghalbol_delivery",
  "hex",
  "hkdf 0.13.0",
  "if-addrs 0.14.0",
@@ -1865,6 +1866,7 @@ dependencies = [
 name = "ghalbol_ddns"
 version = "0.1.0"
 dependencies = [
+ "fs4",
  "reqwest",
  "serde",
  "serde_json",

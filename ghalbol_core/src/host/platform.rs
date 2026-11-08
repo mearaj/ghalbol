@@ -74,6 +74,10 @@ static QR_SCAN_UI_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// Decode an invite QR from a picture: a path on desktop, a picker `content://` URI on Android.
 pub fn decode_qr_file(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.is_empty() || path.contains('\0') || path.contains("..") {
+        return Err("No picture was chosen.".into());
+    }
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     {
         return crate::desktop_media::decode_qr_file(path);
@@ -101,9 +105,16 @@ pub const MAX_PICKED_BACKUP_BYTES: usize = 1024 * 1024;
 /// path; Android returns a `content://` document URI, read through the content resolver.
 pub fn read_picked_file(picked: &str, max_bytes: usize) -> Result<(String, Vec<u8>), String> {
     let picked = picked.trim();
+    if picked.is_empty() || picked.contains('\0') {
+        return Err("No file was chosen.".into());
+    }
     #[cfg(target_os = "android")]
     if picked.starts_with("content://") {
         return crate::incoming_call_android::read_content_uri(picked, max_bytes);
+    }
+    // Pathological picker/URI strings — reject climb tokens before metadata/read.
+    if picked.contains("..") {
+        return Err("That file path is not allowed.".into());
     }
     let path = std::path::Path::new(picked);
     let len = std::fs::metadata(path)
@@ -116,6 +127,12 @@ pub fn read_picked_file(picked: &str, max_bytes: usize) -> Result<(String, Vec<u
         ));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("could not read {picked}: {e}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "The chosen file is larger than {} MB",
+            max_bytes / (1024 * 1024)
+        ));
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

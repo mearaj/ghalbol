@@ -1,5 +1,22 @@
 //! Hub navigation history stack.
 
+const MAX_HISTORY_KEY_CHARS: usize = 256;
+const MAX_HISTORY_PAGE_CHARS: usize = 64;
+
+fn clamp_history_entry(mut entry: HubHistoryEntry) -> HubHistoryEntry {
+    if entry.conversation_key.chars().count() > MAX_HISTORY_KEY_CHARS {
+        entry.conversation_key = entry
+            .conversation_key
+            .chars()
+            .take(MAX_HISTORY_KEY_CHARS)
+            .collect();
+    }
+    if entry.page.chars().count() > MAX_HISTORY_PAGE_CHARS {
+        entry.page = entry.page.chars().take(MAX_HISTORY_PAGE_CHARS).collect();
+    }
+    entry
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) struct HubHistoryEntry {
     pub(crate) hub_tab: u8,
@@ -19,11 +36,12 @@ pub(crate) struct HubHistoryStack {
 impl HubHistoryStack {
     pub(crate) fn reset(&mut self, entry: HubHistoryEntry) {
         self.entries.clear();
-        self.entries.push(entry);
+        self.entries.push(clamp_history_entry(entry));
         self.index = 0;
     }
 
     pub(crate) fn replace_top(&mut self, entry: HubHistoryEntry) {
+        let entry = clamp_history_entry(entry);
         if self.entries.is_empty() {
             self.entries.push(entry);
             self.index = 0;
@@ -40,6 +58,7 @@ impl HubHistoryStack {
     }
 
     pub(crate) fn record(&mut self, entry: HubHistoryEntry) {
+        let entry = clamp_history_entry(entry);
         if self.entries.get(self.index) == Some(&entry) {
             return;
         }
@@ -84,7 +103,7 @@ impl HubHistoryStack {
 
 #[cfg(test)]
 mod hub_history_tests {
-    use super::{HubHistoryEntry, HubHistoryStack};
+    use super::{HubHistoryEntry, HubHistoryStack, MAX_HISTORY_KEY_CHARS};
 
     fn entry(tab: u8, page: &str) -> HubHistoryEntry {
         HubHistoryEntry {
@@ -164,6 +183,31 @@ mod hub_history_tests {
         assert_eq!(prev.hub_tab, 0);
         assert!(prev.narrow_show_room);
         assert_eq!(prev.conversation_key, "peer1");
+    }
+
+    #[test]
+    fn record_clamps_oversized_conversation_key() {
+        let mut h = HubHistoryStack::default();
+        let mut e = entry(0, "");
+        e.conversation_key = "a".repeat(MAX_HISTORY_KEY_CHARS + 40);
+        h.record(e);
+        assert_eq!(
+            h.entries[0].conversation_key.chars().count(),
+            MAX_HISTORY_KEY_CHARS
+        );
+    }
+
+    #[test]
+    fn record_after_back_discards_forward_tail() {
+        let mut h = HubHistoryStack::default();
+        h.reset(entry(0, ""));
+        h.record(entry(0, "lang"));
+        h.record(entry(0, "invite"));
+        assert_eq!(h.go_back().unwrap().page, "lang");
+        h.record(entry(0, "password"));
+        assert_eq!(h.entries.len(), 3);
+        assert_eq!(h.entries.last().unwrap().page, "password");
+        assert!(h.go_forward().is_none());
     }
 
     #[test]

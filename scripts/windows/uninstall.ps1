@@ -19,9 +19,13 @@ $installDir = $PSScriptRoot
 $manifest = Read-Manifest (Join-Path $installDir 'install-manifest.env')
 $label = $manifest['GHALBOL_APP_LABEL']
 $appId = $manifest['GHALBOL_APP_ID']
-$exe = Join-Path $installDir 'ghalbol-app.exe'
+$binBase = $manifest['BIN_NAME']
+if ([string]::IsNullOrWhiteSpace($binBase)) { $binBase = 'ghalbol-app' }
+$exeName = "${binBase}.exe"
+$procName = [System.IO.Path]::GetFileNameWithoutExtension($exeName)
+$exe = Join-Path $installDir $exeName
 
-Get-Process -Name 'ghalbol-app' -ErrorAction SilentlyContinue |
+Get-Process -Name $procName -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $exe } |
     Stop-Process -Force
 

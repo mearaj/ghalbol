@@ -33,6 +33,19 @@ impl VideoJitter {
         }
     }
 
+    /// How far ahead of the play cursor / buffer base we accept (bounds sparse-seq DoS).
+    fn forward_window(&self) -> u32 {
+        (self.max_depth as u32).saturating_add(8)
+    }
+
+    fn forward_base(&self, incoming: u32) -> u32 {
+        match (self.next_seq, self.map.keys().next().copied()) {
+            (Some(n), _) => n,
+            (None, Some(k)) => k,
+            (None, None) => incoming,
+        }
+    }
+
     /// Insert a completed encoded frame. Frames older than the play cursor are
     /// dropped; overflow drops the oldest and flags that a keyframe is needed to
     /// resync cleanly.
@@ -41,6 +54,11 @@ impl VideoJitter {
             if frame_seq < n {
                 return;
             }
+        }
+        let base = self.forward_base(frame_seq);
+        if frame_seq > base.saturating_add(self.forward_window()) {
+            self.keyframe_request = true;
+            return;
         }
         self.map.insert(frame_seq, frame);
         while self.map.len() > self.max_depth {
@@ -111,5 +129,33 @@ impl VideoJitter {
         let r = self.keyframe_request;
         self.keyframe_request = false;
         r
+    }
+
+    #[cfg(test)]
+    fn buffered_len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::call_video::codec::EncodedVideoFrame;
+
+    fn enc(keyframe: bool) -> EncodedVideoFrame {
+        EncodedVideoFrame {
+            keyframe,
+            data: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn push_rejects_sparse_seq_far_ahead_of_window() {
+        let mut j = VideoJitter::new(4);
+        j.push(10, enc(true));
+        assert_eq!(j.buffered_len(), 1);
+        j.push(10 + j.forward_window() + 1, enc(false));
+        assert_eq!(j.buffered_len(), 1);
+        assert!(j.take_keyframe_request());
     }
 }

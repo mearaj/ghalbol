@@ -19,9 +19,7 @@ impl IdentityAlgorithm {
             "secp256k1" => Ok(Self::Secp256k1),
             "ed25519" => Ok(Self::Ed25519),
             "ecdsa-p256" => Ok(Self::EcdsaP256),
-            other => Err(ServerError::BadRequest(format!(
-                "unknown identity algorithm: {other}"
-            ))),
+            _ => Err(ServerError::BadRequest("unknown identity algorithm".into())),
         }
     }
 
@@ -45,6 +43,10 @@ impl Identity {
         let t = s.trim();
         if t.is_empty() {
             return Err(ServerError::BadRequest("identity empty".into()));
+        }
+        // algo-prefix + hex must stay bounded before decode allocates.
+        if t.len() > 32 + MAX_PUBKEY_HEX_LEN {
+            return Err(ServerError::BadRequest("identity wire too long".into()));
         }
         if let Some((algo, hex_part)) = t.split_once(':') {
             let algorithm = IdentityAlgorithm::from_wire_id(algo)?;
@@ -98,12 +100,25 @@ pub fn percent_decode_uri_component(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Max length for identity strings in paths and query params (before parse).
+pub const MAX_IDENTITY_PARAM_LEN: usize = 256;
+
+/// Matches `ghalbol_core::identity` oversize gate (prefixed wires stay small).
+const MAX_PUBKEY_HEX_LEN: usize = 132;
+
+pub fn check_identity_param_len(s: &str) -> Result<(), ServerError> {
+    if s.len() > MAX_IDENTITY_PARAM_LEN {
+        return Err(ServerError::BadRequest("identity wire too long".into()));
+    }
+    Ok(())
+}
+
 fn decode_pubkey_hex(hex_s: &str) -> Result<Vec<u8>, ServerError> {
     let s = hex_s.trim();
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if s.is_empty() || s.len() > MAX_PUBKEY_HEX_LEN || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(ServerError::BadRequest("public key: invalid hex".into()));
     }
-    hex::decode(s).map_err(|e| ServerError::BadRequest(format!("public key hex: {e}")))
+    hex::decode(s).map_err(|_| ServerError::BadRequest("public key: invalid hex".into()))
 }
 
 fn validate_public_key(algorithm: IdentityAlgorithm, public_key: &[u8]) -> Result<(), ServerError> {
@@ -113,16 +128,15 @@ fn validate_public_key(algorithm: IdentityAlgorithm, public_key: &[u8]) -> Resul
                 .map_err(|e| ServerError::BadRequest(format!("secp256k1 public key: {e}")))?;
         }
         IdentityAlgorithm::Ed25519 => {
-            let arr: [u8; 32] = public_key
-                .try_into()
-                .map_err(|_| ServerError::BadRequest("ed25519 public key: invalid length".into()))?;
+            let arr: [u8; 32] = public_key.try_into().map_err(|_| {
+                ServerError::BadRequest("ed25519 public key: invalid length".into())
+            })?;
             ed25519_dalek::VerifyingKey::from_bytes(&arr)
                 .map_err(|e| ServerError::BadRequest(format!("ed25519 public key: {e}")))?;
         }
         IdentityAlgorithm::EcdsaP256 => {
-            p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).map_err(|e| {
-                ServerError::BadRequest(format!("ecdsa-p256 public key: {e}"))
-            })?;
+            p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key)
+                .map_err(|e| ServerError::BadRequest(format!("ecdsa-p256 public key: {e}")))?;
         }
     }
     Ok(())
@@ -156,5 +170,20 @@ mod tests {
     #[test]
     fn ml_dsa65_wire_rejects() {
         assert!(Identity::parse("ml-dsa-65:deadbeef").is_err());
+    }
+
+    #[test]
+    fn oversized_pubkey_hex_rejects_before_decode() {
+        let huge = "ab".repeat(MAX_PUBKEY_HEX_LEN + 1);
+        assert!(Identity::parse(&huge).is_err());
+        assert!(Identity::parse(&format!("ed25519:{huge}")).is_err());
+    }
+
+    #[test]
+    fn param_len_gate_rejects_before_parse() {
+        let huge = "a".repeat(MAX_IDENTITY_PARAM_LEN + 1);
+        assert!(check_identity_param_len(&huge).is_err());
+        let ok = "a".repeat(MAX_IDENTITY_PARAM_LEN);
+        assert!(check_identity_param_len(&ok).is_ok());
     }
 }

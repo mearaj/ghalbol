@@ -70,6 +70,11 @@ pub struct App {
     /// Shown above the transcript when the delivery mailbox is down after a send.
     #[rust]
     delivery_hint: String,
+    /// Ephemeral chat/call feedback shown above the transcript (survives poll ticks).
+    #[rust]
+    chat_notice: String,
+    #[rust]
+    chat_notice_error: bool,
     #[rust]
     namespace: String,
     #[rust]
@@ -112,6 +117,9 @@ pub struct App {
     camera_on: bool,
     #[rust]
     call_open: bool,
+    /// Mirrors whether `call_view` is the active shell (for stale-call recovery).
+    #[rust]
+    call_view_visible: bool,
     #[rust]
     ui_locked: bool,
     #[rust]
@@ -174,6 +182,11 @@ pub struct App {
     /// Last voice-play elapsed second painted (throttle transcript refresh).
     #[rust]
     voice_play_tick_sec: u32,
+    /// Last status strip painted above the transcript (skip `chat_log.render` on poll).
+    #[rust]
+    painted_call_strip: String,
+    #[rust]
+    painted_call_strip_error: bool,
 }
 
 impl AppMain for App {
@@ -210,6 +223,7 @@ impl AppMain for App {
                     selected_pk: ""
                     selected_title: "Select a chat"
                     call_line: ""
+                    call_line_is_error: ""
                     open_gen: 0
                     play_gen: 0
                     play_path: ""
@@ -254,9 +268,10 @@ impl AppMain for App {
             }
             host::desktop_session_start(&self.namespace);
             if let Some(arg) = std::env::args().skip(1).find(|arg| {
-                arg.starts_with("ghalbol://") || arg.contains("ghalbol.com/connect/")
+                let t = arg.trim();
+                t.starts_with("ghalbol://") || t.contains("ghalbol.com/connect/")
             }) {
-                self.pending_invite = arg;
+                self.pending_invite = strip_surrounding_quotes(&arg);
             }
             start_ui_poll();
             self.push_identity_copy(cx);
@@ -264,6 +279,7 @@ impl AppMain for App {
         match event {
             Event::Shutdown | Event::QuitRequested(_) => {
                 let _ = host::end_call();
+                self.call_open = false;
             }
             Event::WindowGeomChange(change) => {
                 self.apply_shell_widths(cx, change.new_geom.inner_size.x);
@@ -284,10 +300,7 @@ impl AppMain for App {
             // hides the soft keyboard on its own while typing continues.
             Event::VirtualKeyboard(VirtualKeyboardEvent::DidHide { .. }) => {
                 if !cx.keyboard.has_physical_keyboard() {
-                    let composer = self.ui.text_input(cx, ids!(composer));
-                    if cx.has_key_focus(composer.area()) {
-                        cx.set_key_focus(Area::Empty);
-                    }
+                    self.release_composer_key_focus(cx);
                 }
             }
             Event::NextFrame(_) => self.apply_chat_pin_frame(cx),
@@ -327,9 +340,21 @@ impl AppMain for App {
             Event::Foreground | Event::Resume => {
                 host::set_app_visible(true);
                 if let Some(url) = host::take_view_invite() {
-                    if self.session.is_some() {
-                        let _ = host::accept_invite(&self.namespace, &url);
-                        self.roster_ver = u64::MAX;
+                    if self.session.is_some() && !self.ui_locked {
+                        match host::accept_invite(&self.namespace, &url) {
+                            Ok(pk) => {
+                                self.roster_ver = u64::MAX;
+                                self.open_joined_peer_chat(cx, &pk);
+                                self.show_call_line(
+                                    cx,
+                                    crate::app_chat::join_accept_status_line(&pk),
+                                );
+                            }
+                            Err(e) => {
+                                self.roster_ver = u64::MAX;
+                                self.surface_invite_join_error(cx, e, Some(&url));
+                            }
+                        }
                     } else {
                         self.pending_invite = url;
                     }
@@ -345,6 +370,8 @@ impl AppMain for App {
         self.sync_open_chat(cx);
         if let Event::Signal = event {
             self.drain_events(cx);
+            // Poll may join via QR / roster bumps — open the room same frame.
+            self.sync_open_chat(cx);
         }
     }
 }

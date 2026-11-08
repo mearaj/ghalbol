@@ -42,6 +42,9 @@ impl Identity {
         if t.is_empty() {
             return Err(DeliveryError::BadRequest("identity empty".into()));
         }
+        if t.len() > 256 {
+            return Err(DeliveryError::BadRequest("identity too long".into()));
+        }
         if let Some((algo, hex_part)) = t.split_once(':') {
             let algorithm = IdentityAlgorithm::from_wire_id(algo)?;
             let public_key = decode_pubkey_hex(hex_part)?;
@@ -74,9 +77,12 @@ pub fn normalize_identity_wire(s: &str) -> Result<String, DeliveryError> {
     Identity::parse(s).map(|id| id.to_wire())
 }
 
+/// Matches `ghalbol_core::identity` / coord oversize gate.
+const MAX_PUBKEY_HEX_LEN: usize = 132;
+
 fn decode_pubkey_hex(hex_s: &str) -> Result<Vec<u8>, DeliveryError> {
     let s = hex_s.trim();
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if s.is_empty() || s.len() > MAX_PUBKEY_HEX_LEN || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(DeliveryError::BadRequest("public key: invalid hex".into()));
     }
     hex::decode(s).map_err(|e| DeliveryError::BadRequest(format!("public key hex: {e}")))
@@ -105,4 +111,24 @@ fn validate_public_key(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_overlong_identity_before_decode() {
+        let err = Identity::parse(&"ab".repeat(200)).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn rejects_overlong_pubkey_hex_under_wire_cap() {
+        // Under the wire-length gate but over the pubkey hex gate.
+        let huge = "a".repeat(MAX_PUBKEY_HEX_LEN + 1);
+        assert!(huge.len() <= 256);
+        assert!(Identity::parse(&huge).is_err());
+        assert!(Identity::parse(&format!("ed25519:{huge}")).is_err());
+    }
 }

@@ -39,7 +39,8 @@ impl DmDialAddr {
     /// Parse `/ip4/h/tcp/p`, `/ip6/h/tcp/p`, or `host:port`.
     pub fn parse(s: &str) -> Option<Self> {
         let t = s.trim();
-        if t.is_empty() {
+        // Bound before SocketAddr/DNS work — hostile dial strings must not allocate huge hosts.
+        if t.is_empty() || t.len() > 512 {
             return None;
         }
         if let Ok(sa) = SocketAddr::from_str(t) {
@@ -47,6 +48,9 @@ impl DmDialAddr {
         }
         let parts: Vec<&str> = t.split('/').filter(|p| !p.is_empty()).collect();
         if parts.len() >= 4 && (parts[0] == "ip4" || parts[0] == "ip6") && parts[2] == "tcp" {
+            if parts[1].len() > 253 {
+                return None;
+            }
             if let Ok(port) = parts[3].parse::<u16>() {
                 return Some(Self::new(parts[1].to_string(), port));
             }
@@ -86,5 +90,12 @@ mod tests {
         assert_eq!(a.port, 8766);
         let b = DmDialAddr::parse("192.168.1.2:4433").unwrap();
         assert_eq!(b.port, 4433);
+    }
+
+    #[test]
+    fn parse_rejects_oversized_dial_string() {
+        let huge = format!("/ip4/{}/tcp/8766", "a".repeat(300));
+        assert!(DmDialAddr::parse(&huge).is_none());
+        assert!(DmDialAddr::parse(&"x".repeat(513)).is_none());
     }
 }

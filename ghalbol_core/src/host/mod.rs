@@ -39,8 +39,42 @@ pub(crate) fn json_error(v: &Value, fallback: &str) -> Result<(), String> {
 pub(crate) fn short_key(pk: &str) -> String {
     let t = pk.trim();
     if t.len() <= 16 {
-        t.to_string()
-    } else {
-        format!("{}…{}", &t[..8], &t[t.len() - 4..])
+        return t.to_string();
     }
+    if !t.is_ascii() || t.len() < 12 {
+        return t.chars().take(16).collect();
+    }
+    format!("{}…{}", &t[..8], &t[t.len() - 4..])
+}
+
+/// Wire-shaped contact identity for outbound host API calls.
+pub(crate) fn require_contact_pk(peer_public_key_hex: &str) -> Result<String, String> {
+    let pk = peer_public_key_hex.trim();
+    if !crate::contacts_v1::is_valid_public_key_hex(pk) {
+        return Err("public key is not valid".into());
+    }
+    Ok(pk.to_string())
+}
+
+/// Mailbox / attachment offer ids (`ghalbol_delivery` caps at 128 bytes).
+const MAX_DELIVERY_MESSAGE_ID_BYTES: usize = 128;
+
+pub(crate) fn require_delivery_message_id(message_id: &str) -> Result<String, String> {
+    let t = message_id.trim();
+    if t.is_empty()
+        || t.len() > MAX_DELIVERY_MESSAGE_ID_BYTES
+        || t.chars().any(char::is_control)
+    {
+        return Err("message id is not valid".into());
+    }
+    Ok(t.to_string())
+}
+
+pub(crate) fn require_app_namespace(app_namespace: &str) -> Result<&str, String> {
+    let ns = app_namespace.trim();
+    if ns.is_empty() {
+        return Err("app namespace is required".into());
+    }
+    crate::storage::sanitize_namespace(ns).map_err(|_| "app namespace is not valid".to_string())?;
+    Ok(ns)
 }

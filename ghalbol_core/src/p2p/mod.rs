@@ -12,6 +12,6 @@ pub use crate::connect::{
     last_room_peer, libp2p_peer_for_contact_identity, live_foreground_peer_for_catchup,
     live_foreground_peer_pk, may_send_read_ack_for_contact_pk, new_msg_id_for_ffi,
     notify_dm_presence_wake, notify_network_change, notify_relay_refresh, queue_read_ack_catchup,
-    run_gossip_chat_node_with_std_io, set_app_ack_read_enabled, set_app_ui_visible,
+    run_gossip_chat_node_with_std_io, app_ui_visible, set_app_ack_read_enabled, set_app_ui_visible,
     set_drop_pending_call_invite_hook, sync_foreground_peer_now,
 };

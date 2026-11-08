@@ -181,7 +181,7 @@ pub async fn run_video_session(
             }
         }
     }
-    video.render_tx.closed().await;
+    drop(video.render_tx);
     #[cfg(target_os = "android")]
     crate::call_video::android_video::stop_capture();
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

@@ -84,5 +84,6 @@ tempfile = "3"
 qrcode = { version = "0.14", features = ["image"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ghalbol_coord = { path = "../ghalbol_coord" }
+ghalbol_delivery = { path = "../ghalbol_delivery" }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }

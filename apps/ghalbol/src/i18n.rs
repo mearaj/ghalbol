@@ -625,6 +625,7 @@ fn extra(lang: &str, id: &str) -> Option<&'static str> {
             ("blocked_empty", "No hay contactos bloqueados. Pega una clave pública para bloquear a alguien de tu lista."),
             ("blocked_help", "Pega una clave pública y toca Alternar bloqueo para desbloquear."),
             ("tap_to_resend", "Toca para reenviar"),
+            ("decline", "Rechazar"),
             ("delivery", "Entrega"),
             ("log", "Registro"),
             ("key", "Clave privada"),
@@ -669,6 +670,7 @@ fn extra(lang: &str, id: &str) -> Option<&'static str> {
             ("blocked_empty", "कोई अवरुद्ध संपर्क नहीं। सूची से किसी को अवरुद्ध करने के लिए सार्वजनिक कुंजी चिपकाएँ।"),
             ("blocked_help", "अनब्लॉक करने के लिए सार्वजनिक कुंजी चिपकाएँ और अवरोध टॉगल दबाएँ।"),
             ("tap_to_resend", "फिर भेजने के लिए टैप करें"),
+            ("decline", "अस्वीकार करें"),
             ("delivery", "वितरण"),
             ("log", "ऐप लॉग"),
             ("key", "निजी कुंजी"),
@@ -901,6 +903,7 @@ fn extra(lang: &str, id: &str) -> Option<&'static str> {
             ("blocked_empty", "No blocked contacts. Paste a public key below to block someone already in your list."),
             ("blocked_help", "Paste a public key below and tap Toggle block to unblock."),
             ("tap_to_resend", "Tap to resend"),
+            ("decline", "Decline"),
             ("flip_camera", "Flip camera"),
             ("camera_on", "Camera on"),
             ("camera_off", "Camera off"),
@@ -986,6 +989,13 @@ mod tests {
                 assert_ne!(local, phrase("en", id), "{code} still English for {id}");
             }
         }
+    }
+
+    #[test]
+    fn decline_phrase_is_translated() {
+        assert_eq!(phrase("en", "decline"), "Decline");
+        assert_eq!(phrase("es", "decline"), "Rechazar");
+        assert_ne!(phrase("zz", "decline"), "decline");
     }
 
     #[test]

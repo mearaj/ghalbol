@@ -101,6 +101,9 @@ pub fn derive_call_media_transport_keys(
     if call_id.is_empty() {
         return Err("call_id empty".to_string());
     }
+    if call_id.len() > 128 {
+        return Err("call_id too long".to_string());
+    }
     let ikm = transport_ecdh_ikm(local_sk, peer_pk);
     let pair = identity_pair_binding(local_identity_wire, peer_identity_wire)?;
     let salt = call_id.as_bytes();
@@ -148,6 +151,20 @@ mod tests {
         let k_ab = derive_call_sig_transport_message_key(&sk_a, &pk_b, &wire_a, &wire_b).unwrap();
         let k_ba = derive_call_sig_transport_message_key(&sk_b, &pk_a, &wire_b, &wire_a).unwrap();
         assert_eq!(k_ab, k_ba);
+    }
+
+    #[test]
+    fn call_media_rejects_empty_call_id() {
+        let (_ks_a, alice) = crate::create_keystore_v1("pw", None).unwrap();
+        let (_ks_b, bob) = crate::create_keystore_v1("pw2", None).unwrap();
+        let (sk_a, pk_a) = generate_transport_keypair();
+        let wire_a = alice.identity_wire();
+        let wire_b = bob.identity_wire();
+        assert!(
+            derive_call_media_transport_keys(&sk_a, &pk_a, &wire_a, &wire_b, "  ")
+                .unwrap_err()
+                .contains("empty")
+        );
     }
 
     #[test]

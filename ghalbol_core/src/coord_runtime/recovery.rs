@@ -6,26 +6,25 @@ use super::state::*;
 use std::sync::atomic::Ordering;
 
 pub fn clear_coord_lookup_backoff_for_pk(public_key_hex: &str) {
-    let pk = public_key_hex.trim();
-    if !crate::contacts_v1::is_valid_public_key_hex(pk) {
+    let Ok(pk) = crate::public_key_util::normalize_contact_identity_wire(public_key_hex) else {
         return;
-    }
+    };
     if let Ok(mut m) = lookup_backoff_map().lock() {
-        m.remove(pk);
+        m.remove(&pk);
     }
 }
 
 /// Mirror `:p2p` `note_coord_lookup_not_found` so duplicate UI lookups do not fight native upkeep.
 pub fn sync_coord_lookup_peer_not_found(public_key_hex: &str, step_ms: u64, now_ms: i64) {
-    let pk = public_key_hex.trim();
-    if !crate::contacts_v1::is_valid_public_key_hex(pk) {
+    let Ok(pk) = crate::public_key_util::normalize_contact_identity_wire(public_key_hex) else {
         return;
-    }
+    };
     let step = step_ms.clamp(500, 5_000);
     let next = (now_ms as u64).saturating_add(step);
     if let Ok(mut m) = lookup_backoff_map().lock() {
-        m.insert(
-            pk.to_string(),
+        insert_lookup_backoff(
+            &mut m,
+            pk,
             CoordLookupBackoff {
                 next_allowed_ms: next,
                 step_ms: step,
@@ -103,6 +102,10 @@ pub fn coord_invalidate_presence_on_network_change() {
     if let Ok(mut m) = lookup_backoff_map().lock() {
         m.clear();
     }
+    if let Ok(mut r) = coord_globals().registered_on.lock() {
+        r.clear();
+    }
+    COORD_REG_PENDING.store(false, Ordering::Relaxed);
     // Public-TCP registration is stale after iface change. Relay-circuit presence may still
     // be valid on the coord relay — only clear the registered bit when we are not listening
     // on a circuit (same rule as mark_coord_relay_hop_lost).

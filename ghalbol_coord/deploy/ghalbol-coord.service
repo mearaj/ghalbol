@@ -20,10 +20,12 @@ Group=REPLACE_VM_USER
 WorkingDirectory=/home/REPLACE_VM_USER
 ExecStart=/home/REPLACE_VM_USER/ghalbol_coord
 Environment=GHALBOL_COORD_LISTEN=REPLACE_GHALBOL_COORD_LISTEN
-Environment=GHALBOL_COORD_DB=/home/REPLACE_VM_USER/.local/share/com.ghalbol.coord/ghalbol_coord
+Environment=GHALBOL_COORD_DB=/home/REPLACE_VM_USER/.local/share/com.ghalbol.coord/ghalbol_server
 Environment=RUST_LOG=info
 Restart=on-failure
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target
