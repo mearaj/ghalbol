@@ -388,13 +388,25 @@ pub(crate) fn read_root_unlocked(path: &Path) -> Result<Value, TranscriptStoreEr
 }
 
 fn write_root_unlocked(path: &Path, root: &Value) -> Result<(), TranscriptStoreError> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string_pretty(root)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
-    fs::rename(tmp, path)?;
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        // Durable before rename so a crash mid-write cannot leave a truncated final file.
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    // Best-effort directory fsync so the rename itself survives power loss (Unix).
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -472,12 +484,53 @@ fn pick_better_duplicate(a: &StoredChatLine, b: &StoredChatLine) -> StoredChatLi
     if bmid.is_empty() && !amid.is_empty() {
         return a.clone();
     }
-    if a.outgoing && b.outgoing && delivery_rank(&b.delivery) > delivery_rank(&a.delivery) {
-        return b.clone();
+    if a.outgoing && b.outgoing {
+        if delivery_rank(&b.delivery) > delivery_rank(&a.delivery) {
+            return b.clone();
+        }
+        if delivery_rank(&a.delivery) > delivery_rank(&b.delivery) {
+            return a.clone();
+        }
+        // Same delivery rank — keep first peer `received_at_ms` (recipient authority).
+        match (a.received_at_ms, b.received_at_ms) {
+            (Some(_), None) => return a.clone(),
+            (None, Some(_)) => return b.clone(),
+            _ => {}
+        }
+        return a.clone();
     }
-    let at = a.created_at_ms.unwrap_or(0);
-    let bt = b.created_at_ms.unwrap_or(0);
-    if bt > at { b.clone() } else { a.clone() }
+    if !a.outgoing && !b.outgoing {
+        // Inbound: prefer read_ack_sent, then earliest accept time, then richer local media.
+        if a.read_ack_sent != b.read_ack_sent {
+            return if b.read_ack_sent {
+                b.clone()
+            } else {
+                a.clone()
+            };
+        }
+        let ar = a.received_at_ms.or(a.created_at_ms).unwrap_or(0);
+        let br = b.received_at_ms.or(b.created_at_ms).unwrap_or(0);
+        if ar > 0 && br > 0 && ar != br {
+            return if ar <= br { a.clone() } else { b.clone() };
+        }
+        if a.local_path.as_deref().unwrap_or("").is_empty()
+            && !b.local_path.as_deref().unwrap_or("").is_empty()
+        {
+            return b.clone();
+        }
+        if a.audio_path.as_deref().unwrap_or("").is_empty()
+            && !b.audio_path.as_deref().unwrap_or("").is_empty()
+        {
+            return b.clone();
+        }
+        return a.clone();
+    }
+    // Mixed polarity for the same message_id is unexpected — keep the outgoing row's ticks.
+    if a.outgoing {
+        a.clone()
+    } else {
+        b.clone()
+    }
 }
 
 fn line_sort_key(line: &StoredChatLine) -> (i64, String, String) {
@@ -1000,6 +1053,44 @@ mod tests {
         // WAN ack_received after LAN ack_read must not downgrade
         let picked2 = pick_better_duplicate(&read, &delivered);
         assert_eq!(picked2.delivery, "read");
+    }
+
+    #[test]
+    fn pick_better_duplicate_inbound_keeps_earliest_accept() {
+        let early = StoredChatLine {
+            local_id: "a".into(),
+            text: "hi".into(),
+            outgoing: false,
+            from: Some("peer".into()),
+            message_id: Some("mid-in".into()),
+            delivery: "delivered".into(),
+            created_at_ms: Some(100),
+            received_at_ms: Some(1000),
+            read_ack_sent: false,
+            msg_kind: "text".into(),
+            duration_ms: None,
+            audio_path: None,
+            file_name: None,
+            mime_type: None,
+            size_bytes: None,
+            local_path: None,
+        };
+        let late = StoredChatLine {
+            created_at_ms: Some(5000),
+            received_at_ms: Some(5000),
+            text: "hi-dup".into(),
+            ..early.clone()
+        };
+        let picked = pick_better_duplicate(&early, &late);
+        assert_eq!(picked.received_at_ms, Some(1000));
+        assert_eq!(picked.text, "hi");
+        let with_read = StoredChatLine {
+            read_ack_sent: true,
+            received_at_ms: Some(5000),
+            ..early.clone()
+        };
+        let picked_read = pick_better_duplicate(&early, &with_read);
+        assert!(picked_read.read_ack_sent);
     }
 
     #[test]

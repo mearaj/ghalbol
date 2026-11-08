@@ -5,7 +5,9 @@ mod tests {
         parse_coord_urls, resolve_coord_insecure_tls,
     };
     use super::super::recovery::{
+        clear_coord_lookup_backoff_for_pk, coord_invalidate_presence_on_network_change,
         coord_recovery_throttled, note_coord_recovery_attempt, relay_presence_reschedule_min_ms,
+        sync_coord_lookup_peer_not_found,
     };
     use super::super::state::*;
     use std::sync::atomic::Ordering;
@@ -74,5 +76,33 @@ mod tests {
     fn parse_coord_urls_empty_input() {
         assert!(parse_coord_urls("").is_empty());
         assert!(parse_coord_urls("   ").is_empty());
+    }
+
+    #[test]
+    fn network_handover_invalidate_clears_lookup_backoff() {
+        let secret =
+            crate::identity::generate_secret(crate::identity::IdentityAlgorithm::Secp256k1)
+                .expect("secret");
+        let pk_bytes = crate::identity::public_key_from_secret(
+            crate::identity::IdentityAlgorithm::Secp256k1,
+            &secret,
+        )
+        .expect("pk");
+        let pk = hex::encode(pk_bytes);
+        sync_coord_lookup_peer_not_found(&pk, 2_000, 1_000_000);
+        assert!(
+            lookup_backoff_map()
+                .lock()
+                .map(|m| m.contains_key(&pk))
+                .unwrap_or(false)
+        );
+        coord_invalidate_presence_on_network_change();
+        assert!(
+            lookup_backoff_map()
+                .lock()
+                .map(|m| !m.contains_key(&pk))
+                .unwrap_or(false)
+        );
+        clear_coord_lookup_backoff_for_pk(&pk);
     }
 }

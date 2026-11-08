@@ -410,7 +410,8 @@ pub fn on_listen_dm_addr(addr: &DmDialAddr) {
         v.push(ep);
     }
     if v.len() > before {
-        spawn_register_presence();
+        // Endpoint set changed — bypass register throttle (TRANSPORT.md).
+        spawn_register_presence_inner(true);
     }
 }
 pub(super) fn endpoints_for_coord_register(eps: Vec<CoordEndpoint>) -> Vec<CoordEndpoint> {

@@ -571,8 +571,19 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
             return;
         }
     }
-    if call_state::apply_inbound(&parsed.sender_public_key_hex, &parsed.call_id, parsed.kind)
-        .is_err()
+    let invite_video = call_state::invite_payload_wants_video(&parsed.payload);
+    // Capture before Hangup/Reject clears peer call state.
+    let prior_video = call_state::peer_call_video_enabled(&parsed.sender_public_key_hex)
+        || crate::p2p::call_active::snapshot()
+            .filter(|s| s.call_id == parsed.call_id)
+            .is_some_and(|s| s.video_active || s.camera_on || s.remote_video_on);
+    if call_state::apply_inbound_ex(
+        &parsed.sender_public_key_hex,
+        &parsed.call_id,
+        parsed.kind,
+        invite_video,
+    )
+    .is_err()
     {
         return;
     }
@@ -654,7 +665,7 @@ async fn handle_inbound_call_frame(frame: &[u8], ctx: &WireDispatchCtx) {
                 crate::call_history::record_ring_outcome(
                     &cid,
                     &parsed.sender_public_key_hex,
-                    false,
+                    prior_video,
                     history_reason,
                 );
                 crate::call_state::clear_peer(&parsed.sender_public_key_hex);

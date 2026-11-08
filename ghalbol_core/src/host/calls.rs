@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 
+use crate::call_state;
 use crate::p2p_runtime;
 
 use super::json_error;
@@ -198,7 +199,11 @@ pub fn end_call() -> Result<(), String> {
     let _ = p2p_runtime::p2p_call_media(&json!({ "action": "stop", "call_id": call_id }));
     let _ = p2p_runtime::p2p_call_video(&json!({ "action": "stop", "call_id": call_id }));
     if declining {
-        crate::call_history::record_ring_outcome(&call_id, &peer, false, reason);
+        let video = call_state::peer_call_video_enabled(&peer)
+            || crate::p2p::call_active::snapshot()
+                .map(|s| s.video_active || s.camera_on || s.remote_video_on)
+                .unwrap_or(false);
+        crate::call_history::record_ring_outcome(&call_id, &peer, video, reason);
     } else {
         crate::call_history::record_from_active(reason);
     }

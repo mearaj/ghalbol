@@ -88,7 +88,11 @@ fn unpack_sealed(sealed: &[u8]) -> Result<(u8, &[u8], &[u8], &[u8]), String> {
 
 fn encrypt_with_key(key: &Key<Aes256Gcm>, plaintext: &[u8]) -> Result<([u8; AES_GCM_NONCE_LEN], Vec<u8>), String> {
     let cipher = Aes256Gcm::new(key);
-    let nonce = [0u8; AES_GCM_NONCE_LEN];
+    // Random nonce per seal. Keys are already ECDH-ephemeral (unique per message), but a
+    // fixed zero nonce is brittle if any shared-secret collision or key-reuse path appears.
+    // Wire format unchanged: nonce is carried in the sealed blob, so old zero-nonce rows still open.
+    let mut nonce = [0u8; AES_GCM_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|_| "aes-gcm encrypt failed".to_string())?;
@@ -275,6 +279,50 @@ mod tests {
         assert_eq!(sealed.first(), Some(&OFFLINE_CIPHER_SECP256K1_V1));
         let plain = open_sealed_secp256k1(&sk, &sealed).unwrap();
         assert_eq!(plain, b"hello ghalbol");
+    }
+
+    #[test]
+    fn secp_seals_use_distinct_nonces() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let pk = sk.public_key(&secp).serialize();
+        let a = seal_to_secp256k1_public(&pk, b"same plaintext").unwrap();
+        let b = seal_to_secp256k1_public(&pk, b"same plaintext").unwrap();
+        assert_ne!(a, b, "fresh ephemeral + random nonce must diversify ciphertext");
+        // Nonce is after prefix + u32le pub_len + ephemeral pub (33 bytes for secp).
+        let (_pa, _ea, na, _ca) = unpack_sealed(&a).unwrap();
+        let (_pb, _eb, nb, _cb) = unpack_sealed(&b).unwrap();
+        assert_ne!(na, nb);
+        assert_eq!(open_sealed_secp256k1(&sk, &a).unwrap(), b"same plaintext");
+        assert_eq!(open_sealed_secp256k1(&sk, &b).unwrap(), b"same plaintext");
+    }
+
+    #[test]
+    fn legacy_zero_nonce_secp_still_opens() {
+        let secp = Secp256k1::new();
+        let sk = random_secp_secret_key().unwrap();
+        let recipient = sk.public_key(&secp);
+        let ephemeral = random_secp_secret_key().unwrap();
+        let ephemeral_pub = ephemeral.public_key(&secp);
+        let shared = secp256k1::ecdh::SharedSecret::new(&recipient, &ephemeral);
+        let mut shared_arr = [0u8; 32];
+        shared_arr.copy_from_slice(&shared.secret_bytes());
+        let key = aes_key_sha256(&shared_arr);
+        let cipher = Aes256Gcm::new(&key);
+        let zero = [0u8; AES_GCM_NONCE_LEN];
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&zero), b"legacy-zero".as_ref())
+            .unwrap();
+        let sealed = pack_sealed(
+            OFFLINE_CIPHER_SECP256K1_V1,
+            &ephemeral_pub.serialize(),
+            &zero,
+            &ct,
+        );
+        assert_eq!(
+            open_sealed_secp256k1(&sk, &sealed).unwrap(),
+            b"legacy-zero"
+        );
     }
 
     #[test]

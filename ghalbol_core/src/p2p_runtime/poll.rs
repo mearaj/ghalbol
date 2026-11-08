@@ -29,7 +29,7 @@ fn maybe_maintain_poll_queue(now_ms: i64) {
             crate::call_history::record_ring_outcome(
                 &ring.call_id,
                 &ring.peer_public_key_hex,
-                false,
+                ring.video_enabled,
                 reason,
             );
         }

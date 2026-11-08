@@ -24,6 +24,9 @@ static LAST_BRIDGE_PENDING_POLL_MS: std::sync::atomic::AtomicI64 =
 const BRIDGE_PENDING_POLL_MS: i64 = 3_000;
 static LAST_COORD_DIAL_SWEEP_MS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
+/// Last observed OS default transport discriminant for handover detection.
+static LAST_OS_DEFAULT_TRANSPORT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0xff);
 /// Storm throttle for coord public-TCP sweep (urgent/priority still win inside the pass).
 const COORD_DIAL_SWEEP_MS: i64 = 5_000;
 /// After a failed accept, wait before retrying the same bridge_id (avoids log storms).
@@ -267,6 +270,18 @@ pub fn mark_peer_disconnected(
     let _ = events_tx.send(GossipChatEvent::PeerDisconnected(peer.clone()));
 }
 
+fn os_default_transport_disc(
+    t: crate::p2p::network_transport::OsDefaultTransport,
+) -> u8 {
+    use crate::p2p::network_transport::OsDefaultTransport;
+    match t {
+        OsDefaultTransport::None => 0,
+        OsDefaultTransport::Wifi => 1,
+        OsDefaultTransport::Cellular => 2,
+        OsDefaultTransport::Ethernet => 3,
+    }
+}
+
 fn run_connect_upkeep(
     identity: &crate::DecryptedIdentity,
     listen_port: u16,
@@ -277,6 +292,18 @@ fn run_connect_upkeep(
     crate::p2p::network_transport::refresh_os_network_truth();
     let mut net = crate::p2p::network_transport::detect_local_network_profile();
     crate::p2p::network_transport::merge_os_network_truth(&mut net);
+    let disc = os_default_transport_disc(net.os.default_transport);
+    let prev = LAST_OS_DEFAULT_TRANSPORT.swap(disc, Ordering::SeqCst);
+    if prev != 0xff && prev != disc {
+        native_log::info(
+            "connect",
+            format!(
+                "OS default route changed disc {prev}→{disc} iface={:?}",
+                net.os.default_route_iface
+            ),
+        );
+        crate::coord_runtime::coord_invalidate_presence_on_network_change();
+    }
     if let Some(pub_ip) = net.primary_public_ipv4 {
         if let Some(addr) = DmDialAddr::parse(&format!("{pub_ip}:{listen_port}")) {
             crate::coord_runtime::on_listen_dm_addr(&addr);

@@ -364,27 +364,29 @@ async fn handle_inbox_ack(
         .ok_or_else(|| DeliveryError::BadRequest("missing sender_wire".into()))?;
     let sender_norm = crate::identity::normalize_identity_wire(sender_wire)?;
 
-    state
+    let (_sender, newly) = state
         .store
         .ack_deliver(session, message_id, &sender_norm)?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    if newly {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
 
-    state
-        .registry
-        .push(
-            &sender_norm,
-            json!({
-                "type": "message.ack_to_sender",
-                "message_id": message_id,
-                "recipient_wire": session,
-                "delivered_at_ms": now,
-            }),
-        )
-        .await;
+        state
+            .registry
+            .push(
+                &sender_norm,
+                json!({
+                    "type": "message.ack_to_sender",
+                    "message_id": message_id,
+                    "recipient_wire": session,
+                    "delivered_at_ms": now,
+                }),
+            )
+            .await;
+    }
 
     Ok(Some(json!({
         "type": "inbox.ack.ok",

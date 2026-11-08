@@ -26,6 +26,14 @@ fn summary_text(kind: &str, reason: &str, elapsed: i64) -> String {
     }
 }
 
+fn call_event_outgoing(reason: &str, elapsed: i64) -> bool {
+    match reason {
+        "missed" | "rejected" | "remote_reject" => false,
+        "remote_hangup" if elapsed < 2_000 => false,
+        _ => true,
+    }
+}
+
 /// Append a local-only call summary to the peer transcript (no wire send).
 pub fn record_call_ended(snap: &ActiveCallSnapshot, reason: &str) {
     let Some(ns) = crate::dm_event_handler::active_app_namespace() else {
@@ -47,15 +55,21 @@ pub fn record_call_ended(snap: &ActiveCallSnapshot, reason: &str) {
         "Voice call"
     };
     let text = summary_text(kind, reason, elapsed);
+    // Missed / rejected rings render as inbound; connected/cancelled hangups as outbound.
+    let outgoing = call_event_outgoing(reason, elapsed);
     let line = StoredChatLine {
         local_id: format!("call-{}-{}", snap.call_id, now),
         text,
-        outgoing: true,
-        from: None,
+        outgoing,
+        from: if outgoing {
+            None
+        } else {
+            Some(peer.to_string())
+        },
         message_id: Some(format!("call-{}", snap.call_id)),
         delivery: "read".into(),
         created_at_ms: Some(now),
-        received_at_ms: None,
+        received_at_ms: if outgoing { None } else { Some(now) },
         read_ack_sent: true,
         msg_kind: "call_event".into(),
         duration_ms: Some(elapsed.max(0) as u32),
@@ -133,5 +147,15 @@ mod tests {
             summary_text("Voice call", "ui_hangup", 800),
             "Voice call · cancelled"
         );
+    }
+
+    #[test]
+    fn missed_reasons_are_inbound() {
+        assert!(!call_event_outgoing("missed", 0));
+        assert!(!call_event_outgoing("rejected", 500));
+        assert!(!call_event_outgoing("remote_reject", 1_000));
+        assert!(!call_event_outgoing("remote_hangup", 1_500));
+        assert!(call_event_outgoing("remote_hangup", 5_000));
+        assert!(call_event_outgoing("ui_hangup", 800));
     }
 }

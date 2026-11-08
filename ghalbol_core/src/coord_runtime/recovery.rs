@@ -87,13 +87,32 @@ pub fn mark_coord_relay_hop_lost() {
     schedule_check_relay_presence_once();
 }
 
-/// Clear stale endpoint snapshot after a full WAN network handover.
+/// Clear stale endpoint snapshot after a full WAN network handover (Wi‑Fi ↔ cell).
+/// Forces presence re-check / re-register so dials do not use pre-handover TCP endpoints.
 pub fn coord_invalidate_presence_on_network_change() {
+    crate::flow_log::info(
+        "coord",
+        "network handover — invalidate published endpoints and re-establish presence",
+    );
     if let Ok(mut v) = coord_globals().endpoints.lock() {
         v.clear();
     }
     if let Ok(mut g) = coord_globals().preferred_relay_peer_id.lock() {
         *g = None;
+    }
+    if let Ok(mut m) = lookup_backoff_map().lock() {
+        m.clear();
+    }
+    // Public-TCP registration is stale after iface change. Relay-circuit presence may still
+    // be valid on the coord relay — only clear the registered bit when we are not listening
+    // on a circuit (same rule as mark_coord_relay_hop_lost).
+    if !crate::wan_coord::local_relay_circuit_listening() {
+        COORD_REGISTERED.store(false, Ordering::Relaxed);
+    }
+    COORD_CONSEC_FAILS.store(0, Ordering::Relaxed);
+    schedule_check_relay_presence_once();
+    if has_public_coord_register_endpoints() {
+        spawn_register_presence_inner(true);
     }
 }
 pub fn note_remote_peer_circuit_stale(public_key_hex: &str) {

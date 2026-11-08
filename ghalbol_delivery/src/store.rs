@@ -296,28 +296,40 @@ impl MailboxStore {
         })
     }
 
+    /// Ack delivery. Returns `(sender_wire, newly_transitioned)`.
+    /// Already-`delivered` / `read` rows are idempotent success with `newly_transitioned=false`
+    /// so reconnect retries do not fail or re-notify the sender.
     pub fn ack_deliver(
         &self,
         recipient_wire: &str,
         message_id: &str,
         sender_wire: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<(String, bool)> {
         let conn = self.conn.lock().map_err(|_| {
             DeliveryError::Internal("store mutex poisoned".into())
         })?;
-        let row_sender: String = conn
+        let (row_sender, state): (String, String) = conn
             .query_row(
-                "SELECT sender_wire FROM pending_messages
-                 WHERE recipient_wire = ?1 AND message_id = ?2 AND state = 'queued'",
+                "SELECT sender_wire, state FROM pending_messages
+                 WHERE recipient_wire = ?1 AND message_id = ?2",
                 params![recipient_wire, message_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .map_err(|_| DeliveryError::NotFound("queued message not found".into()))?;
+            .map_err(|_| DeliveryError::NotFound("message metadata not found".into()))?;
 
         if row_sender != sender_wire {
             return Err(DeliveryError::Forbidden(
                 "sender_wire mismatch for ack".into(),
             ));
+        }
+
+        if state == "delivered" || state == "read" {
+            return Ok((sender_wire.to_string(), false));
+        }
+        if state != "queued" {
+            return Err(DeliveryError::BadRequest(format!(
+                "cannot deliver-ack state={state}"
+            )));
         }
 
         let now = Self::now_ms();
@@ -336,7 +348,7 @@ impl MailboxStore {
             "message acked"
         );
 
-        Ok(Some(sender_wire.to_string()))
+        Ok((sender_wire.to_string(), true))
     }
 
     pub fn ack_read(
@@ -532,12 +544,21 @@ mod tests {
         };
         let policy = PolicyLimits::from_config(&cfg);
         store.upload(validated, 300, &policy).unwrap();
-        store
+        let (_s, newly) = store
             .ack_deliver(&recipient, "m-read", &sender)
             .unwrap();
+        assert!(newly);
+        let (_s, newly_again) = store
+            .ack_deliver(&recipient, "m-read", &sender)
+            .unwrap();
+        assert!(!newly_again);
         store
             .ack_read(&recipient, "m-read", &sender)
             .unwrap();
+        let (_s, after_read) = store
+            .ack_deliver(&recipient, "m-read", &sender)
+            .unwrap();
+        assert!(!after_read);
         let rows = store.list_outbox(&sender, true).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, "read");

@@ -68,6 +68,7 @@ pub struct ExpiredRing {
     pub peer_public_key_hex: String,
     pub call_id: String,
     pub incoming: bool,
+    pub video_enabled: bool,
 }
 
 /// Drop [CallPhase::IncomingRinging] / [CallPhase::OutgoingRinging] older than [MAX_LIVE_CALL_INVITE_AGE_MS].
@@ -89,10 +90,21 @@ pub fn expire_stale_ringing(now_ms: i64) -> Vec<ExpiredRing> {
             peer_public_key_hex: pk.clone(),
             call_id: c.call_id.clone(),
             incoming: c.phase == CallPhase::IncomingRinging,
+            video_enabled: c.video_enabled,
         });
         false
     });
     expired
+}
+
+/// Whether the live call for `peer` was started as video (invite / connected).
+pub fn peer_call_video_enabled(peer_pk_hex: &str) -> bool {
+    let key = peer_pk_hex.trim().to_ascii_lowercase();
+    store()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&key).map(|c| c.video_enabled))
+        .unwrap_or(false)
 }
 
 pub fn clear_peer(peer_pk_hex: &str) {
@@ -192,8 +204,25 @@ fn fresh_call(call_id: String, phase: CallPhase, video_enabled: bool) -> PeerCal
     }
 }
 
+/// True when invite/accept payload advertises audio+video (or video-only).
+pub fn invite_payload_wants_video(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload
+            .get("media")
+            .and_then(|v| v.as_str())
+            .map(str::trim),
+        Some("audio_video" | "video")
+    )
+}
+
 /// Apply an **outbound** signal before enqueueing to the network.
-pub fn apply_outbound(peer_pk_hex: &str, call_id: &str, kind: CallSigKind) -> Result<(), String> {
+/// `invite_video` is honored for [CallSigKind::Invite] only.
+pub fn apply_outbound_ex(
+    peer_pk_hex: &str,
+    call_id: &str,
+    kind: CallSigKind,
+    invite_video: bool,
+) -> Result<(), String> {
     let key = peer_pk_hex.trim().to_ascii_lowercase();
     let mut g = store().lock().map_err(|_| "call state lock".to_string())?;
     let cur = g.get(&key).cloned();
@@ -203,12 +232,27 @@ pub fn apply_outbound(peer_pk_hex: &str, call_id: &str, kind: CallSigKind) -> Re
                 None => {
                     g.insert(
                         key,
-                        fresh_call(call_id.to_string(), CallPhase::OutgoingRinging, false),
+                        fresh_call(
+                            call_id.to_string(),
+                            CallPhase::OutgoingRinging,
+                            invite_video,
+                        ),
                     );
                 }
                 // Idempotent: host applies before enqueue; the outbound worker applies again.
                 Some(c)
-                    if c.phase == CallPhase::OutgoingRinging && c.call_id == call_id => {}
+                    if c.phase == CallPhase::OutgoingRinging && c.call_id == call_id =>
+                {
+                    if invite_video && !c.video_enabled {
+                        g.insert(
+                            key,
+                            PeerCall {
+                                video_enabled: true,
+                                ..c
+                            },
+                        );
+                    }
+                }
                 Some(_) => {
                     return Err("call already active with this contact".to_string());
                 }
@@ -288,7 +332,13 @@ pub fn apply_outbound(peer_pk_hex: &str, call_id: &str, kind: CallSigKind) -> Re
 }
 
 /// Apply an **inbound** signal after cryptographic verify.
-pub fn apply_inbound(peer_pk_hex: &str, call_id: &str, kind: CallSigKind) -> Result<(), String> {
+/// `invite_video` is honored for [CallSigKind::Invite] only.
+pub fn apply_inbound_ex(
+    peer_pk_hex: &str,
+    call_id: &str,
+    kind: CallSigKind,
+    invite_video: bool,
+) -> Result<(), String> {
     let key = peer_pk_hex.trim().to_ascii_lowercase();
     let mut g = store().lock().map_err(|_| "call state lock".to_string())?;
     let cur = g.get(&key).cloned();
@@ -298,7 +348,11 @@ pub fn apply_inbound(peer_pk_hex: &str, call_id: &str, kind: CallSigKind) -> Res
                 None => {
                     g.insert(
                         key,
-                        fresh_call(call_id.to_string(), CallPhase::IncomingRinging, false),
+                        fresh_call(
+                            call_id.to_string(),
+                            CallPhase::IncomingRinging,
+                            invite_video,
+                        ),
                     );
                 }
                 Some(c) if c.phase == CallPhase::OutgoingRinging => {
@@ -306,7 +360,11 @@ pub fn apply_inbound(peer_pk_hex: &str, call_id: &str, kind: CallSigKind) -> Res
                     if call_id < c.call_id.as_str() {
                         g.insert(
                             key,
-                            fresh_call(call_id.to_string(), CallPhase::IncomingRinging, false),
+                            fresh_call(
+                                call_id.to_string(),
+                                CallPhase::IncomingRinging,
+                                invite_video,
+                            ),
                         );
                     } else {
                         return Err("busy".to_string());
@@ -403,16 +461,16 @@ mod tests {
         // lib tests run concurrently.
         const PK: &str = "0305b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
         clear_all_calls();
-        apply_outbound(PK, "call-bbb", CallSigKind::Invite).unwrap();
+        apply_outbound_ex(PK, "call-bbb", CallSigKind::Invite, false).unwrap();
         assert_eq!(phase_for_peer(PK), CallPhase::OutgoingRinging);
-        apply_inbound(PK, "call-aaa", CallSigKind::Invite).unwrap();
+        apply_inbound_ex(PK, "call-aaa", CallSigKind::Invite, false).unwrap();
         let snap = snapshot_for_peer(PK);
         assert_eq!(snap.phase, CallPhase::IncomingRinging);
         assert_eq!(snap.call_id.as_deref(), Some("call-aaa"));
 
         clear_all_calls();
-        apply_outbound(PK, "call-aaa", CallSigKind::Invite).unwrap();
-        assert!(apply_inbound(PK, "call-bbb", CallSigKind::Invite).is_err());
+        apply_outbound_ex(PK, "call-aaa", CallSigKind::Invite, false).unwrap();
+        assert!(apply_inbound_ex(PK, "call-bbb", CallSigKind::Invite, false).is_err());
         assert_eq!(phase_for_peer(PK), CallPhase::OutgoingRinging);
         assert_eq!(snapshot_for_peer(PK).call_id.as_deref(), Some("call-aaa"));
     }
@@ -423,13 +481,37 @@ mod tests {
         const PK: &str = "03f1b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
         clear_all_calls();
         let t0 = now_ms();
-        apply_inbound(PK, "call-stale", CallSigKind::Invite).unwrap();
+        apply_inbound_ex(PK, "call-stale", CallSigKind::Invite, false).unwrap();
         assert_eq!(phase_for_peer(PK), CallPhase::IncomingRinging);
         let expired = expire_stale_ringing(t0 + MAX_LIVE_CALL_INVITE_AGE_MS + 1_000);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].call_id, "call-stale");
         assert!(expired[0].incoming);
+        assert!(!expired[0].video_enabled);
         assert_eq!(phase_for_peer(PK), CallPhase::Idle);
         assert!(first_incoming_ringing().is_none());
+    }
+
+    #[test]
+    fn expire_stale_video_invite_preserves_video_flag() {
+        let _lock = lock_call_state_tests();
+        const PK: &str = "03a1b1b0d27745e0a38a7254ea100abc38857b51ded2ac7ea88d3063fb8da21784";
+        clear_all_calls();
+        let t0 = now_ms();
+        apply_inbound_ex(PK, "call-vid", CallSigKind::Invite, true).unwrap();
+        assert!(peer_call_video_enabled(PK));
+        let expired = expire_stale_ringing(t0 + MAX_LIVE_CALL_INVITE_AGE_MS + 1_000);
+        assert_eq!(expired.len(), 1);
+        assert!(expired[0].video_enabled);
+    }
+
+    #[test]
+    fn invite_payload_wants_video_parses_media() {
+        assert!(invite_payload_wants_video(&serde_json::json!({
+            "media": "audio_video"
+        })));
+        assert!(invite_payload_wants_video(&serde_json::json!({ "media": "video" })));
+        assert!(!invite_payload_wants_video(&serde_json::json!({ "media": "audio" })));
+        assert!(!invite_payload_wants_video(&serde_json::json!({})));
     }
 }

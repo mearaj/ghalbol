@@ -66,6 +66,62 @@ fn outbox_in_flight_mx() -> &'static Mutex<HashSet<String>> {
     M.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Process-local set of message_ids that failed open/decode permanently.
+/// Skips reconnect re-decrypt storms without sending a false `inbox.ack` delivery tick.
+fn inbound_poison_mx() -> &'static Mutex<HashSet<String>> {
+    static M: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_inbound_poison(message_id: &str) {
+    let mid = message_id.trim();
+    if mid.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = inbound_poison_mx().lock() {
+        g.insert(mid.to_string());
+    }
+}
+
+fn is_inbound_poison(message_id: &str) -> bool {
+    let mid = message_id.trim();
+    if mid.is_empty() {
+        return false;
+    }
+    inbound_poison_mx()
+        .lock()
+        .map(|g| g.contains(mid))
+        .unwrap_or(false)
+}
+
+fn is_permanent_inbound_open_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("decrypt")
+        || e.contains("seal")
+        || e.contains("ciphertext")
+        || e.contains("inner json")
+        || e.contains("sha256")
+        || e.contains("unsupported")
+        || e.contains("size mismatch")
+        || e.contains("missing ")
+        || e.contains("hex:")
+        || e.contains("invalid")
+}
+
+fn is_hard_upload_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("too large")
+        || e.contains("oversize")
+        || e.contains("401")
+        || e.contains("403")
+        || e.contains("unauthorized")
+        || e.contains("forbidden")
+        || e.contains("unsupported")
+        || e.contains("secp256k1")
+        || e.contains("seal")
+        || e.contains("quota")
+}
+
 fn delivery_url_mx() -> &'static Mutex<Option<String>> {
     static U: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     U.get_or_init(|| Mutex::new(None))
@@ -215,6 +271,19 @@ async fn handle_push_frame(
                     return;
                 }
             };
+            let frame_mid = frame
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| envelope.get("message_id").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .trim();
+            if is_inbound_poison(frame_mid) {
+                native_log::debug(
+                    "delivery",
+                    format!("message.inbound skip poison mid={frame_mid}"),
+                );
+                return;
+            }
             match open_message_from_envelope(ident, envelope) {
                 Ok(DeliveryOpenedMessage::Text {
                     message_id,
@@ -341,6 +410,9 @@ async fn handle_push_frame(
                                     "attachment inbound decode failed message_id={message_id}: {e}"
                                 ),
                             );
+                            if is_permanent_inbound_open_error(&e) {
+                                mark_inbound_poison(&message_id);
+                            }
                             return;
                         }
                     };
@@ -429,6 +501,23 @@ async fn handle_push_frame(
                 }
                 Err(e) => {
                     native_log::warn("delivery", format!("message.inbound decrypt failed: {e}"));
+                    if is_permanent_inbound_open_error(&e) {
+                        let mid = if frame_mid.is_empty() {
+                            envelope
+                                .get("message_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                        } else {
+                            frame_mid
+                        };
+                        mark_inbound_poison(mid);
+                        native_log::warn(
+                            "delivery",
+                            format!(
+                                "message.inbound permanent open failure mid={mid}; skipping until process restart / TTL (no false delivery ack)"
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -441,7 +530,14 @@ async fn handle_push_frame(
                 .get("recipient_wire")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let ev = json!({
+            // Server field is `delivered_at_ms`; transcript/ack path uses `received_at_ms`
+            // (recipient-authoritative first-accept time).
+            let received_at_ms = frame
+                .get("delivered_at_ms")
+                .or_else(|| frame.get("received_at_ms"))
+                .and_then(|v| v.as_i64())
+                .filter(|&t| t > 0);
+            let mut ev = json!({
                 "kind": "dm_message",
                 "msg_kind": "ack_received",
                 "ref_id": message_id,
@@ -449,6 +545,9 @@ async fn handle_push_frame(
                 "sender_public_key_hex": recipient,
                 "public_key_hex": recipient,
             });
+            if let Some(at) = received_at_ms {
+                ev["received_at_ms"] = json!(at);
+            }
             let _ = apply_p2p_event_json(&ev);
             enqueue_delivery_ack_poll(recipient, message_id, "ack_received");
         }
@@ -762,15 +861,7 @@ fn spawn_delivery_upload(recipient: String, text: String, message_id: String) {
                         format!("upload failed message_id={message_id}: {e}"),
                     );
                     // Permanent client/auth/size errors — stop retrying as pending.
-                    let hard = e.contains("too large")
-                        || e.contains("oversize")
-                        || e.contains("auth")
-                        || e.contains("401")
-                        || e.contains("403")
-                        || e.contains("unsupported")
-                        || e.contains("secp256k1")
-                        || e.contains("seal");
-                    if hard {
+                    if is_hard_upload_error(&e) {
                         if let Some(ns) = active_app_namespace() {
                             let _ = crate::dm_transcript_store::patch_outgoing_failed(
                                 &ns, &recipient, &message_id,
@@ -809,15 +900,7 @@ fn spawn_delivery_voice_upload(
                         "delivery",
                         format!("voice upload failed message_id={message_id}: {e}"),
                     );
-                    let hard = e.contains("too large")
-                        || e.contains("oversize")
-                        || e.contains("auth")
-                        || e.contains("401")
-                        || e.contains("403")
-                        || e.contains("unsupported")
-                        || e.contains("secp256k1")
-                        || e.contains("seal");
-                    if hard {
+                    if is_hard_upload_error(&e) {
                         if let Some(ns) = active_app_namespace() {
                             let _ = crate::dm_transcript_store::patch_outgoing_failed(
                                 &ns, &recipient, &message_id,
@@ -855,15 +938,7 @@ fn spawn_delivery_attachment_upload(
                         "delivery",
                         format!("attachment upload failed message_id={message_id}: {e}"),
                     );
-                    let hard = e.contains("too large")
-                        || e.contains("oversize")
-                        || e.contains("auth")
-                        || e.contains("401")
-                        || e.contains("403")
-                        || e.contains("unsupported")
-                        || e.contains("secp256k1")
-                        || e.contains("seal");
-                    if hard {
+                    if is_hard_upload_error(&e) {
                         if let Some(ns) = active_app_namespace() {
                             let _ = crate::dm_transcript_store::patch_outgoing_failed(
                                 &ns, &recipient, &message_id,
@@ -889,7 +964,8 @@ pub fn delivery_outbox_upkeep() {
         Err(_) => return,
     };
     let now = now_ms();
-    let mut due = Vec::new();
+    let mut due_text = Vec::new();
+    let mut spawned = 0usize;
     for contact in contacts {
         let pk = contact.public_key_hex.trim();
         if !is_valid_public_key_hex(pk) {
@@ -914,41 +990,115 @@ pub fn delivery_outbox_upkeep() {
             if !outbox_due_for_retry(mid, now) {
                 continue;
             }
-            if row.msg_kind.trim() == "voice" {
-                let path = row
-                    .audio_path
-                    .as_deref()
-                    .or(row.local_path.as_deref())
-                    .map(str::to_string);
-                let Some(path) = path else {
-                    native_log::warn(
-                        "delivery",
-                        format!("voice outbox missing audio_path message_id={mid}"),
-                    );
-                    continue;
-                };
-                let Ok(opus) = std::fs::read(&path) else {
-                    native_log::warn(
-                        "delivery",
-                        format!("voice outbox read failed message_id={mid} path={path}"),
-                    );
-                    continue;
-                };
-                let duration_ms = row.duration_ms.unwrap_or(1);
-                spawn_delivery_voice_upload(pk.to_string(), duration_ms, opus, mid.to_string());
-                continue;
+            if spawned + due_text.len() >= DELIVERY_OUTBOX_MAX_PER_TICK {
+                break;
             }
-            due.push((pk.to_string(), mid.to_string(), row.text.clone()));
+            match row.msg_kind.trim() {
+                "voice" => {
+                    let path = row
+                        .audio_path
+                        .as_deref()
+                        .or(row.local_path.as_deref())
+                        .map(str::to_string);
+                    let Some(path) = path else {
+                        native_log::warn(
+                            "delivery",
+                            format!("voice outbox missing audio_path message_id={mid}"),
+                        );
+                        continue;
+                    };
+                    let Ok(opus) = std::fs::read(&path) else {
+                        native_log::warn(
+                            "delivery",
+                            format!("voice outbox read failed message_id={mid} path={path}"),
+                        );
+                        continue;
+                    };
+                    let duration_ms = row.duration_ms.unwrap_or(1);
+                    spawn_delivery_voice_upload(pk.to_string(), duration_ms, opus, mid.to_string());
+                    spawned += 1;
+                }
+                "attachment_offer" => {
+                    let Some(path) = row.local_path.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    else {
+                        native_log::warn(
+                            "delivery",
+                            format!("attachment outbox missing local_path message_id={mid}"),
+                        );
+                        continue;
+                    };
+                    let file_name = row
+                        .file_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("file");
+                    let mime = row
+                        .mime_type
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("application/octet-stream");
+                    match crate::attach_v1::pack_attachment_for_mailbox(
+                        std::path::Path::new(path),
+                        file_name,
+                        mime,
+                    ) {
+                        Ok(inner) => {
+                            spawn_delivery_attachment_upload(
+                                pk.to_string(),
+                                inner,
+                                mid.to_string(),
+                            );
+                            spawned += 1;
+                        }
+                        Err(e) => {
+                            native_log::warn(
+                                "delivery",
+                                format!(
+                                    "attachment outbox repack failed message_id={mid}: {e}"
+                                ),
+                            );
+                            if e.contains("not a file")
+                                || e.contains("No such file")
+                                || e.contains("empty")
+                                || e.contains("too large")
+                            {
+                                let _ = crate::dm_transcript_store::patch_outgoing_failed(
+                                    &ns, pk, mid,
+                                );
+                            }
+                        }
+                    }
+                }
+                "text" | "" => {
+                    due_text.push((pk.to_string(), mid.to_string(), row.text.clone()));
+                }
+                // call_event / availability_status / unknown — never re-upload as text.
+                other => {
+                    native_log::debug(
+                        "delivery",
+                        format!("outbox skip non-uploadable msg_kind={other} mid={mid}"),
+                    );
+                }
+            }
         }
     }
-    if due.is_empty() {
+    if due_text.is_empty() && spawned == 0 {
         return;
     }
     native_log::debug(
         "delivery",
-        format!("outbox resync {} pending upload(s)", due.len()),
+        format!(
+            "outbox resync {} text + {} media pending upload(s)",
+            due_text.len(),
+            spawned
+        ),
     );
-    for (recipient, message_id, text) in due.into_iter().take(DELIVERY_OUTBOX_MAX_PER_TICK) {
+    for (recipient, message_id, text) in due_text
+        .into_iter()
+        .take(DELIVERY_OUTBOX_MAX_PER_TICK.saturating_sub(spawned))
+    {
         spawn_delivery_upload(recipient, text, message_id);
     }
 }
@@ -1186,4 +1336,40 @@ pub fn delivery_mailbox_list(include_expired: bool) -> Value {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn hard_upload_errors_are_classified() {
+        assert!(is_hard_upload_error("payload too large"));
+        assert!(is_hard_upload_error("HTTP 401 unauthorized"));
+        assert!(is_hard_upload_error("quota exceeded"));
+        assert!(!is_hard_upload_error("connection reset"));
+        assert!(!is_hard_upload_error("timeout waiting for upload.ok"));
+        // Avoid matching the substring "auth" inside unrelated words like "author".
+        assert!(!is_hard_upload_error("authoritative relay unavailable"));
+    }
+
+    #[test]
+    fn permanent_inbound_open_errors_are_classified() {
+        assert!(is_permanent_inbound_open_error("aes-gcm decrypt failed"));
+        assert!(is_permanent_inbound_open_error("attachment sha256 mismatch"));
+        assert!(is_permanent_inbound_open_error("unsupported attachment_version=1"));
+        assert!(!is_permanent_inbound_open_error("disk full writing attach dir"));
+        assert!(!is_permanent_inbound_open_error("app namespace not set"));
+    }
+
+    #[test]
+    fn poison_set_is_idempotent() {
+        let mid = "poison-test-mid-unique";
+        assert!(!is_inbound_poison(mid));
+        mark_inbound_poison(mid);
+        assert!(is_inbound_poison(mid));
+        mark_inbound_poison(mid);
+        assert!(is_inbound_poison(mid));
+        if let Ok(mut g) = inbound_poison_mx().lock() {
+            g.remove(mid);
+        }
+    }
+}

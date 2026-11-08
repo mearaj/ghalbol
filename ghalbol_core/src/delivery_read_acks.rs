@@ -193,6 +193,8 @@ pub async fn try_read_ack_after_inbound_async(
     if !may_send_read_ack_for_contact_pk(&sender) {
         return;
     }
+    // Queue first so ~1s upkeep retries if this attempt fails or the process dies mid-flight.
+    enqueue_pending(message_id, &sender);
     if !claim_in_flight(message_id) {
         return;
     }
@@ -212,6 +214,13 @@ pub async fn try_read_ack_after_inbound_async(
                 "delivery_read",
                 format!("inbox.read failed mid={message_id} sender={sender}: {e}"),
             );
+            if let Ok(mut q) = pending_mx().lock() {
+                for p in q.iter_mut() {
+                    if p.message_id == message_id.trim() && p.sender_wire == sender {
+                        p.queued_at_ms = now_ms();
+                    }
+                }
+            }
         }
     }
 }
@@ -339,5 +348,37 @@ mod tests {
     #[test]
     fn normalize_pk_lowercases() {
         assert_eq!(normalize_pk("  ABCD "), "abcd");
+    }
+
+    #[test]
+    fn enqueue_pending_dedupes_same_mid_and_sender() {
+        let mid = "test-read-ack-dedupe-mid";
+        let secret = crate::identity::generate_secret(crate::identity::IdentityAlgorithm::Secp256k1)
+            .expect("secret");
+        let pk = crate::identity::public_key_from_secret(
+            crate::identity::IdentityAlgorithm::Secp256k1,
+            &secret,
+        )
+        .expect("pk");
+        let sender = hex::encode(pk);
+        assert!(is_valid_public_key_hex(&sender));
+        {
+            let Ok(mut q) = pending_mx().lock() else {
+                return;
+            };
+            q.retain(|p| p.message_id != mid);
+        }
+        enqueue_pending(mid, &sender);
+        enqueue_pending(mid, &sender);
+        let count = pending_mx()
+            .lock()
+            .map(|q| {
+                q.iter()
+                    .filter(|p| p.message_id == mid && p.sender_wire == normalize_pk(&sender))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(count, 1);
+        dequeue_pending(mid, &sender);
     }
 }

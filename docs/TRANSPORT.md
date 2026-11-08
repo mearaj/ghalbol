@@ -205,11 +205,14 @@ mDNS Expired → remove_session; set_peer_on_local_lan false
   → text: unchanged (delivery)
 
 Device left LAN (mobile-data) → refresh_os_network_truth
-  → coord register if public endpoint changes
+  → OS default-route change → `coord_invalidate_presence_on_network_change`
+    (clear published TCP endpoints + lookup backoff; force relay presence /
+     re-register — does **not** tear down a live local relay circuit listen)
   → mDNS state purged on LAN loss paths in network_transport / connect upkeep
 
 Wi‑Fi return → notify_network_change → fresh ephemeral listen + mDNS publish
   → Discovered → LAN session again (calls)
+  → same OS-route invalidate path when `os=` flips wifi↔cell/ethernet
 ```
 
 **Healthy signs:** `mdns discovered` → `chat_ready` on LAN; `bridge request ok` → `wss connecting` for WAN calls; delivery logs for text independent of connect.

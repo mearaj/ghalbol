@@ -95,13 +95,16 @@ pub fn p2p_call_signal(config: &Value) -> Value {
     // Apply local phase immediately so the dialer shows "Calling…" (not Accept)
     // before the outbound worker runs. The worker's apply_outbound is then a no-op
     // or confirms the same phase.
-    if let Err(e) = call_state::apply_outbound(&recipient, &call_id, signal_kind) {
-        return json_err(e);
-    }
     let payload = config
         .get("payload")
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
+    let invite_video = call_state::invite_payload_wants_video(&payload);
+    if let Err(e) =
+        call_state::apply_outbound_ex(&recipient, &call_id, signal_kind, invite_video)
+    {
+        return json_err(e);
+    }
     let signal_id = config
         .get("signal_id")
         .and_then(|x| x.as_str())
@@ -232,7 +235,7 @@ pub fn p2p_call_status(_config: &Value) -> Value {
             crate::call_history::record_ring_outcome(
                 &ring.call_id,
                 &ring.peer_public_key_hex,
-                false,
+                ring.video_enabled,
                 reason,
             );
         }

@@ -220,7 +220,9 @@ Push to **sender** when recipient acks.
 }
 ```
 
-Client patches outbound transcript `delivery=delivered`.
+Client patches outbound transcript `delivery=delivered`, mapping `delivered_at_ms` →
+transcript `received_at_ms` (first value wins). Replayed `inbox.ack` after the row is
+already `delivered`/`read` is idempotent: `inbox.ack.ok` with **no** second push.
 
 ### `message.read_to_sender` (read receipt)
 

@@ -297,7 +297,10 @@ async fn process_one(
                 return;
             };
             let recipient_hex = recipient_public_key_hex.clone();
-            if let Err(e) = call_state::apply_outbound(&recipient_hex, &call_id, signal_kind) {
+            let invite_video = call_state::invite_payload_wants_video(&payload);
+            if let Err(e) =
+                call_state::apply_outbound_ex(&recipient_hex, &call_id, signal_kind, invite_video)
+            {
                 native_log::warn("call", format!("outbound signal rejected: {e}"));
                 return;
             }
